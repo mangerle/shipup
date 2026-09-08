@@ -211,11 +211,20 @@ impl Manifest {
     pub fn resolve(&self, options: &ResolveOptions<'_>) -> Result<ResolvedRelease> {
         let current_version = options.current_version;
 
-        // 1. 如果指定了特定通道且存在该通道配置，优先匹配通道
-        if let Some(ch) = options.channel
-            && let Some(channel_info) = self.channels.get(ch)
-            && let Some(package) = match_package(&channel_info.packages, options.target)
-        {
+        // 1. 如果指定了特定通道，严格在指定通道内进行匹配，杜绝静默回退导致安装非预期版本
+        if let Some(ch) = options.channel {
+            let channel_info = self.channels.get(ch).ok_or_else(|| {
+                UpdateError::ManifestParse(format!("Manifest 中未找到指定的发布通道: {}", ch))
+            })?;
+
+            let package =
+                match_package(&channel_info.packages, options.target).ok_or_else(|| {
+                    UpdateError::PlatformNotFound(format!(
+                        "当前目标平台 ({}) 在指定通道 ({}) 中未找到适配的安装包",
+                        options.target, ch
+                    ))
+                })?;
+
             let is_mandatory = channel_info.force_update
                 || channel_info
                     .min_supported_version
@@ -232,7 +241,7 @@ impl Manifest {
             });
         }
 
-        // 2. 回退到顶层默认配置进行匹配
+        // 2. 未指定通道时，使用顶层默认主通道配置进行匹配
         let package = match_package(&self.packages, options.target)
             .ok_or_else(|| UpdateError::PlatformNotFound(options.target.to_string()))?;
 
