@@ -1,38 +1,40 @@
 # shipup
 
-通用、轻量级、无 UI 绑定的跨平台软件自更新（Self-Updater）系统。
+A universal, lightweight, UI-agnostic cross-platform self-updating system for desktop applications.
+
+English | [简体中文](README_ZH.md)
 
 ---
 
-## 核心特性
+## Core Features
 
-- **纯粹独立，零 UI 绑定**：不假设任何上层 GUI 框架或异步事件循环，可无缝嵌入 GPUI、Slint、Egui、Iced 以及命令行与服务端应用。
-- **复合更新策略**：支持轻量单二进制原地原子替换、压缩包（.zip / .tar.gz）解压沙箱替换与大型桌面应用外部安装器接管。
-- **原生同步与异步双模式**：基于 `reqwest`，开箱即用支持同步阻塞（`blocking`）与异步原生（`async`）双套 API，亦可通过特性灵活裁剪依赖。
-- **工业级安全防线**：
-  - 第一层：SHA-256 流式哈希校验传输损坏。
-  - 第二层：Ed25519 纯 Rust 高性能非对称公钥数字签名验证。
-  - 第三层：Zip Slip 路径逃逸防御与解压体积熔断防护。
-- **跨平台鲁棒性**：
-  - 同卷原子写入策略，彻底杜绝跨文件系统 `EXDEV: Cross-device link` 错误。
-  - 深度适配 Windows 文件锁重命名绕过与新进程启动自清理闭环。
-  - 自动修复 Linux 可执行权限（0o755）与清理 macOS Gatekeeper 隔离属性。
-- **发布生态闭环**：提供开箱即用的发布端命令行工具 `shipup-cli`，支持密钥生成（`keygen`）与发布包签名合并（`release`）。
+- **Pure & UI-Agnostic**: Imposes no assumptions on GUI frameworks or async runtimes. Seamlessly integrates with GPUI, Slint, egui, Iced, as well as CLI and backend daemon services.
+- **Multiple Update Strategies**: Supports in-place atomic binary replacement, archive extraction sandbox replacement (.zip / .tar.gz), and external installer takeover for complex installers.
+- **Native Dual Modes**: Built on top of `reqwest`, offering out-of-the-box support for both synchronous blocking (`blocking`) and asynchronous native (`async`) APIs, customizable via Cargo feature flags.
+- **Enterprise-Grade Security Defense**:
+  - Layer 1: Streaming SHA-256 integrity verification against corrupt downloads.
+  - Layer 2: High-performance pure-Rust Ed25519 asymmetric cryptographic signature verification.
+  - Layer 3: Zip Slip path traversal mitigation and decompression size limit circuit breaking.
+- **Cross-Platform Robustness**:
+  - Same-volume atomic staging strategy preventing cross-filesystem `EXDEV: Cross-device link` errors.
+  - Deep adaptation for Windows executable file locks via atomic rename and self-cleanup helper processes.
+  - Automatic permission bit fixing (0o755) on Linux and Gatekeeper quarantine attribute removal on macOS.
+- **Release Ecosystem**: Ships with an out-of-the-box CLI tool `shipup-cli` for cryptographic key generation (`keygen`) and manifest building/signing (`release`).
 
 ---
 
-## 快速入门
+## Quick Start
 
-### 1. 添加依赖
+### 1. Add Dependency
 
-在应用的 `Cargo.toml` 中添加：
+Add `shipup` to your application's `Cargo.toml`:
 
 ```toml
 [dependencies]
 shipup = "0.1.0"
 ```
 
-### 2. 客户端更新检查与安装
+### 2. Client Update Checking and Installation
 
 ```rust
 use std::sync::atomic::AtomicBool;
@@ -41,7 +43,7 @@ use std::time::Duration;
 use shipup::{Updater, UpdateEvent};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 构建更新器实例
+    // Build the updater instance
     let updater = Updater::builder()
         .current_version("1.0.0")?
         .manifest_url("https://updates.example.com/latest.json")
@@ -50,33 +52,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_secs(15))
         .build()?;
 
-    // 检查更新
+    // Check for updates
     if let Some(update) = updater.check()? {
-        println!("发现新版本: {}", update.version());
+        println!("New update found: {}", update.version());
 
-        // 下载并安装
+        // Download and apply update
         let cancel_flag = Arc::new(AtomicBool::new(false));
         update.download_and_install_with_cancellation(
             Some(cancel_flag),
             |event| match event {
                 UpdateEvent::DownloadStarted { total_bytes } => {
-                    println!("开始下载，文件大小: {:?}", total_bytes);
+                    println!("Download started, file size: {:?}", total_bytes);
                 }
                 UpdateEvent::DownloadProgress { percent, .. } => {
                     if let Some(p) = percent {
-                        println!("下载进度: {:.1}%", p);
+                        println!("Download progress: {:.1}%", p);
                     }
                 }
-                UpdateEvent::Installing => println!("正在替换安装..."),
-                UpdateEvent::ReadyToRestart => println!("安装就绪，准备重启。"),
+                UpdateEvent::Installing => println!("Applying update and replacing files..."),
+                UpdateEvent::ReadyToRestart => println!("Installation completed. Ready to restart."),
                 _ => {}
             },
         )?;
 
-        // 优雅自重启
+        // Graceful self-restart
         update.restart_with(|ctx| {
             ctx.before_exit(|| {
-                println!("正在释放单实例锁并清理运行状态...");
+                println!("Releasing single-instance locks and cleaning up runtime state...");
             });
         })?;
     }
@@ -87,5 +89,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-## 许可证
-本项目采用 MIT 许可证授权。详情参见 [LICENSE](LICENSE) 文件。
+## Release Tool (shipup-cli)
+
+`shipup` provides a companion CLI tool `shipup-cli` for keypair management and manifest signing.
+
+### 1. Install CLI Tool
+```powershell
+cargo install shipup-cli
+```
+
+### 2. Generate Ed25519 Keypair
+```powershell
+shipup-cli keygen -o ./keys
+```
+This generates `ed25519.key` (private key, keep confidential) and `ed25519.pub` (public key, embedded in client applications) in the `./keys` directory.
+
+### 3. Build and Sign Manifest
+```powershell
+shipup-cli release \
+  --version 1.1.0 \
+  --target x86_64-pc-windows-msvc \
+  --package-path ./target/release/app.exe \
+  --url https://updates.example.com/downloads/app-1.1.0.exe \
+  --key-path ./keys/ed25519.key \
+  --package-type binary \
+  --manifest ./dist/latest.json
+```
+
+---
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

@@ -15,7 +15,7 @@ homepage = "https://github.com/mangerle/shipup"
 documentation = "https://docs.rs/shipup"
 readme = "README.md"
 rust-version = "1.96.0"
-description = "通用、轻量级、无 UI 绑定的跨平台软件自更新系统"
+description = "A universal, lightweight, UI-independent cross-platform software auto-update system"
 keywords = ["updater", "self-update", "cross-platform", "desktop", "auto-update"]
 categories = ["development-tools", "os"]
 
