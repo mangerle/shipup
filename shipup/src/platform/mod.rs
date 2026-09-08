@@ -21,12 +21,16 @@ pub fn cleanup_old_backups() {
     {
         windows::cleanup_old_backup_files();
     }
+    #[cfg(target_os = "macos")]
+    {
+        macos::cleanup_old_backup_bundles();
+    }
 }
 
 /// 执行原地原子替换
 ///
 /// # 设计原理
-/// - **实现初衷**：基于操作系统原语实现单二进制原地替换，覆盖 Windows 文件重命名绕过与 Unix 的 `unlink` 机制。
+/// - **实现初衷**：基于操作系统原语实现单二进制或 macOS Bundle 原地替换，覆盖 Windows 文件重命名绕过与 Unix 的 `unlink` 机制。
 /// - **核心优势**：无需依赖外部更新助手程序，实现极低开销的原地自更新。
 /// - **代价与局限**：要求对当前程序所在目录具有写入权限。
 ///
@@ -40,7 +44,11 @@ pub fn replace_binary(new_binary_path: &Path) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        macos::replace_current_binary(new_binary_path)
+        if new_binary_path.is_dir() {
+            macos::replace_current_bundle(new_binary_path)
+        } else {
+            macos::replace_current_binary(new_binary_path)
+        }
     }
 
     #[cfg(target_os = "linux")]
