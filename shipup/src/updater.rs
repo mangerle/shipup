@@ -272,6 +272,7 @@ impl Update {
             cancel_flag,
             max_retries: self.max_retries,
             retry_delay: self.retry_delay,
+            expected_checksum: self.release.package.checksum.as_deref(),
         };
 
         download::download_file_blocking(&client, &options, &mut callback)?;
@@ -319,6 +320,7 @@ impl Update {
             cancel_flag,
             max_retries: self.max_retries,
             retry_delay: self.retry_delay,
+            expected_checksum: self.release.package.checksum.as_deref(),
         };
 
         download::download_file_async(&client, &options, &mut callback).await?;

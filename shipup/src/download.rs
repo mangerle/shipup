@@ -18,6 +18,8 @@ use reqwest::StatusCode;
 #[cfg(any(feature = "blocking", feature = "async"))]
 use reqwest::header::RANGE;
 
+use crate::signature::verify_sha256_file;
+
 #[cfg(feature = "blocking")]
 const BUFFER_SIZE: usize = 64 * 1024; // 64KB 缓冲区
 
@@ -114,6 +116,40 @@ pub struct DownloadOptions<'a> {
     pub max_retries: u32,
     /// 网络重试初始退避延迟
     pub retry_delay: Duration,
+    /// 预期的 SHA-256 完整性哈希（用于直接比对本地已有文件实现秒级缓存命中）
+    pub expected_checksum: Option<&'a str>,
+}
+
+pub(crate) fn try_hit_local_cache<F>(
+    target_path: &Path,
+    expected_checksum: Option<&str>,
+    event_callback: &mut F,
+) -> bool
+where
+    F: FnMut(UpdateEvent),
+{
+    if let Some(checksum) = expected_checksum
+        && target_path.exists()
+        && verify_sha256_file(target_path, checksum).is_ok()
+    {
+        let file_size = fs::metadata(target_path).map(|m| m.len()).ok();
+        log::info!(
+            "本地已有安装包完整性校验（SHA-256）一致，命中本地缓存，直接跳过网络下载，文件路径: {}",
+            target_path.display()
+        );
+        event_callback(UpdateEvent::DownloadStarted {
+            total_bytes: file_size,
+        });
+        event_callback(UpdateEvent::DownloadProgress {
+            downloaded_bytes: file_size.unwrap_or(0),
+            total_bytes: file_size,
+            percent: Some(100.0),
+            speed_bytes_per_sec: None,
+            eta: Some(Duration::ZERO),
+        });
+        return true;
+    }
+    false
 }
 
 pub(crate) fn calculate_backoff(retry_delay: Duration, attempt: u32) -> Duration {
@@ -152,6 +188,14 @@ pub fn download_file_blocking<F>(
 where
     F: FnMut(UpdateEvent),
 {
+    if try_hit_local_cache(
+        options.target_path,
+        options.expected_checksum,
+        &mut event_callback,
+    ) {
+        return Ok(());
+    }
+
     let mut attempts = 0;
     loop {
         attempts += 1;
@@ -324,6 +368,14 @@ pub async fn download_file_async<F>(
 where
     F: FnMut(UpdateEvent) + Send,
 {
+    if try_hit_local_cache(
+        options.target_path,
+        options.expected_checksum,
+        &mut event_callback,
+    ) {
+        return Ok(());
+    }
+
     let mut attempts = 0;
     loop {
         attempts += 1;
@@ -561,5 +613,42 @@ mod tests {
         assert!(is_retryable_error(&UpdateError::Network(
             "连接超时重置".to_string()
         )));
+    }
+
+    #[test]
+    fn test_try_hit_local_cache() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join(format!("shipup_cache_test_{}.bin", std::process::id()));
+        let content = b"hello shipup cached update package";
+        fs::write(&test_file, content).unwrap();
+
+        let mut events = Vec::new();
+
+        // 1. 哈希不匹配时不能命中缓存
+        let not_hit =
+            try_hit_local_cache(&test_file, Some("wrong_hash"), &mut |ev| events.push(ev));
+        assert!(!not_hit);
+        assert!(events.is_empty());
+
+        // 2. 哈希匹配时成功命中缓存并派发 100% 进度
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(content);
+        let mut expected_hash = String::new();
+        for b in hash {
+            use std::fmt::Write;
+            let _ = write!(expected_hash, "{b:02x}");
+        }
+
+        let hit = try_hit_local_cache(&test_file, Some(&expected_hash), &mut |ev| events.push(ev));
+        assert!(hit);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], UpdateEvent::DownloadStarted { .. }));
+        if let UpdateEvent::DownloadProgress { percent, .. } = &events[1] {
+            assert_eq!(*percent, Some(100.0));
+        } else {
+            panic!("预期收到 100% DownloadProgress 事件");
+        }
+
+        let _ = fs::remove_file(&test_file);
     }
 }
