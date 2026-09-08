@@ -24,33 +24,33 @@ categories = ["development-tools", "os"]
 shipup = { path = "shipup", default-features = false }
 
 # 网络与异步
-reqwest = { version = "0.12", default-features = false }
-tokio = { version = "1.38", default-features = false }
-futures-util = { version = "0.3", default-features = false }
+reqwest = { version = "0.13", default-features = false }
+tokio = { version = "1.53", default-features = false }
+futures-util = { version = "0.3.34", default-features = false }
 
 # 核心系统与文件替换
-self-replace = "1.5"
+self-replace = "1.5.0"
 
 # 加密与哈希校验
-ed25519-dalek = { version = "2.1", default-features = false }
-sha2 = "0.10"
-base64 = "0.22"
-rand_core = { version = "0.6", features = ["std"] }
+ed25519-dalek = { version = "3.0", default-features = false }
+sha2 = "0.11"
+base64 = "0.23"
+getrandom = "0.4"
 
 # 序列化与版本
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-semver = { version = "1.0", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+semver = { version = "1.0.28", features = ["serde"] }
 
 # 错误处理与日志门面
-thiserror = "2.0"
-log = "0.4"
-clap = { version = "4.5", features = ["derive"] }
+thiserror = "2.0.20"
+log = "0.4.34"
+clap = { version = "4.6", features = ["derive"] }
 
 # 归档解压缩
-zip = { version = "2.2", default-features = false }
-flate2 = "1.0"
-tar = "0.4"
+zip = { version = "8.6", default-features = false }
+flate2 = "1.1"
+tar = "0.4.46"
 
 # 生产发布体积与性能优化
 [profile.release]

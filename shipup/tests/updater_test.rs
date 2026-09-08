@@ -3,7 +3,6 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signer, SigningKey};
-use rand_core::OsRng;
 use semver::Version;
 use shipup::Updater;
 use shipup::manifest::{ChannelInfo, Manifest, PackageInfo, PackageType};
@@ -113,7 +112,13 @@ fn test_sha256_verification() {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(payload);
-    let expected = format!("sha256:{:x}", hasher.finalize());
+    let hash = hasher.finalize();
+    let mut hex = String::with_capacity(hash.len() * 2);
+    for b in hash {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    let expected = format!("sha256:{hex}");
 
     assert!(verify_sha256(payload, &expected).is_ok());
     assert!(
@@ -129,8 +134,9 @@ fn test_sha256_verification() {
 fn test_ed25519_sign_and_verify() {
     let payload = b"critical-binary-content-to-be-updated";
 
-    let mut rng = OsRng;
-    let signing_key = SigningKey::generate(&mut rng);
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).expect("获取随机数种子失败");
+    let signing_key = SigningKey::from_bytes(&seed);
     let verifying_key = signing_key.verifying_key();
 
     let sig = signing_key.sign(payload);

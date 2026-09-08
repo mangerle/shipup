@@ -114,8 +114,8 @@ fn extract_zip(archive_path: &Path, canonical_sandbox: &Path) -> Result<()> {
 }
 
 #[cfg(feature = "archive-zip")]
-fn unpack_single_zip_entry(
-    entry: &mut zip::read::ZipFile<'_>,
+fn unpack_single_zip_entry<R: Read>(
+    entry: &mut zip::read::ZipFile<'_, R>,
     dest_path: &Path,
     total_extracted: &mut u64,
     max_allowed_bytes: u64,

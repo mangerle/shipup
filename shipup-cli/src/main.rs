@@ -4,7 +4,6 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey};
-use rand_core::OsRng;
 use semver::Version;
 use sha2::{Digest, Sha256};
 use shipup::{ChannelInfo, Manifest, PackageInfo, PackageType};
@@ -114,8 +113,9 @@ fn handle_keygen(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("开始生成 Ed25519 密钥对，输出目录: {}", out_dir.display());
     fs::create_dir_all(out_dir)?;
 
-    let mut rng = OsRng;
-    let signing_key = SigningKey::generate(&mut rng);
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed)?;
+    let signing_key = SigningKey::from_bytes(&seed);
     let verifying_key = signing_key.verifying_key();
 
     let private_key_b64 = BASE64.encode(signing_key.to_bytes());
@@ -144,7 +144,13 @@ fn compute_payload_integrity(
 
     let mut hasher = Sha256::new();
     hasher.update(&package_bytes);
-    let checksum = format!("sha256:{:x}", hasher.finalize());
+    let hash = hasher.finalize();
+    let mut hex = String::with_capacity(hash.len() * 2);
+    for b in hash {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    let checksum = format!("sha256:{hex}");
 
     let signature = if let Some(kp) = key_path {
         let key_str = fs::read_to_string(kp)?;

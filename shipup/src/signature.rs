@@ -24,7 +24,12 @@ pub fn verify_sha256(data: &[u8], expected_checksum: &str) -> Result<()> {
 
     let mut hasher = Sha256::new();
     hasher.update(data);
-    let actual_hex = format!("{:x}", hasher.finalize());
+    let hash = hasher.finalize();
+    let mut actual_hex = String::with_capacity(hash.len() * 2);
+    for b in hash {
+        use std::fmt::Write;
+        let _ = write!(actual_hex, "{b:02x}");
+    }
 
     if !actual_hex.eq_ignore_ascii_case(expected_hex) {
         return Err(UpdateError::ChecksumMismatch {
