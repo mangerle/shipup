@@ -1,0 +1,36 @@
+// shipup 跨平台自更新系统 - 门面与核心接口导出
+//! # shipup
+//!
+//! `shipup` 是一个通用、轻量级、无 UI 绑定的跨平台软件自更新（Self-Updater）系统。
+//! 支持在桌面程序（GPUI、Slint、Egui、Iced 等）以及服务端和命令行程序中无缝嵌入。
+//!
+//! ## 核心特性
+//! - 零 GUI 框架绑定，架构纯粹独立
+//! - 支持二进制原地原子替换、压缩包解压沙箱替换与外部安装器无残留派生
+//! - 原生支持同步阻塞（blocking）与异步（async）双调用模式
+//! - 内置 SHA-256 传输完整性校验与 Ed25519 数字签名验证
+//! - 防范 Zip Slip 路径越界逃逸与同卷原子写入防跨设备链接（EXDEV）错误
+//! - 自动绕过 Windows 文件锁并完成启动自清理闭环
+
+pub mod archive;
+pub mod builder;
+pub mod download;
+pub mod error;
+pub mod event;
+pub mod manifest;
+pub mod platform;
+pub mod restart;
+pub mod signature;
+pub mod updater;
+
+// 常用核心类型直接重导出
+pub use builder::{UpdaterBuilder, UpdaterConfig};
+pub use error::{Result, UpdateError};
+pub use event::UpdateEvent;
+pub use manifest::{
+    current_target_triple, ChannelInfo, Manifest, PackageInfo, PackageType, ResolveOptions,
+    ResolvedRelease,
+};
+pub use platform::cleanup_old_backups;
+pub use restart::{is_restarted_by_shipup, restart_with, RestartContext, SHIPUP_RESTARTED_ARG};
+pub use updater::{Update, Updater};

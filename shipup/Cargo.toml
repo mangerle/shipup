@@ -1,0 +1,48 @@
+[package]
+name = "shipup"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "通用、轻量级、无 UI 绑定的跨平台软件自更新系统"
+
+[features]
+default = ["blocking", "async", "archive-zip", "archive-tar"]
+blocking = ["dep:reqwest", "reqwest/blocking", "reqwest/default-tls"]
+async = [
+    "dep:reqwest",
+    "reqwest/default-tls",
+    "reqwest/stream",
+    "dep:tokio",
+    "tokio/rt",
+    "tokio/sync",
+    "dep:futures-util",
+    "futures-util/io",
+]
+archive-zip = ["dep:zip", "zip/deflate"]
+archive-tar = ["dep:flate2", "dep:tar"]
+
+[dependencies]
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+
+self-replace = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["std"] }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+semver = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+zip = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
+
+[dev-dependencies]
+rand_core = { workspace = true }
