@@ -2,7 +2,7 @@
 
 // shipup 跨平台自更新系统 - Updater 与 Update 核心交互实体
 
-use crate::archive::extract_archive;
+use crate::archive::{extract_archive, sync_extracted_payload};
 use crate::builder::{UpdaterBuilder, UpdaterConfig};
 use crate::download::{self, DownloadOptions};
 use crate::error::{Result, UpdateError};
@@ -368,6 +368,14 @@ impl Update {
                 )?;
 
                 callback(UpdateEvent::Installing);
+
+                // 同步解压目录中除主程序外的全部伴随依赖（动态库、静态资源等）到宿主应用目录
+                let current_exe = std::env::current_exe()?;
+                if let Some(target_dir) = current_exe.parent() {
+                    let payload_dir = extracted_binary.parent().unwrap_or(&sandbox_dir);
+                    sync_extracted_payload(payload_dir, target_dir, &extracted_binary)?;
+                }
+
                 replace_binary(&extracted_binary)?;
 
                 let _ = fs::remove_dir_all(&sandbox_dir);
