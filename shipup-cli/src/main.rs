@@ -88,6 +88,10 @@ struct ReleaseArgs {
     #[arg(long)]
     channel: Option<String>,
 
+    /// 是否需要操作系统管理员提权（UAC / Sudo）执行安装（默认 false）
+    #[arg(long, default_value_t = false)]
+    require_elevation: bool,
+
     /// Manifest JSON 输出或合并文件路径
     #[arg(short, long, default_value = "latest.json")]
     manifest: PathBuf,
@@ -235,6 +239,7 @@ fn handle_release(args: &ReleaseArgs) -> Result<(), Box<dyn std::error::Error>> 
         package_type: parsed_pkg_type,
         install_args: args.install_args.clone(),
         executable_path: args.executable_path.clone(),
+        require_elevation: args.require_elevation,
     };
 
     let mut manifest = load_or_init_manifest(

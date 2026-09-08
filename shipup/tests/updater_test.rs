@@ -21,6 +21,7 @@ fn test_manifest_serialization_and_routing() {
             package_type: PackageType::Binary,
             install_args: vec![],
             executable_path: None,
+            require_elevation: false,
         },
     );
 
@@ -35,6 +36,7 @@ fn test_manifest_serialization_and_routing() {
             package_type: PackageType::Installer,
             install_args: vec!["/S".to_string()],
             executable_path: None,
+            require_elevation: true,
         },
     );
 

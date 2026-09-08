@@ -132,7 +132,11 @@ pub fn replace_current_binary(new_binary_path: &Path) -> Result<()> {
 }
 
 /// 拉起 macOS 外部安装程序（如 .pkg 或 .dmg）
-pub fn spawn_installer(installer_path: &Path, user_args: &[String]) -> Result<()> {
+pub fn spawn_installer(
+    installer_path: &Path,
+    user_args: &[String],
+    _require_elevation: bool,
+) -> Result<()> {
     let mut cmd = Command::new("open");
     if !user_args.is_empty() {
         cmd.args(user_args);

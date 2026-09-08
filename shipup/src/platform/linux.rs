@@ -39,10 +39,21 @@ pub fn replace_current_binary(new_binary_path: &Path) -> Result<()> {
 }
 
 /// 拉起 Linux 外部安装器（如 AppImage 或脚本）
-pub fn spawn_installer(installer_path: &Path, user_args: &[String]) -> Result<()> {
+pub fn spawn_installer(
+    installer_path: &Path,
+    user_args: &[String],
+    require_elevation: bool,
+) -> Result<()> {
     ensure_executable(installer_path)?;
 
-    let mut cmd = Command::new(installer_path);
+    let mut cmd = if require_elevation {
+        let mut pkexec_cmd = Command::new("pkexec");
+        pkexec_cmd.arg(installer_path);
+        pkexec_cmd
+    } else {
+        Command::new(installer_path)
+    };
+
     if !user_args.is_empty() {
         cmd.args(user_args);
     }

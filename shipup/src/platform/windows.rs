@@ -63,38 +63,71 @@ pub fn replace_current_binary(new_binary_path: &Path) -> Result<()> {
 /// # 设计原理
 /// - **实现初衷**：注入 DETACHED_PROCESS 与 CREATE_NEW_PROCESS_GROUP 标志，切断父子进程控制台句柄继承。
 /// - **核心优势**：主程序在后续 `process::exit(0)` 退出后，安装器子进程能够顺畅运行并拥有完整文件重写能力。
+///   当 `require_elevation` 为 true 时，通过 PowerShell 触发 UAC 凭据对话框以 Administrator 提权执行。
 ///
 /// # Errors
 /// 当进程派生失败时返回 [`UpdateError::InstallerSpawn`]。
-pub fn spawn_installer(installer_path: &Path, user_args: &[String]) -> Result<()> {
+pub fn spawn_installer(
+    installer_path: &Path,
+    user_args: &[String],
+    require_elevation: bool,
+) -> Result<()> {
     log::info!(
-        "正在派生拉起 Windows 外部安装器: {}",
-        installer_path.display()
+        "正在派生拉起 Windows 外部安装器: {} (UAC 提权: {})",
+        installer_path.display(),
+        require_elevation
     );
-    let mut cmd = Command::new(installer_path);
 
-    if user_args.is_empty() {
-        let ext = installer_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
+    let ext = installer_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
 
-        if ext == "msi" {
-            cmd = Command::new("msiexec");
-            cmd.arg("/i")
-                .arg(installer_path)
-                .arg("/passive")
-                .arg("/norestart");
+    let mut args: Vec<String> = Vec::new();
+    let program: String;
+
+    if ext == "msi" {
+        program = "msiexec".to_string();
+        args.push("/i".to_string());
+        args.push(installer_path.to_string_lossy().to_string());
+        if user_args.is_empty() {
+            args.push("/passive".to_string());
+            args.push("/norestart".to_string());
         } else {
-            cmd.arg("/S");
+            args.extend(user_args.iter().cloned());
         }
     } else {
-        cmd.args(user_args);
+        program = installer_path.to_string_lossy().to_string();
+        if user_args.is_empty() {
+            args.push("/S".to_string());
+        } else {
+            args.extend(user_args.iter().cloned());
+        }
     }
 
-    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    if require_elevation {
+        log::info!("正在通过 PowerShell 以 UAC 管理员提权拉起安装器");
+        let arg_list = args.join(" ");
+        let mut ps_cmd = Command::new("powershell");
+        ps_cmd
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(format!(
+                "Start-Process -FilePath '{}' -ArgumentList '{}' -Verb RunAs",
+                program, arg_list
+            ));
+        ps_cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        ps_cmd.spawn().map_err(|e| {
+            UpdateError::InstallerSpawn(format!("以管理员提权拉起安装器失败: {}", e))
+        })?;
+        return Ok(());
+    }
 
+    let mut cmd = Command::new(&program);
+    cmd.args(&args);
+    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     cmd.spawn()
         .map_err(|e| UpdateError::InstallerSpawn(format!("拉起 Windows 安装器失败: {}", e)))?;
 

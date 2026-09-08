@@ -79,6 +79,10 @@ pub struct PackageInfo {
     /// 当模式为 archive 时，压缩包内目标主程序的相对路径（如 "myapp.exe" 或 "MyApp.app"）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_path: Option<String>,
+
+    /// 是否需要操作系统管理员提权（UAC / Sudo）执行（针对 Windows 安装器等场景）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_elevation: bool,
 }
 
 /// 单独发布通道中的更新信息
@@ -422,6 +426,7 @@ mod tests {
                 package_type: PackageType::Binary,
                 install_args: vec![],
                 executable_path: None,
+                require_elevation: false,
             },
         );
 
@@ -436,6 +441,7 @@ mod tests {
                 package_type: PackageType::Archive,
                 install_args: vec![],
                 executable_path: None,
+                require_elevation: false,
             },
         );
 
@@ -496,5 +502,18 @@ mod tests {
             matched.unwrap().version,
             Version::parse("2.0.0-beta.1").unwrap()
         );
+    }
+
+    #[test]
+    fn test_package_info_require_elevation_default_and_deserialize() {
+        // 旧版本 JSON 不含 require_elevation 时默认反序列化为 false
+        let legacy_json = r#"{"url":"https://example.com/setup.exe","package_type":"installer"}"#;
+        let pkg: PackageInfo = serde_json::from_str(legacy_json).unwrap();
+        assert!(!pkg.require_elevation);
+
+        // 新版本 JSON 显式指定 require_elevation 为 true
+        let elevated_json = r#"{"url":"https://example.com/setup.exe","package_type":"installer","require_elevation":true}"#;
+        let elevated_pkg: PackageInfo = serde_json::from_str(elevated_json).unwrap();
+        assert!(elevated_pkg.require_elevation);
     }
 }

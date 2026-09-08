@@ -416,7 +416,11 @@ impl Update {
             }
             PackageType::Installer => {
                 callback(UpdateEvent::Installing);
-                spawn_installer(temp_path, &self.release.package.install_args)?;
+                spawn_installer(
+                    temp_path,
+                    &self.release.package.install_args,
+                    self.release.package.require_elevation,
+                )?;
                 callback(UpdateEvent::ReadyToRestart);
             }
         }

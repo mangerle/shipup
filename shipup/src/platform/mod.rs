@@ -74,20 +74,24 @@ pub fn replace_binary(new_binary_path: &Path) -> Result<()> {
 ///
 /// # Errors
 /// 当安装器子进程派生失败时返回 [`crate::error::UpdateError::InstallerSpawn`]。
-pub fn spawn_installer(installer_path: &Path, user_args: &[String]) -> Result<()> {
+pub fn spawn_installer(
+    installer_path: &Path,
+    user_args: &[String],
+    require_elevation: bool,
+) -> Result<()> {
     #[cfg(windows)]
     {
-        windows::spawn_installer(installer_path, user_args)
+        windows::spawn_installer(installer_path, user_args, require_elevation)
     }
 
     #[cfg(target_os = "macos")]
     {
-        macos::spawn_installer(installer_path, user_args)
+        macos::spawn_installer(installer_path, user_args, require_elevation)
     }
 
     #[cfg(target_os = "linux")]
     {
-        linux::spawn_installer(installer_path, user_args)
+        linux::spawn_installer(installer_path, user_args, require_elevation)
     }
 
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
