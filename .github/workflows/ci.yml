@@ -1,0 +1,65 @@
+name: CI 质量门禁与跨平台验证
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    name: 代码风格格式化检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 稳定版工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: 执行代码格式化检查 (cargo fmt)
+        run: cargo fmt --all --check
+
+  clippy:
+    name: 静态代码分析检查 (Clippy 零警告)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 稳定版工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: 缓存 Cargo 依赖与编译产物
+        uses: Swatinem/rust-cache@v2
+
+      - name: 运行 Clippy 零警告门禁检查
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: 跨平台功能与单元测试 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 稳定版工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Cargo 依赖与编译产物
+        uses: Swatinem/rust-cache@v2
+
+      - name: 执行全工作区全特性测试
+        run: cargo test --all-targets --all-features --verbose
