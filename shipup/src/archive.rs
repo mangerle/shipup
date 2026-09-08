@@ -383,3 +383,58 @@ pub fn sync_extracted_payload(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_sync_extracted_payload_copies_assets_and_excludes_binary() {
+        let temp_base =
+            std::env::temp_dir().join(format!("shipup_archive_test_{}", std::process::id()));
+        let payload_dir = temp_base.join("payload");
+        let target_dir = temp_base.join("install_dir");
+
+        let _ = fs::remove_dir_all(&temp_base);
+        fs::create_dir_all(&payload_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+
+        // 构造沙箱内的文件树
+        let exe_path = payload_dir.join("myapp.exe");
+        let dll_path = payload_dir.join("core.dll");
+        let assets_dir = payload_dir.join("assets");
+        fs::create_dir_all(&assets_dir).unwrap();
+        let asset_file = assets_dir.join("logo.png");
+
+        File::create(&exe_path)
+            .unwrap()
+            .write_all(b"new-exe")
+            .unwrap();
+        File::create(&dll_path)
+            .unwrap()
+            .write_all(b"new-dll")
+            .unwrap();
+        File::create(&asset_file)
+            .unwrap()
+            .write_all(b"new-logo")
+            .unwrap();
+
+        // 执行资产同步，排除 myapp.exe
+        let res = sync_extracted_payload(&payload_dir, &target_dir, &exe_path);
+        assert!(res.is_ok());
+
+        // 验证主程序未被该方法直接覆盖（由原子替换接管）
+        assert!(!target_dir.join("myapp.exe").exists());
+        // 验证动态库与子目录资源已成功同步并完整保留
+        assert!(target_dir.join("core.dll").exists());
+        assert_eq!(fs::read(target_dir.join("core.dll")).unwrap(), b"new-dll");
+        assert!(target_dir.join("assets").join("logo.png").exists());
+        assert_eq!(
+            fs::read(target_dir.join("assets").join("logo.png")).unwrap(),
+            b"new-logo"
+        );
+
+        let _ = fs::remove_dir_all(&temp_base);
+    }
+}

@@ -145,3 +145,56 @@ impl UpdaterBuilder {
         Ok(Updater::new(config))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_builder_missing_required_fields() {
+        // 缺少版本与 URL
+        let empty_builder = UpdaterBuilder::new();
+        assert!(matches!(
+            empty_builder.build(),
+            Err(UpdateError::ManifestParse(_))
+        ));
+
+        // 仅提供版本缺少 URL
+        let only_version = UpdaterBuilder::new().current_version("1.0.0").unwrap();
+        assert!(matches!(
+            only_version.build(),
+            Err(UpdateError::ManifestParse(_))
+        ));
+
+        // 仅提供 URL 缺少版本
+        let only_url = UpdaterBuilder::new().manifest_url("https://example.com/latest.json");
+        assert!(matches!(
+            only_url.build(),
+            Err(UpdateError::ManifestParse(_))
+        ));
+
+        // 无效版本字符串
+        assert!(
+            UpdaterBuilder::new()
+                .current_version("invalid-semver")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_builder_full_configuration() {
+        let updater = UpdaterBuilder::new()
+            .current_version("1.0.5")
+            .unwrap()
+            .manifest_url("https://updates.example.com/latest.json")
+            .channel("canary")
+            .public_key("dGVzdC1wdWJsaWMta2V5")
+            .timeout(Duration::from_secs(30))
+            .user_agent("CustomUpdater/1.0")
+            .target("x86_64-pc-windows-msvc")
+            .allow_downgrade(true)
+            .build();
+
+        assert!(updater.is_ok());
+    }
+}

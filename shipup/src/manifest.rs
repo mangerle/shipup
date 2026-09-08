@@ -374,3 +374,127 @@ pub fn current_target_triple() -> &'static str {
     )))]
     return "unknown-target";
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_target_libc_and_env_distinction() {
+        // 验证 Linux 下保留 musl 与 gnu 区分
+        assert_eq!(
+            normalize_target("x86_64-unknown-linux-musl"),
+            "linux-x86-64-musl"
+        );
+        assert_eq!(
+            normalize_target("x86_64-unknown-linux-gnu"),
+            "linux-x86-64-gnu"
+        );
+        assert_ne!(
+            normalize_target("x86_64-unknown-linux-musl"),
+            normalize_target("x86_64-unknown-linux-gnu")
+        );
+
+        // 验证 Windows 下保留 msvc 与 gnu 区分
+        assert_eq!(
+            normalize_target("x86_64-pc-windows-msvc"),
+            "windows-x86-64-msvc"
+        );
+        assert_eq!(
+            normalize_target("x86_64-pc-windows-gnu"),
+            "windows-x86-64-gnu"
+        );
+        assert_ne!(
+            normalize_target("x86_64-pc-windows-msvc"),
+            normalize_target("x86_64-pc-windows-gnu")
+        );
+    }
+
+    #[test]
+    fn test_channel_resolution_strictness() {
+        let mut packages = HashMap::new();
+        packages.insert(
+            "x86_64-pc-windows-msvc".to_string(),
+            PackageInfo {
+                url: "https://example.com/app.exe".to_string(),
+                signature: None,
+                checksum: None,
+                package_type: PackageType::Binary,
+                install_args: vec![],
+                executable_path: None,
+            },
+        );
+
+        let mut channels = HashMap::new();
+        let mut beta_packages = HashMap::new();
+        beta_packages.insert(
+            "x86_64-unknown-linux-gnu".to_string(),
+            PackageInfo {
+                url: "https://example.com/app-linux.tar.gz".to_string(),
+                signature: None,
+                checksum: None,
+                package_type: PackageType::Archive,
+                install_args: vec![],
+                executable_path: None,
+            },
+        );
+
+        channels.insert(
+            "beta".to_string(),
+            ChannelInfo {
+                version: Version::parse("2.0.0-beta.1").unwrap(),
+                min_supported_version: None,
+                force_update: false,
+                pub_date: None,
+                notes: None,
+                packages: beta_packages,
+            },
+        );
+
+        let manifest = Manifest {
+            version: Version::parse("1.0.0").unwrap(),
+            min_supported_version: None,
+            force_update: false,
+            pub_date: None,
+            notes: None,
+            packages,
+            channels,
+        };
+
+        let current_ver = Version::parse("1.0.0").unwrap();
+
+        // 1. 指定不存在的通道，应返回错误而不是静默穿透回退
+        let not_found_channel = manifest.resolve(&ResolveOptions {
+            channel: Some("alpha"),
+            target: "x86_64-pc-windows-msvc",
+            current_version: &current_ver,
+        });
+        assert!(matches!(
+            not_found_channel,
+            Err(UpdateError::ManifestParse(_))
+        ));
+
+        // 2. 通道存在但无当前目标平台的更新包，严禁静默回退到稳定版主通道
+        let platform_missing = manifest.resolve(&ResolveOptions {
+            channel: Some("beta"),
+            target: "x86_64-pc-windows-msvc",
+            current_version: &current_ver,
+        });
+        assert!(matches!(
+            platform_missing,
+            Err(UpdateError::PlatformNotFound(_))
+        ));
+
+        // 3. 通道与平台均匹配，成功返回
+        let matched = manifest.resolve(&ResolveOptions {
+            channel: Some("beta"),
+            target: "x86_64-unknown-linux-gnu",
+            current_version: &current_ver,
+        });
+        assert!(matched.is_ok());
+        assert_eq!(
+            matched.unwrap().version,
+            Version::parse("2.0.0-beta.1").unwrap()
+        );
+    }
+}

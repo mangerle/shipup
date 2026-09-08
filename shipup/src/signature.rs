@@ -150,3 +150,75 @@ pub fn verify_ed25519_file(
     let data = std::fs::read(file_path)?;
     verify_ed25519(&data, base64_signature, base64_public_key)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::Signer;
+    use ed25519_dalek::SigningKey;
+    use std::io::Write;
+
+    #[test]
+    fn test_sha256_slice_and_file_verification() {
+        let content = b"shipup payload streaming verification content";
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        let hash = hasher.finalize();
+        let mut hex = String::with_capacity(hash.len() * 2);
+        for b in hash {
+            use std::fmt::Write;
+            let _ = write!(hex, "{b:02x}");
+        }
+        let expected = format!("sha256:{hex}");
+
+        // 验证切片哈希
+        let slice_res = verify_sha256(content, &expected);
+        assert!(slice_res.is_ok());
+
+        // 验证文件流式哈希
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!("shipup_sha256_test_{}.bin", std::process::id()));
+        let mut f = File::create(&temp_file).unwrap();
+        f.write_all(content).unwrap();
+        drop(f);
+
+        let file_res = verify_sha256_file(&temp_file, &expected);
+        let _ = std::fs::remove_file(&temp_file);
+        assert!(file_res.is_ok());
+
+        // 校验错误哈希分支
+        let mismatch_res = verify_sha256(content, "sha256:00000000000000000000000000000000");
+        assert!(matches!(
+            mismatch_res,
+            Err(UpdateError::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_ed25519_verification_branches() {
+        let payload = b"critical-binary-content";
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).unwrap();
+        let signing_key = SigningKey::from_bytes(&seed);
+        let verifying_key = signing_key.verifying_key();
+
+        let sig = signing_key.sign(payload);
+        let sig_b64 = BASE64.encode(sig.to_bytes());
+        let pub_b64 = BASE64.encode(verifying_key.to_bytes());
+
+        // 正常验签
+        assert!(verify_ed25519(payload, &sig_b64, &pub_b64).is_ok());
+
+        // 内容篡改验签失败
+        assert!(matches!(
+            verify_ed25519(b"tampered", &sig_b64, &pub_b64),
+            Err(UpdateError::InvalidSignature)
+        ));
+
+        // Base64 解码错误分支
+        assert!(matches!(
+            verify_ed25519(payload, "invalid-base64!@", &pub_b64),
+            Err(UpdateError::Base64(_))
+        ));
+    }
+}
