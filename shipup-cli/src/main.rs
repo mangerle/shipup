@@ -237,20 +237,12 @@ fn handle_release(args: &ReleaseArgs) -> Result<(), Box<dyn std::error::Error>> 
         executable_path: args.executable_path.clone(),
     };
 
-    let mut manifest = if args.manifest.exists() {
-        let content = fs::read_to_string(&args.manifest)?;
-        serde_json::from_str::<Manifest>(&content)?
-    } else {
-        Manifest {
-            version: version.clone(),
-            min_supported_version: min_supported_version.clone(),
-            force_update: args.force_update,
-            pub_date: None,
-            notes: args.notes.clone(),
-            packages: HashMap::new(),
-            channels: HashMap::new(),
-        }
-    };
+    let mut manifest = load_or_init_manifest(
+        &args.manifest,
+        &version,
+        min_supported_version.as_ref(),
+        args,
+    )?;
 
     update_manifest_entries(
         &mut manifest,
@@ -260,17 +252,48 @@ fn handle_release(args: &ReleaseArgs) -> Result<(), Box<dyn std::error::Error>> 
         package_info,
     );
 
-    let json_output = serde_json::to_string_pretty(&manifest)?;
-    if let Some(parent) = args.manifest.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&args.manifest, json_output)?;
-
+    save_manifest_file(&args.manifest, &manifest)?;
     println!(
         "发布信息已成功合并并写入 Manifest：{}",
         args.manifest.display()
     );
+    Ok(())
+}
+
+/// 读取现有 Manifest 文件或初始化默认空 Manifest
+fn load_or_init_manifest(
+    manifest_path: &Path,
+    version: &Version,
+    min_supported_version: Option<&Version>,
+    args: &ReleaseArgs,
+) -> Result<Manifest, Box<dyn std::error::Error>> {
+    if manifest_path.exists() {
+        let content = fs::read_to_string(manifest_path)?;
+        Ok(serde_json::from_str::<Manifest>(&content)?)
+    } else {
+        Ok(Manifest {
+            version: version.clone(),
+            min_supported_version: min_supported_version.cloned(),
+            force_update: args.force_update,
+            pub_date: None,
+            notes: args.notes.clone(),
+            packages: HashMap::new(),
+            channels: HashMap::new(),
+        })
+    }
+}
+
+/// 将格式化后的 Manifest JSON 写入磁盘目标路径
+fn save_manifest_file(
+    manifest_path: &Path,
+    manifest: &Manifest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let json_output = serde_json::to_string_pretty(manifest)?;
+    if let Some(parent) = manifest_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(manifest_path, json_output)?;
     Ok(())
 }
