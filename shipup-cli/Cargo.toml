@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "shipup 开发者与 CI/CD 发布端命令行工具"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 shipup = { workspace = true }
