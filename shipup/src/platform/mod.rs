@@ -1,6 +1,7 @@
 // shipup 跨平台自更新系统 - 平台专属抽象层
 
 use crate::error::Result;
+use crate::manifest::PackageType;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
@@ -131,4 +132,41 @@ pub fn get_same_volume_temp_path() -> Result<PathBuf> {
         let parent = current.parent().unwrap_or_else(|| Path::new("."));
         Ok(parent.join("app.shipup.tmp"))
     }
+}
+
+/// 根据更新包模式确定最佳的临时下载文件路径
+///
+/// # 设计原理
+/// - **实现初衷**：
+///   - 对于 `PackageType::Installer`，安装器是由独立子进程运行的完整安装包，无需与当前可执行文件处于同一磁盘卷，
+///     且宿主程序可能安装在无写权限的受保护系统目录（如 `C:\Program Files`）。因此直接落盘至用户系统临时目录（`std::env::temp_dir()`），
+///     彻底杜绝权限被拒错误。
+///   - 对于 `PackageType::Binary` 和 `PackageType::Archive`，由于依赖原地原子重命名，强制优先使用同卷临时路径以规避跨卷 `EXDEV` 错误。
+/// - **核心优势**：从根源消除安装器模式下的目录权限壁垒，兼顾原地原子替换与受保护路径升级能力。
+///
+/// # Errors
+/// 当路径探测失败或系统临时目录不可用时返回错误。
+pub fn get_temp_download_path(package_type: PackageType, url: &str) -> Result<PathBuf> {
+    if package_type == PackageType::Installer {
+        let temp_dir = std::env::temp_dir();
+        let url_path = Path::new(url.split('?').next().unwrap_or(url));
+        let ext = url_path.extension().and_then(|s| s.to_str()).unwrap_or({
+            #[cfg(windows)]
+            {
+                "exe"
+            }
+            #[cfg(target_os = "macos")]
+            {
+                "pkg"
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
+            {
+                "bin"
+            }
+        });
+        let file_name = format!("shipup_installer_{}.{}", std::process::id(), ext);
+        return Ok(temp_dir.join(file_name));
+    }
+
+    get_same_volume_temp_path()
 }

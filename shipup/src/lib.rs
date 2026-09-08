@@ -31,6 +31,6 @@ pub use manifest::{
     ChannelInfo, Manifest, PackageInfo, PackageType, ResolveOptions, ResolvedRelease,
     current_target_triple,
 };
-pub use platform::cleanup_old_backups;
+pub use platform::{cleanup_old_backups, get_same_volume_temp_path, get_temp_download_path};
 pub use restart::{RestartContext, SHIPUP_RESTARTED_ARG, is_restarted_by_shipup, restart_with};
 pub use updater::{Update, Updater};

@@ -9,7 +9,7 @@ use crate::error::{Result, UpdateError};
 use crate::event::UpdateEvent;
 use crate::manifest::{Manifest, PackageType, ResolveOptions, ResolvedRelease};
 use crate::platform::{
-    cleanup_old_backups, get_same_volume_temp_path, replace_binary, spawn_installer,
+    cleanup_old_backups, get_temp_download_path, replace_binary, spawn_installer,
 };
 use crate::restart::{RestartContext, restart_with};
 use crate::signature::{verify_ed25519, verify_sha256};
@@ -245,7 +245,8 @@ impl Update {
             .build()
             .map_err(|e| UpdateError::Network(format!("初始化 HTTP 客户端失败: {}", e)))?;
 
-        let temp_download_path = get_same_volume_temp_path()?;
+        let temp_download_path =
+            get_temp_download_path(self.release.package.package_type, &self.release.package.url)?;
         let options = DownloadOptions {
             url: &self.release.package.url,
             target_path: &temp_download_path,
@@ -290,7 +291,8 @@ impl Update {
             .build()
             .map_err(|e| UpdateError::Network(format!("初始化异步 HTTP 客户端失败: {}", e)))?;
 
-        let temp_download_path = get_same_volume_temp_path()?;
+        let temp_download_path =
+            get_temp_download_path(self.release.package.package_type, &self.release.package.url)?;
         let options = DownloadOptions {
             url: &self.release.package.url,
             target_path: &temp_download_path,
