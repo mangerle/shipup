@@ -283,14 +283,26 @@ fn match_package<'a>(
 }
 
 /// 标准化 Target 别名归一化处理
+///
+/// # 设计原理
+/// - **实现初衷**：兼容常见的发布平台命名简写（如 windows-x64、macos-arm64），
+///   同时严格保留 Linux 下的 glibc（gnu）与 musl 运行时差异，防止非兼容 libc 二进制错配。
 fn normalize_target(target: &str) -> String {
     let lower = target.to_ascii_lowercase().replace('_', "-");
     if lower.contains("windows") || lower.contains("win") {
+        let env_suffix = if lower.contains("gnu") || lower.contains("mingw") {
+            "-gnu"
+        } else if lower.contains("msvc") {
+            "-msvc"
+        } else {
+            ""
+        };
+
         if lower.contains("x86-64") || lower.contains("x64") || lower.contains("x86_64") {
-            return "windows-x86-64".to_string();
+            return format!("windows-x86-64{}", env_suffix);
         }
         if lower.contains("aarch64") || lower.contains("arm64") {
-            return "windows-arm64".to_string();
+            return format!("windows-arm64{}", env_suffix);
         }
     } else if lower.contains("darwin") || lower.contains("macos") || lower.contains("apple") {
         if lower.contains("aarch64") || lower.contains("arm64") {
@@ -300,11 +312,19 @@ fn normalize_target(target: &str) -> String {
             return "macos-x86-64".to_string();
         }
     } else if lower.contains("linux") {
+        let libc_suffix = if lower.contains("musl") {
+            "-musl"
+        } else if lower.contains("gnu") || lower.contains("glibc") {
+            "-gnu"
+        } else {
+            ""
+        };
+
         if lower.contains("x86-64") || lower.contains("x64") || lower.contains("x86_64") {
-            return "linux-x86-64".to_string();
+            return format!("linux-x86-64{}", libc_suffix);
         }
         if lower.contains("aarch64") || lower.contains("arm64") {
-            return "linux-arm64".to_string();
+            return format!("linux-arm64{}", libc_suffix);
         }
     }
     lower
