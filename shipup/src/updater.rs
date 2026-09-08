@@ -14,11 +14,17 @@ use crate::platform::{
 use crate::restart::{RestartContext, restart_with};
 use crate::signature::{verify_ed25519_file, verify_sha256_file};
 use semver::Version;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
+
+#[cfg(any(feature = "blocking", feature = "async"))]
+use reqwest::Proxy;
+#[cfg(any(feature = "blocking", feature = "async"))]
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 /// 更新器核心实体
 ///
@@ -34,6 +40,8 @@ pub struct Updater {
     public_key: Option<String>,
     timeout: Duration,
     user_agent: Option<String>,
+    headers: HashMap<String, String>,
+    proxy: Option<String>,
     target: String,
     allow_downgrade: bool,
 }
@@ -54,6 +62,8 @@ impl Updater {
             public_key: config.public_key,
             timeout: config.timeout,
             user_agent: config.user_agent,
+            headers: config.headers,
+            proxy: config.proxy,
             target: config.target,
             allow_downgrade: config.allow_downgrade,
         }
@@ -69,13 +79,12 @@ impl Updater {
     /// 当网络请求失败、HTTP 响应非 2xx 或 JSON 反序列化失败时返回对应错误。
     pub fn check(&self) -> Result<Option<Update>> {
         log::info!("正在发起同步更新检查，远端地址: {}", self.manifest_url);
-        let mut client_builder = reqwest::blocking::Client::builder().timeout(self.timeout);
-        if let Some(ref ua) = self.user_agent {
-            client_builder = client_builder.user_agent(ua);
-        }
-        let client = client_builder
-            .build()
-            .map_err(|e| UpdateError::Network(format!("初始化 HTTP 客户端失败: {}", e)))?;
+        let client = build_blocking_http_client(
+            self.timeout,
+            self.user_agent.as_deref(),
+            &self.headers,
+            self.proxy.as_deref(),
+        )?;
 
         let response = client
             .get(&self.manifest_url)
@@ -107,13 +116,12 @@ impl Updater {
     /// 当异步网络请求失败或 Manifest 解析错误时返回相应错误。
     pub async fn check_async(&self) -> Result<Option<Update>> {
         log::info!("正在发起异步更新检查，远端地址: {}", self.manifest_url);
-        let mut client_builder = reqwest::Client::builder().timeout(self.timeout);
-        if let Some(ref ua) = self.user_agent {
-            client_builder = client_builder.user_agent(ua);
-        }
-        let client = client_builder
-            .build()
-            .map_err(|e| UpdateError::Network(format!("初始化异步 HTTP 客户端失败: {}", e)))?;
+        let client = build_async_http_client(
+            self.timeout,
+            self.user_agent.as_deref(),
+            &self.headers,
+            self.proxy.as_deref(),
+        )?;
 
         let response = client
             .get(&self.manifest_url)
@@ -163,6 +171,8 @@ impl Updater {
             public_key: self.public_key.clone(),
             timeout: self.timeout,
             user_agent: self.user_agent.clone(),
+            headers: self.headers.clone(),
+            proxy: self.proxy.clone(),
         }))
     }
 }
@@ -179,6 +189,8 @@ pub struct Update {
     public_key: Option<String>,
     timeout: Duration,
     user_agent: Option<String>,
+    headers: HashMap<String, String>,
+    proxy: Option<String>,
 }
 
 impl Update {
@@ -237,13 +249,12 @@ impl Update {
     where
         F: FnMut(UpdateEvent),
     {
-        let mut client_builder = reqwest::blocking::Client::builder().timeout(self.timeout);
-        if let Some(ref ua) = self.user_agent {
-            client_builder = client_builder.user_agent(ua);
-        }
-        let client = client_builder
-            .build()
-            .map_err(|e| UpdateError::Network(format!("初始化 HTTP 客户端失败: {}", e)))?;
+        let client = build_blocking_http_client(
+            self.timeout,
+            self.user_agent.as_deref(),
+            &self.headers,
+            self.proxy.as_deref(),
+        )?;
 
         let temp_download_path =
             get_temp_download_path(self.release.package.package_type, &self.release.package.url)?;
@@ -283,13 +294,12 @@ impl Update {
     where
         F: FnMut(UpdateEvent) + Send,
     {
-        let mut client_builder = reqwest::Client::builder().timeout(self.timeout);
-        if let Some(ref ua) = self.user_agent {
-            client_builder = client_builder.user_agent(ua);
-        }
-        let client = client_builder
-            .build()
-            .map_err(|e| UpdateError::Network(format!("初始化异步 HTTP 客户端失败: {}", e)))?;
+        let client = build_async_http_client(
+            self.timeout,
+            self.user_agent.as_deref(),
+            &self.headers,
+            self.proxy.as_deref(),
+        )?;
 
         let temp_download_path =
             get_temp_download_path(self.release.package.package_type, &self.release.package.url)?;
@@ -420,4 +430,74 @@ impl Update {
     pub fn restart(&self) -> Result<()> {
         restart_with(|_| {})
     }
+}
+
+#[cfg(feature = "blocking")]
+fn build_blocking_http_client(
+    timeout: Duration,
+    user_agent: Option<&str>,
+    headers: &HashMap<String, String>,
+    proxy: Option<&str>,
+) -> Result<reqwest::blocking::Client> {
+    let mut builder = reqwest::blocking::Client::builder().timeout(timeout);
+    if let Some(ua) = user_agent {
+        builder = builder.user_agent(ua);
+    }
+    if !headers.is_empty() {
+        let mut header_map = HeaderMap::with_capacity(headers.len());
+        for (k, v) in headers {
+            let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
+                UpdateError::Network(format!("无效的 HTTP 请求头名称 '{}': {}", k, e))
+            })?;
+            let val = HeaderValue::from_str(v).map_err(|e| {
+                UpdateError::Network(format!("无效的 HTTP 请求头数值 '{}': {}", v, e))
+            })?;
+            header_map.insert(name, val);
+        }
+        builder = builder.default_headers(header_map);
+    }
+    if let Some(proxy_url) = proxy {
+        let proxy_config = Proxy::all(proxy_url).map_err(|e| {
+            UpdateError::Network(format!("配置代理服务器 '{}' 失败: {}", proxy_url, e))
+        })?;
+        builder = builder.proxy(proxy_config);
+    }
+    builder
+        .build()
+        .map_err(|e| UpdateError::Network(format!("初始化 HTTP 客户端失败: {}", e)))
+}
+
+#[cfg(feature = "async")]
+fn build_async_http_client(
+    timeout: Duration,
+    user_agent: Option<&str>,
+    headers: &HashMap<String, String>,
+    proxy: Option<&str>,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+    if let Some(ua) = user_agent {
+        builder = builder.user_agent(ua);
+    }
+    if !headers.is_empty() {
+        let mut header_map = HeaderMap::with_capacity(headers.len());
+        for (k, v) in headers {
+            let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
+                UpdateError::Network(format!("无效的 HTTP 请求头名称 '{}': {}", k, e))
+            })?;
+            let val = HeaderValue::from_str(v).map_err(|e| {
+                UpdateError::Network(format!("无效的 HTTP 请求头数值 '{}': {}", v, e))
+            })?;
+            header_map.insert(name, val);
+        }
+        builder = builder.default_headers(header_map);
+    }
+    if let Some(proxy_url) = proxy {
+        let proxy_config = Proxy::all(proxy_url).map_err(|e| {
+            UpdateError::Network(format!("配置代理服务器 '{}' 失败: {}", proxy_url, e))
+        })?;
+        builder = builder.proxy(proxy_config);
+    }
+    builder
+        .build()
+        .map_err(|e| UpdateError::Network(format!("初始化异步 HTTP 客户端失败: {}", e)))
 }

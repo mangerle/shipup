@@ -4,6 +4,7 @@ use crate::error::{Result, UpdateError};
 use crate::manifest::current_target_triple;
 use crate::updater::Updater;
 use semver::Version;
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// 更新器核心配置结构体
@@ -24,6 +25,10 @@ pub struct UpdaterConfig {
     pub timeout: Duration,
     /// 自定义 HTTP User-Agent
     pub user_agent: Option<String>,
+    /// 自定义 HTTP 请求头字典（用于 Token 鉴权、Cookie 注入等）
+    pub headers: HashMap<String, String>,
+    /// HTTP / HTTPS / SOCKS 代理服务器地址
+    pub proxy: Option<String>,
     /// 目标架构 Target Triple 标识
     pub target: String,
     /// 是否允许降级升级
@@ -44,6 +49,8 @@ pub struct UpdaterBuilder {
     pub(crate) public_key: Option<String>,
     pub(crate) timeout: Duration,
     pub(crate) user_agent: Option<String>,
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) proxy: Option<String>,
     pub(crate) target: String,
     pub(crate) allow_downgrade: bool,
 }
@@ -57,6 +64,8 @@ impl Default for UpdaterBuilder {
             public_key: None,
             timeout: Duration::from_secs(15),
             user_agent: None,
+            headers: HashMap::new(),
+            proxy: None,
             target: current_target_triple().to_string(),
             allow_downgrade: false,
         }
@@ -118,6 +127,24 @@ impl UpdaterBuilder {
         self
     }
 
+    /// 添加单个自定义 HTTP 请求头（可多次调用以添加多个，如 Authorization 凭证）
+    pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(key.into(), value.into());
+        self
+    }
+
+    /// 批量设置自定义 HTTP 请求头字典
+    pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
+        self.headers.extend(headers);
+        self
+    }
+
+    /// 设置 HTTP / HTTPS / SOCKS 代理服务器地址（例如 "http://127.0.0.1:7890"）
+    pub fn proxy(mut self, proxy_url: impl Into<String>) -> Self {
+        self.proxy = Some(proxy_url.into());
+        self
+    }
+
     /// 构建 Updater 实例
     ///
     /// # Errors
@@ -138,6 +165,8 @@ impl UpdaterBuilder {
             public_key: self.public_key,
             timeout: self.timeout,
             user_agent: self.user_agent,
+            headers: self.headers,
+            proxy: self.proxy,
             target: self.target,
             allow_downgrade: self.allow_downgrade,
         };
@@ -191,6 +220,9 @@ mod tests {
             .public_key("dGVzdC1wdWJsaWMta2V5")
             .timeout(Duration::from_secs(30))
             .user_agent("CustomUpdater/1.0")
+            .header("Authorization", "Bearer secret-token-123")
+            .header("X-Custom-Header", "shipup-test")
+            .proxy("http://127.0.0.1:8080")
             .target("x86_64-pc-windows-msvc")
             .allow_downgrade(true)
             .build();

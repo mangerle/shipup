@@ -160,6 +160,8 @@ fn test_updater_builder_configuration() {
         .unwrap()
         .manifest_url("https://updates.example.com/latest.json")
         .channel("beta")
+        .header("Authorization", "Bearer token-abc")
+        .proxy("http://127.0.0.1:8888")
         .allow_downgrade(true);
 
     let updater = builder.build().expect("构建 Updater 失败");
