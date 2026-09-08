@@ -1,6 +1,7 @@
 // shipup 跨平台自更新系统 - macOS 专属平台适配
 
 use crate::error::{Result, UpdateError};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -131,17 +132,43 @@ pub fn replace_current_binary(new_binary_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 拉起 macOS 外部安装程序（如 .pkg 或 .dmg）
+/// 构建 macOS 安装器执行命令
+pub(crate) fn build_macos_installer_command(
+    installer_path: &Path,
+    user_args: &[String],
+    require_elevation: bool,
+) -> Command {
+    let ext = installer_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if ext == "pkg" && require_elevation {
+        let script = format!(
+            "do shell script \"installer -pkg '{}' -target /\" with administrator privileges",
+            installer_path.display()
+        );
+        let mut cmd = Command::new("osascript");
+        cmd.arg("-e").arg(script);
+        cmd
+    } else {
+        let mut cmd = Command::new("open");
+        if !user_args.is_empty() {
+            cmd.args(user_args);
+        }
+        cmd.arg(installer_path);
+        cmd
+    }
+}
+
+/// 拉起 macOS 外部安装程序（支持 .pkg 静默安装与 .dmg 镜像自动处理）
 pub fn spawn_installer(
     installer_path: &Path,
     user_args: &[String],
-    _require_elevation: bool,
+    require_elevation: bool,
 ) -> Result<()> {
-    let mut cmd = Command::new("open");
-    if !user_args.is_empty() {
-        cmd.args(user_args);
-    }
-    cmd.arg(installer_path);
+    let mut cmd = build_macos_installer_command(installer_path, user_args, require_elevation);
 
     cmd.spawn()
         .map_err(|e| UpdateError::InstallerSpawn(format!("拉起 macOS 安装器失败: {}", e)))?;
@@ -163,4 +190,26 @@ pub fn get_same_volume_temp_path() -> Result<PathBuf> {
         .ok_or_else(|| UpdateError::SelfReplace("获取当前执行文件父目录失败".to_string()))?;
 
     Ok(parent.join(temp_name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_macos_installer_command_pkg_elevation() {
+        let pkg_path = Path::new("/tmp/MyApp.pkg");
+        let cmd = build_macos_installer_command(pkg_path, &[], true);
+        assert_eq!(cmd.get_program(), "osascript");
+
+        let normal_cmd = build_macos_installer_command(pkg_path, &[], false);
+        assert_eq!(normal_cmd.get_program(), "open");
+    }
+
+    #[test]
+    fn test_build_macos_installer_command_dmg() {
+        let dmg_path = Path::new("/tmp/MyApp.dmg");
+        let cmd = build_macos_installer_command(dmg_path, &["-W".to_string()], false);
+        assert_eq!(cmd.get_program(), "open");
+    }
 }
