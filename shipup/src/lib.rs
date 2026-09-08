@@ -19,6 +19,7 @@ pub mod error;
 pub mod event;
 pub mod manifest;
 pub mod platform;
+pub mod poller;
 pub mod recovery;
 pub mod restart;
 pub mod signature;
@@ -33,6 +34,7 @@ pub use manifest::{
     current_target_triple,
 };
 pub use platform::{cleanup_old_backups, get_same_volume_temp_path, get_temp_download_path};
+pub use poller::{AutoPollEvent, AutoPollOptions, AutoPollerHandle};
 pub use recovery::{
     HealthCheckStatus, check_and_recover_current, confirm_update_success,
     confirm_update_success_in_dir,

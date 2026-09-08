@@ -201,6 +201,35 @@ impl Updater {
             retry_delay: self.retry_delay,
         }))
     }
+
+    #[cfg(feature = "blocking")]
+    /// 启动基于独立 OS 线程的后台同步静默轮询工作器
+    ///
+    /// # Errors
+    /// 当派生操作系统线程失败时返回 [`std::io::Error`]。
+    pub fn start_polling_thread<F>(
+        &self,
+        options: crate::poller::AutoPollOptions,
+        callback: F,
+    ) -> std::io::Result<crate::poller::AutoPollerHandle>
+    where
+        F: FnMut(crate::poller::AutoPollEvent) + Send + 'static,
+    {
+        crate::poller::spawn_polling_thread(self.clone(), options, callback)
+    }
+
+    #[cfg(feature = "async")]
+    /// 启动基于 Tokio 的后台异步静默轮询任务
+    pub fn start_polling_task<F>(
+        &self,
+        options: crate::poller::AutoPollOptions,
+        callback: F,
+    ) -> crate::poller::AutoPollerHandle
+    where
+        F: FnMut(crate::poller::AutoPollEvent) + Send + 'static,
+    {
+        crate::poller::spawn_polling_task(self.clone(), options, callback)
+    }
 }
 
 /// 表示已确认可用的新版本更新对象
