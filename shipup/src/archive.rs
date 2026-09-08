@@ -372,7 +372,6 @@ pub fn sync_extracted_payload(
                 fs::copy(&path, &dest_path)?;
                 #[cfg(unix)]
                 {
-                    use std::os::unix::fs::PermissionsExt;
                     if let Ok(meta) = path.metadata() {
                         let _ = fs::set_permissions(&dest_path, meta.permissions());
                     }
