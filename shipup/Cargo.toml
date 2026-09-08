@@ -21,6 +21,7 @@ async = [
     "dep:tokio",
     "tokio/rt",
     "tokio/sync",
+    "tokio/time",
     "dep:futures-util",
     "futures-util/io",
 ]

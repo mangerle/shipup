@@ -29,6 +29,10 @@ pub struct UpdaterConfig {
     pub headers: HashMap<String, String>,
     /// HTTP / HTTPS / SOCKS 代理服务器地址
     pub proxy: Option<String>,
+    /// 网络请求重试最大次数（默认 3 次）
+    pub max_retries: u32,
+    /// 网络重试初始退避延迟（默认 1 秒）
+    pub retry_delay: Duration,
     /// 目标架构 Target Triple 标识
     pub target: String,
     /// 是否允许降级升级
@@ -51,6 +55,8 @@ pub struct UpdaterBuilder {
     pub(crate) user_agent: Option<String>,
     pub(crate) headers: HashMap<String, String>,
     pub(crate) proxy: Option<String>,
+    pub(crate) max_retries: u32,
+    pub(crate) retry_delay: Duration,
     pub(crate) target: String,
     pub(crate) allow_downgrade: bool,
 }
@@ -66,6 +72,8 @@ impl Default for UpdaterBuilder {
             user_agent: None,
             headers: HashMap::new(),
             proxy: None,
+            max_retries: 3,
+            retry_delay: Duration::from_secs(1),
             target: current_target_triple().to_string(),
             allow_downgrade: false,
         }
@@ -145,6 +153,18 @@ impl UpdaterBuilder {
         self
     }
 
+    /// 设置网络请求重试最大次数（默认 3 次）
+    pub fn max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    /// 设置网络请求重试初始退避延迟（默认 1 秒）
+    pub fn retry_delay(mut self, retry_delay: Duration) -> Self {
+        self.retry_delay = retry_delay;
+        self
+    }
+
     /// 构建 Updater 实例
     ///
     /// # Errors
@@ -167,6 +187,8 @@ impl UpdaterBuilder {
             user_agent: self.user_agent,
             headers: self.headers,
             proxy: self.proxy,
+            max_retries: self.max_retries,
+            retry_delay: self.retry_delay,
             target: self.target,
             allow_downgrade: self.allow_downgrade,
         };
@@ -223,6 +245,8 @@ mod tests {
             .header("Authorization", "Bearer secret-token-123")
             .header("X-Custom-Header", "shipup-test")
             .proxy("http://127.0.0.1:8080")
+            .max_retries(5)
+            .retry_delay(Duration::from_millis(500))
             .target("x86_64-pc-windows-msvc")
             .allow_downgrade(true)
             .build();

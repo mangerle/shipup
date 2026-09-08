@@ -13,6 +13,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(any(feature = "blocking", feature = "async"))]
+use reqwest::StatusCode;
+#[cfg(any(feature = "blocking", feature = "async"))]
+use reqwest::header::RANGE;
+
 #[cfg(feature = "blocking")]
 const BUFFER_SIZE: usize = 64 * 1024; // 64KB 缓冲区
 
@@ -105,20 +110,40 @@ pub struct DownloadOptions<'a> {
     pub target_path: &'a Path,
     /// 跨线程/异步任务的主动取消信号标记
     pub cancel_flag: Option<Arc<AtomicBool>>,
+    /// 网络自动重试最大次数
+    pub max_retries: u32,
+    /// 网络重试初始退避延迟
+    pub retry_delay: Duration,
+}
+
+pub(crate) fn calculate_backoff(retry_delay: Duration, attempt: u32) -> Duration {
+    let factor = 2_u64.saturating_pow(attempt.saturating_sub(1));
+    let backoff_secs = retry_delay.as_secs_f64() * (factor as f64);
+    Duration::from_secs_f64(backoff_secs.min(60.0))
+}
+
+pub(crate) fn is_retryable_error(err: &UpdateError) -> bool {
+    match err {
+        UpdateError::Cancelled => false,
+        UpdateError::HttpStatus { status_code, .. } => {
+            *status_code == 408 || *status_code == 429 || *status_code >= 500
+        }
+        _ => true,
+    }
 }
 
 #[cfg(feature = "blocking")]
-/// 同步阻塞流式下载更新包到目标文件
+/// 同步阻塞流式下载更新包（支持 HTTP Range 断点续传与指数退避网络重试）
 ///
 /// # 设计原理
-/// - **实现初衷**：基于固定大小缓冲区（64KB）循环拉取 HTTP 响应流，并实时派发进度通知事件。
-/// - **核心优势**：单次内存占用恒定，即便下载数百兆的安装包也不会造成内存暴涨；支持毫秒级轮询响应主动取消。
-/// - **代价与局限**：在调用线程中形成阻塞，若需在 GUI 中使用需调度至后台工作线程。
+/// - **实现初衷**：在弱网或网络中断环境下自动进行指数退避重试，并利用 HTTP Range 头续传已下载部分，
+///   避免数十兆或数百兆文件反复从头下载。
+/// - **核心优势**：在单次会话或跨次会话中均支持断点续传；用户主动取消时保留断点切片；错误重试机制内聚。
+/// - **代价与局限**：若远端服务器不支持 206 Partial Content，将自动降级为全量下载。
 ///
 /// # Errors
-/// - 当网络请求发起失败或 HTTP 响应非 2xx 时返回 [`UpdateError::Network`] 或 [`UpdateError::HttpStatus`]。
-/// - 当用户触发取消信号时物理销毁临时文件并返回 [`UpdateError::Cancelled`]。
-/// - 当磁盘写入失败时返回 [`UpdateError::Io`]。
+/// - 超过最大重试次数时返回最后一次的网络或 I/O 错误。
+/// - 当用户主动取消时返回 [`UpdateError::Cancelled`]。
 pub fn download_file_blocking<F>(
     client: &reqwest::blocking::Client,
     options: &DownloadOptions<'_>,
@@ -127,13 +152,67 @@ pub fn download_file_blocking<F>(
 where
     F: FnMut(UpdateEvent),
 {
-    log::info!("正在发起同步下载请求，目标地址: {}", options.url);
-    let mut response = client
-        .get(options.url)
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match download_file_blocking_attempt(client, options, &mut event_callback) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if !is_retryable_error(&e) || attempts > options.max_retries {
+                    return Err(e);
+                }
+                let backoff = calculate_backoff(options.retry_delay, attempts);
+                log::warn!(
+                    "同步下载遇到暂时性故障: {}，正在等待 {:?} 进行第 {}/{} 次重试",
+                    e,
+                    backoff,
+                    attempts,
+                    options.max_retries
+                );
+                std::thread::sleep(backoff);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "blocking")]
+fn download_file_blocking_attempt<F>(
+    client: &reqwest::blocking::Client,
+    options: &DownloadOptions<'_>,
+    event_callback: &mut F,
+) -> Result<()>
+where
+    F: FnMut(UpdateEvent),
+{
+    let existing_len = fs::metadata(options.target_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let mut request = client.get(options.url);
+    if existing_len > 0 {
+        log::info!(
+            "检测到已存在部分下载文件 ({} 字节)，尝试发起 Range 断点续传",
+            existing_len
+        );
+        request = request.header(RANGE, format!("bytes={}-", existing_len));
+    } else {
+        log::info!("发起全新同步下载请求，目标地址: {}", options.url);
+    }
+
+    let mut response = request
         .send()
         .map_err(|e| UpdateError::Network(format!("发起下载请求失败: {}", e)))?;
 
     let status = response.status();
+    if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        log::warn!("Range 范围无效（416），清除损坏或超长临时文件后重新全量下载");
+        let _ = fs::remove_file(options.target_path);
+        return Err(UpdateError::HttpStatus {
+            status_code: 416,
+            message: "HTTP 416 Range Not Satisfiable".to_string(),
+        });
+    }
+
     if !status.is_success() {
         return Err(UpdateError::HttpStatus {
             status_code: status.as_u16(),
@@ -141,20 +220,32 @@ where
         });
     }
 
-    let total_bytes = response.content_length();
-    event_callback(UpdateEvent::DownloadStarted { total_bytes });
-
     if let Some(parent) = options.target_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let file = File::create(options.target_path)?;
+    let (file, initial_downloaded, total_bytes) = if status == StatusCode::PARTIAL_CONTENT {
+        let remaining = response.content_length();
+        let total = remaining.map(|r| existing_len.saturating_add(r));
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(options.target_path)?;
+        (f, existing_len, total)
+    } else {
+        let total = response.content_length();
+        let f = File::create(options.target_path)?;
+        (f, 0, total)
+    };
+
+    event_callback(UpdateEvent::DownloadStarted { total_bytes });
     pipe_blocking_stream(
         &mut response,
         file,
+        initial_downloaded,
         total_bytes,
         options,
-        &mut event_callback,
+        event_callback,
     )?;
 
     log::info!(
@@ -168,6 +259,7 @@ where
 fn pipe_blocking_stream<F>(
     response: &mut reqwest::blocking::Response,
     mut file: File,
+    initial_downloaded: u64,
     total_bytes: Option<u64>,
     options: &DownloadOptions<'_>,
     event_callback: &mut F,
@@ -175,7 +267,7 @@ fn pipe_blocking_stream<F>(
 where
     F: FnMut(UpdateEvent),
 {
-    let mut downloaded_bytes: u64 = 0;
+    let mut downloaded_bytes: u64 = initial_downloaded;
     let mut tracker = DownloadProgressTracker::new(total_bytes);
     let mut buffer = [0u8; BUFFER_SIZE];
 
@@ -183,29 +275,21 @@ where
         if let Some(ref flag) = options.cancel_flag
             && flag.load(Ordering::Relaxed)
         {
-            log::warn!("检测到用户主动取消下载信号，正在清理临时文件");
-            drop(file);
-            let _ = fs::remove_file(options.target_path);
+            log::warn!("检测到用户主动取消下载信号，保留已下载文件以供断点续传");
             return Err(UpdateError::Cancelled);
         }
 
         let read_bytes = match response.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => n,
-            Err(e) => {
-                drop(file);
-                let _ = fs::remove_file(options.target_path);
-                return Err(UpdateError::Io(e));
-            }
+            Err(e) => return Err(UpdateError::Io(e)),
         };
 
         if let Err(e) = file.write_all(&buffer[..read_bytes]) {
-            drop(file);
-            let _ = fs::remove_file(options.target_path);
             return Err(UpdateError::Io(e));
         }
 
-        downloaded_bytes += read_bytes as u64;
+        downloaded_bytes = downloaded_bytes.saturating_add(read_bytes as u64);
         let (percent, speed_bytes_per_sec, eta) = tracker.update(downloaded_bytes);
 
         event_callback(UpdateEvent::DownloadProgress {
@@ -222,17 +306,16 @@ where
 }
 
 #[cfg(feature = "async")]
-/// 异步流式下载更新包到目标文件
+/// 异步流式下载更新包（支持 HTTP Range 断点续传与指数退避网络重试）
 ///
 /// # 设计原理
-/// - **实现初衷**：利用异步数据流（`bytes_stream`）逐块拉取更新包，契合 Tokio 异步事件驱动架构。
-/// - **核心优势**：在单线程或多任务并发上下文中不阻塞 OS 线程，资源开销小。
+/// - **实现初衷**：利用异步事件驱动模型实现弱网退避重试与 Range 断点续传，不阻塞 OS 线程。
+/// - **核心优势**：在单线程或多任务并发上下文中资源开销小，主动取消保留断点切片以供续传。
 /// - **代价与局限**：回调函数需满足 `Send` 约束。
 ///
 /// # Errors
-/// - 当异步网络请求失败或响应非 2xx 时返回 [`UpdateError::Network`] 或 [`UpdateError::HttpStatus`]。
-/// - 当用户触发取消信号时物理销毁临时文件并返回 [`UpdateError::Cancelled`]。
-/// - 当文件落盘失败时返回 [`UpdateError::Io`]。
+/// - 超过最大重试次数时返回最后一次的网络或 I/O 错误。
+/// - 当用户主动取消时返回 [`UpdateError::Cancelled`]。
 pub async fn download_file_async<F>(
     client: &reqwest::Client,
     options: &DownloadOptions<'_>,
@@ -241,14 +324,68 @@ pub async fn download_file_async<F>(
 where
     F: FnMut(UpdateEvent) + Send,
 {
-    log::info!("正在发起异步下载请求，目标地址: {}", options.url);
-    let response = client
-        .get(options.url)
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match download_file_async_attempt(client, options, &mut event_callback).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if !is_retryable_error(&e) || attempts > options.max_retries {
+                    return Err(e);
+                }
+                let backoff = calculate_backoff(options.retry_delay, attempts);
+                log::warn!(
+                    "异步下载遇到暂时性故障: {}，正在等待 {:?} 进行第 {}/{} 次重试",
+                    e,
+                    backoff,
+                    attempts,
+                    options.max_retries
+                );
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "async")]
+async fn download_file_async_attempt<F>(
+    client: &reqwest::Client,
+    options: &DownloadOptions<'_>,
+    event_callback: &mut F,
+) -> Result<()>
+where
+    F: FnMut(UpdateEvent) + Send,
+{
+    let existing_len = fs::metadata(options.target_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let mut request = client.get(options.url);
+    if existing_len > 0 {
+        log::info!(
+            "检测到已存在部分下载文件 ({} 字节)，尝试发起异步 Range 断点续传",
+            existing_len
+        );
+        request = request.header(RANGE, format!("bytes={}-", existing_len));
+    } else {
+        log::info!("发起全新异步下载请求，目标地址: {}", options.url);
+    }
+
+    let response = request
         .send()
         .await
         .map_err(|e| UpdateError::Network(format!("发起异步下载请求失败: {}", e)))?;
 
     let status = response.status();
+    if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        log::warn!("Range 范围无效（416），清除损坏或超长临时文件后重新全量下载");
+        let _ = fs::remove_file(options.target_path);
+        return Err(UpdateError::HttpStatus {
+            status_code: 416,
+            message: "HTTP 416 Range Not Satisfiable".to_string(),
+        });
+    }
+
     if !status.is_success() {
         return Err(UpdateError::HttpStatus {
             status_code: status.as_u16(),
@@ -256,15 +393,34 @@ where
         });
     }
 
-    let total_bytes = response.content_length();
-    event_callback(UpdateEvent::DownloadStarted { total_bytes });
-
     if let Some(parent) = options.target_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let file = File::create(options.target_path)?;
-    pipe_async_stream(response, file, total_bytes, options, &mut event_callback).await?;
+    let (file, initial_downloaded, total_bytes) = if status == StatusCode::PARTIAL_CONTENT {
+        let remaining = response.content_length();
+        let total = remaining.map(|r| existing_len.saturating_add(r));
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(options.target_path)?;
+        (f, existing_len, total)
+    } else {
+        let total = response.content_length();
+        let f = File::create(options.target_path)?;
+        (f, 0, total)
+    };
+
+    event_callback(UpdateEvent::DownloadStarted { total_bytes });
+    pipe_async_stream(
+        response,
+        file,
+        initial_downloaded,
+        total_bytes,
+        options,
+        event_callback,
+    )
+    .await?;
 
     log::info!(
         "更新包异步下载完成，临时路径: {}",
@@ -277,6 +433,7 @@ where
 async fn pipe_async_stream<F>(
     response: reqwest::Response,
     mut file: File,
+    initial_downloaded: u64,
     total_bytes: Option<u64>,
     options: &DownloadOptions<'_>,
     event_callback: &mut F,
@@ -285,7 +442,7 @@ where
     F: FnMut(UpdateEvent) + Send,
 {
     use futures_util::StreamExt;
-    let mut downloaded_bytes: u64 = 0;
+    let mut downloaded_bytes: u64 = initial_downloaded;
     let mut tracker = DownloadProgressTracker::new(total_bytes);
     let mut stream = response.bytes_stream();
 
@@ -293,28 +450,20 @@ where
         if let Some(ref flag) = options.cancel_flag
             && flag.load(Ordering::Relaxed)
         {
-            log::warn!("检测到用户主动取消异步下载信号，正在清理临时文件");
-            drop(file);
-            let _ = fs::remove_file(options.target_path);
+            log::warn!("检测到用户主动取消异步下载信号，保留已下载文件以供断点续传");
             return Err(UpdateError::Cancelled);
         }
 
         let chunk = match chunk_res {
             Ok(c) => c,
-            Err(e) => {
-                drop(file);
-                let _ = fs::remove_file(options.target_path);
-                return Err(UpdateError::Network(format!("下载数据流中断: {}", e)));
-            }
+            Err(e) => return Err(UpdateError::Network(format!("下载数据流中断: {}", e))),
         };
 
         if let Err(e) = file.write_all(&chunk) {
-            drop(file);
-            let _ = fs::remove_file(options.target_path);
             return Err(UpdateError::Io(e));
         }
 
-        downloaded_bytes += chunk.len() as u64;
+        downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
         let (percent, speed_bytes_per_sec, eta) = tracker.update(downloaded_bytes);
 
         event_callback(UpdateEvent::DownloadProgress {
@@ -364,5 +513,53 @@ mod tests {
         assert_eq!(percent, Some(50.0));
         assert_eq!(speed, Some(1_000_000));
         assert_eq!(eta, Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_calculate_backoff_exponential_growth_and_cap() {
+        let base = Duration::from_secs(1);
+        // attempt 1: 1 * 2^0 = 1s
+        assert_eq!(calculate_backoff(base, 1), Duration::from_secs(1));
+        // attempt 2: 1 * 2^1 = 2s
+        assert_eq!(calculate_backoff(base, 2), Duration::from_secs(2));
+        // attempt 3: 1 * 2^2 = 4s
+        assert_eq!(calculate_backoff(base, 3), Duration::from_secs(4));
+        // attempt 10: 1 * 2^9 = 512s，但应被 60s 上限截断
+        assert_eq!(calculate_backoff(base, 10), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_is_retryable_error_rules() {
+        // 用户主动取消不可重试
+        assert!(!is_retryable_error(&UpdateError::Cancelled));
+
+        // 404 Not Found 不可重试
+        assert!(!is_retryable_error(&UpdateError::HttpStatus {
+            status_code: 404,
+            message: "Not Found".to_string(),
+        }));
+
+        // 408 Timeout 可重试
+        assert!(is_retryable_error(&UpdateError::HttpStatus {
+            status_code: 408,
+            message: "Request Timeout".to_string(),
+        }));
+
+        // 429 Too Many Requests 可重试
+        assert!(is_retryable_error(&UpdateError::HttpStatus {
+            status_code: 429,
+            message: "Too Many Requests".to_string(),
+        }));
+
+        // 502 Bad Gateway 可重试
+        assert!(is_retryable_error(&UpdateError::HttpStatus {
+            status_code: 502,
+            message: "Bad Gateway".to_string(),
+        }));
+
+        // 普通网络连接错误可重试
+        assert!(is_retryable_error(&UpdateError::Network(
+            "连接超时重置".to_string()
+        )));
     }
 }

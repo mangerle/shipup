@@ -42,6 +42,8 @@ pub struct Updater {
     user_agent: Option<String>,
     headers: HashMap<String, String>,
     proxy: Option<String>,
+    max_retries: u32,
+    retry_delay: Duration,
     target: String,
     allow_downgrade: bool,
 }
@@ -64,6 +66,8 @@ impl Updater {
             user_agent: config.user_agent,
             headers: config.headers,
             proxy: config.proxy,
+            max_retries: config.max_retries,
+            retry_delay: config.retry_delay,
             target: config.target,
             allow_downgrade: config.allow_downgrade,
         }
@@ -173,6 +177,8 @@ impl Updater {
             user_agent: self.user_agent.clone(),
             headers: self.headers.clone(),
             proxy: self.proxy.clone(),
+            max_retries: self.max_retries,
+            retry_delay: self.retry_delay,
         }))
     }
 }
@@ -191,6 +197,8 @@ pub struct Update {
     user_agent: Option<String>,
     headers: HashMap<String, String>,
     proxy: Option<String>,
+    max_retries: u32,
+    retry_delay: Duration,
 }
 
 impl Update {
@@ -262,6 +270,8 @@ impl Update {
             url: &self.release.package.url,
             target_path: &temp_download_path,
             cancel_flag,
+            max_retries: self.max_retries,
+            retry_delay: self.retry_delay,
         };
 
         download::download_file_blocking(&client, &options, &mut callback)?;
@@ -307,6 +317,8 @@ impl Update {
             url: &self.release.package.url,
             target_path: &temp_download_path,
             cancel_flag,
+            max_retries: self.max_retries,
+            retry_delay: self.retry_delay,
         };
 
         download::download_file_async(&client, &options, &mut callback).await?;
