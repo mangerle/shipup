@@ -19,6 +19,7 @@ pub mod error;
 pub mod event;
 pub mod manifest;
 pub mod platform;
+pub mod recovery;
 pub mod restart;
 pub mod signature;
 pub mod updater;
@@ -32,5 +33,9 @@ pub use manifest::{
     current_target_triple,
 };
 pub use platform::{cleanup_old_backups, get_same_volume_temp_path, get_temp_download_path};
+pub use recovery::{
+    HealthCheckStatus, check_and_recover_current, confirm_update_success,
+    confirm_update_success_in_dir,
+};
 pub use restart::{RestartContext, SHIPUP_RESTARTED_ARG, is_restarted_by_shipup, restart_with};
 pub use updater::{Update, Updater};

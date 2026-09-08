@@ -55,7 +55,27 @@ impl Updater {
     }
 
     pub(crate) fn new(config: UpdaterConfig) -> Self {
-        cleanup_old_backups();
+        // 执行启动健康检查与连续崩溃异常自愈
+        if let Ok(status) =
+            crate::recovery::check_and_recover_current(crate::recovery::DEFAULT_MAX_CRASH_ATTEMPTS)
+        {
+            match status {
+                crate::recovery::HealthCheckStatus::RolledBack { from_version } => {
+                    log::warn!(
+                        "检测到新版本 ({}) 启动多次异常崩溃，已触发自愈并回滚至历史正常版本",
+                        from_version
+                    );
+                }
+                crate::recovery::HealthCheckStatus::PendingConfirmation { attempts } => {
+                    log::info!("当前版本处于更新健康确认观察期，启动计数: {}", attempts);
+                }
+                crate::recovery::HealthCheckStatus::Normal => {
+                    cleanup_old_backups();
+                }
+            }
+        } else {
+            cleanup_old_backups();
+        }
 
         Self {
             current_version: config.current_version,
@@ -376,6 +396,7 @@ impl Update {
                 callback(UpdateEvent::Installing);
                 replace_binary(temp_path)?;
                 let _ = fs::remove_file(temp_path);
+                self.record_state_if_possible();
                 callback(UpdateEvent::ReadyToRestart);
             }
             PackageType::Archive => {
@@ -414,6 +435,7 @@ impl Update {
                 let _ = fs::remove_file(temp_path);
                 apply_result?;
 
+                self.record_state_if_possible();
                 callback(UpdateEvent::ReadyToRestart);
             }
             PackageType::Installer => {
@@ -428,6 +450,25 @@ impl Update {
         }
 
         Ok(())
+    }
+
+    fn record_state_if_possible(&self) {
+        if let Ok(current_exe) = std::env::current_exe()
+            && let Some(target_dir) = current_exe.parent()
+        {
+            let backup_path = target_dir.join(format!(
+                "{}.shipup.old",
+                current_exe
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            ));
+            let _ = crate::recovery::record_update_state(
+                target_dir,
+                &self.release.version.to_string(),
+                &backup_path,
+            );
+        }
     }
 
     /// 优雅重启宿主程序，并在进程退出前执行清理闭包

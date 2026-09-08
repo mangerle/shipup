@@ -71,6 +71,10 @@ pub enum UpdateError {
     #[error("更新流程已被用户主动取消")]
     Cancelled,
 
+    /// 新版本启动自愈回滚状态
+    #[error("新版本启动连续崩溃，已自动触发自愈回滚至历史版本: {0}")]
+    AutoRollback(String),
+
     /// SemVer 版本号格式错误
     #[error("版本号格式解析错误: {0}")]
     SemVer(#[from] SemverError),
