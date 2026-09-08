@@ -1,4 +1,4 @@
-// shipup 跨平台自更新系统 - 生命周期事件与进度模型
+use std::time::Duration;
 
 /// 更新生命周期事件枚举
 ///
@@ -26,6 +26,10 @@ pub enum UpdateEvent {
         total_bytes: Option<u64>,
         /// 下载百分比进度（0.0 ~ 100.0）
         percent: Option<f32>,
+        /// 瞬时下载速率（字节/秒，若无法采样估算则为 None）
+        speed_bytes_per_sec: Option<u64>,
+        /// 预估剩余下载耗时（若无法预估则为 None）
+        eta: Option<Duration>,
     },
 
     /// 正在校验 SHA-256 哈希完整性

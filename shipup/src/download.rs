@@ -11,9 +11,84 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "blocking")]
 const BUFFER_SIZE: usize = 64 * 1024; // 64KB 缓冲区
+
+/// 进度度量采样器
+///
+/// # 设计原理
+/// - **实现初衷**：在流式下载过程中，单次循环可能仅有数十微秒或几毫秒间隔。若每次微小块读取都重新计算速率，
+///   数值会产生剧烈抖动且增加无谓的系统时间查询。
+/// - **核心优势**：通过固定时间窗口（例如 500ms）进行速率平滑计算，结合饱和算术避免除零与溢出。
+/// - **代价与局限**：首个 500ms 窗口内的瞬时速率基于已下载总耗时做粗略均值预估。
+#[derive(Debug)]
+pub(crate) struct DownloadProgressTracker {
+    start_time: Instant,
+    last_sample_time: Instant,
+    last_sample_bytes: u64,
+    current_speed: Option<u64>,
+    total_bytes: Option<u64>,
+}
+
+impl DownloadProgressTracker {
+    pub(crate) fn new(total_bytes: Option<u64>) -> Self {
+        let now = Instant::now();
+        Self {
+            start_time: now,
+            last_sample_time: now,
+            last_sample_bytes: 0,
+            current_speed: None,
+            total_bytes,
+        }
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        downloaded_bytes: u64,
+    ) -> (Option<f32>, Option<u64>, Option<Duration>) {
+        let now = Instant::now();
+        let elapsed_since_sample = now.duration_since(self.last_sample_time);
+
+        // 每 500ms 刷新一次瞬时采样速率
+        if elapsed_since_sample.as_millis() >= 500 {
+            let bytes_in_window = downloaded_bytes.saturating_sub(self.last_sample_bytes);
+            let secs = elapsed_since_sample.as_secs_f64();
+            if secs > 0.0 {
+                let speed = (bytes_in_window as f64 / secs).round() as u64;
+                self.current_speed = Some(speed);
+            }
+            self.last_sample_time = now;
+            self.last_sample_bytes = downloaded_bytes;
+        } else if self.current_speed.is_none() {
+            let total_elapsed = now.duration_since(self.start_time).as_secs_f64();
+            if total_elapsed >= 0.1 {
+                let speed = (downloaded_bytes as f64 / total_elapsed).round() as u64;
+                self.current_speed = Some(speed);
+            }
+        }
+
+        let percent = self.total_bytes.map(|total| {
+            if total > 0 {
+                ((downloaded_bytes as f64 / total as f64) * 100.0) as f32
+            } else {
+                0.0
+            }
+        });
+
+        let eta = match (self.total_bytes, self.current_speed) {
+            (Some(total), Some(speed)) if speed > 0 && total > downloaded_bytes => {
+                let remaining_bytes = total - downloaded_bytes;
+                let remaining_secs = remaining_bytes / speed;
+                Some(Duration::from_secs(remaining_secs))
+            }
+            _ => None,
+        };
+
+        (percent, self.current_speed, eta)
+    }
+}
 
 /// 更新包流式下载配置选项
 ///
@@ -101,6 +176,7 @@ where
     F: FnMut(UpdateEvent),
 {
     let mut downloaded_bytes: u64 = 0;
+    let mut tracker = DownloadProgressTracker::new(total_bytes);
     let mut buffer = [0u8; BUFFER_SIZE];
 
     loop {
@@ -130,18 +206,14 @@ where
         }
 
         downloaded_bytes += read_bytes as u64;
-        let percent = total_bytes.map(|total| {
-            if total > 0 {
-                (downloaded_bytes as f32 / total as f32) * 100.0
-            } else {
-                0.0
-            }
-        });
+        let (percent, speed_bytes_per_sec, eta) = tracker.update(downloaded_bytes);
 
         event_callback(UpdateEvent::DownloadProgress {
             downloaded_bytes,
             total_bytes,
             percent,
+            speed_bytes_per_sec,
+            eta,
         });
     }
 
@@ -214,6 +286,7 @@ where
 {
     use futures_util::StreamExt;
     let mut downloaded_bytes: u64 = 0;
+    let mut tracker = DownloadProgressTracker::new(total_bytes);
     let mut stream = response.bytes_stream();
 
     while let Some(chunk_res) = stream.next().await {
@@ -242,21 +315,54 @@ where
         }
 
         downloaded_bytes += chunk.len() as u64;
-        let percent = total_bytes.map(|total| {
-            if total > 0 {
-                (downloaded_bytes as f32 / total as f32) * 100.0
-            } else {
-                0.0
-            }
-        });
+        let (percent, speed_bytes_per_sec, eta) = tracker.update(downloaded_bytes);
 
         event_callback(UpdateEvent::DownloadProgress {
             downloaded_bytes,
             total_bytes,
             percent,
+            speed_bytes_per_sec,
+            eta,
         });
     }
 
     file.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_download_progress_tracker_zero_and_percent() {
+        let mut tracker = DownloadProgressTracker::new(Some(1000));
+        let (percent, _speed, _eta) = tracker.update(0);
+        assert_eq!(percent, Some(0.0));
+
+        let (percent, _speed, _eta) = tracker.update(500);
+        assert_eq!(percent, Some(50.0));
+
+        let (percent, _speed, _eta) = tracker.update(1000);
+        assert_eq!(percent, Some(100.0));
+    }
+
+    #[test]
+    fn test_download_progress_tracker_unknown_total() {
+        let mut tracker = DownloadProgressTracker::new(None);
+        let (percent, _speed, eta) = tracker.update(2048);
+        assert_eq!(percent, None);
+        assert_eq!(eta, None);
+    }
+
+    #[test]
+    fn test_download_progress_tracker_eta_calculation() {
+        let mut tracker = DownloadProgressTracker::new(Some(2_000_000));
+        // 手动模拟速率计算
+        tracker.current_speed = Some(1_000_000); // 1MB/s
+        let (percent, speed, eta) = tracker.update(1_000_000); // 剩余 1MB
+        assert_eq!(percent, Some(50.0));
+        assert_eq!(speed, Some(1_000_000));
+        assert_eq!(eta, Some(Duration::from_secs(1)));
+    }
 }
