@@ -356,30 +356,40 @@ impl Update {
             }
             PackageType::Archive => {
                 callback(UpdateEvent::ExtractingArchive);
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let sandbox_name = format!("shipup_sandbox_{}_{}", std::process::id(), timestamp);
                 let sandbox_dir = temp_path
                     .parent()
                     .unwrap_or_else(|| Path::new("."))
-                    .join("shipup_archive_sandbox");
+                    .join(sandbox_name);
 
-                let extracted_binary = extract_archive(
-                    temp_path,
-                    &sandbox_dir,
-                    self.release.package.executable_path.as_deref(),
-                )?;
+                let apply_result = (|| -> Result<()> {
+                    let extracted_binary = extract_archive(
+                        temp_path,
+                        &sandbox_dir,
+                        self.release.package.executable_path.as_deref(),
+                    )?;
 
-                callback(UpdateEvent::Installing);
+                    callback(UpdateEvent::Installing);
 
-                // 同步解压目录中除主程序外的全部伴随依赖（动态库、静态资源等）到宿主应用目录
-                let current_exe = std::env::current_exe()?;
-                if let Some(target_dir) = current_exe.parent() {
-                    let payload_dir = extracted_binary.parent().unwrap_or(&sandbox_dir);
-                    sync_extracted_payload(payload_dir, target_dir, &extracted_binary)?;
-                }
+                    // 同步解压目录中除主程序外的全部伴随依赖（动态库、静态资源等）到宿主应用目录
+                    let current_exe = std::env::current_exe()?;
+                    if let Some(target_dir) = current_exe.parent() {
+                        let payload_dir = extracted_binary.parent().unwrap_or(&sandbox_dir);
+                        sync_extracted_payload(payload_dir, target_dir, &extracted_binary)?;
+                    }
 
-                replace_binary(&extracted_binary)?;
+                    replace_binary(&extracted_binary)?;
+                    Ok(())
+                })();
 
                 let _ = fs::remove_dir_all(&sandbox_dir);
                 let _ = fs::remove_file(temp_path);
+                apply_result?;
+
                 callback(UpdateEvent::ReadyToRestart);
             }
             PackageType::Installer => {

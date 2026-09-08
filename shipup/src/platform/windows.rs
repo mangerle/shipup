@@ -31,7 +31,7 @@ pub fn cleanup_old_backup_files() {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
-                && file_name.ends_with(OLD_BACKUP_SUFFIX)
+                && (file_name.ends_with(OLD_BACKUP_SUFFIX) || file_name.ends_with(TEMP_SUFFIX))
             {
                 if let Err(e) = fs::remove_file(&path) {
                     log::debug!("清理遗留旧副本文件失败 ({}): {}", path.display(), e);
@@ -114,7 +114,7 @@ pub fn get_same_volume_temp_path() -> Result<PathBuf> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("app.exe");
-    let temp_name = format!("{}{}", exe_name, TEMP_SUFFIX);
+    let temp_name = format!("{}.{}.shipup.tmp", exe_name, std::process::id());
 
     let parent = current_exe
         .parent()
