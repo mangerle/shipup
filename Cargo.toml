@@ -21,7 +21,7 @@ categories = ["development-tools", "os"]
 
 [workspace.dependencies]
 # 内部子包统一声明
-shipup = { path = "shipup", default-features = false }
+shipup = { path = "shipup", version = "0.1.0", default-features = false }
 
 # 网络与异步
 reqwest = { version = "0.13", default-features = false }
