@@ -12,7 +12,7 @@ use crate::platform::{
     cleanup_old_backups, get_temp_download_path, replace_binary, spawn_installer,
 };
 use crate::restart::{RestartContext, restart_with};
-use crate::signature::{verify_ed25519, verify_sha256};
+use crate::signature::{verify_ed25519_file, verify_sha256_file};
 use semver::Version;
 use std::fs;
 use std::path::Path;
@@ -316,11 +316,9 @@ impl Update {
     where
         F: FnMut(UpdateEvent),
     {
-        let file_bytes = fs::read(temp_path)?;
-
         if let Some(ref checksum) = self.release.package.checksum {
             callback(UpdateEvent::VerifyingChecksum);
-            if let Err(e) = verify_sha256(&file_bytes, checksum) {
+            if let Err(e) = verify_sha256_file(temp_path, checksum) {
                 let _ = fs::remove_file(temp_path);
                 return Err(e);
             }
@@ -330,7 +328,7 @@ impl Update {
             callback(UpdateEvent::VerifyingSignature);
             match self.release.package.signature {
                 Some(ref sig) => {
-                    if let Err(e) = verify_ed25519(&file_bytes, sig, pub_key) {
+                    if let Err(e) = verify_ed25519_file(temp_path, sig, pub_key) {
                         let _ = fs::remove_file(temp_path);
                         return Err(e);
                     }

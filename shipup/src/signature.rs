@@ -5,6 +5,11 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+
+const HASH_BUFFER_SIZE: usize = 64 * 1024; // 64KB 流式缓冲区
 
 /// 校验内存中文件字节内容的 SHA-256 完整性哈希值
 ///
@@ -88,4 +93,60 @@ pub fn verify_ed25519(data: &[u8], base64_signature: &str, base64_public_key: &s
         .map_err(|_| UpdateError::InvalidSignature)?;
 
     Ok(())
+}
+
+/// 基于流式分块读取文件并校验 SHA-256 完整性哈希值
+///
+/// # 设计原理
+/// - **实现初衷**：彻底杜绝大文件（几百兆至数吉字节安装包）一次性读入内存造成的瞬时内存暴涨与 OOM。
+/// - **核心优势**：固定 64KB 缓冲区循环迭代哈希计算，无论目标文件多大，内存消耗始终恒定。
+///
+/// # Errors
+/// 当底层文件读取失败或计算哈希值与期望哈希不一致时返回对应错误。
+pub fn verify_sha256_file(file_path: &Path, expected_checksum: &str) -> Result<()> {
+    let mut file = File::open(file_path)?;
+    let mut buffer = [0u8; HASH_BUFFER_SIZE];
+    let mut hasher = Sha256::new();
+
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+
+    let expected_hex = expected_checksum
+        .strip_prefix("sha256:")
+        .unwrap_or(expected_checksum)
+        .trim();
+
+    let hash = hasher.finalize();
+    let mut actual_hex = String::with_capacity(hash.len() * 2);
+    for b in hash {
+        use std::fmt::Write;
+        let _ = write!(actual_hex, "{b:02x}");
+    }
+
+    if !actual_hex.eq_ignore_ascii_case(expected_hex) {
+        return Err(UpdateError::ChecksumMismatch {
+            expected: expected_hex.to_string(),
+            actual: actual_hex,
+        });
+    }
+
+    Ok(())
+}
+
+/// 针对文件路径执行 Ed25519 数字签名验证
+///
+/// # Errors
+/// 当文件读取失败或签名不匹配时返回错误。
+pub fn verify_ed25519_file(
+    file_path: &Path,
+    base64_signature: &str,
+    base64_public_key: &str,
+) -> Result<()> {
+    let data = std::fs::read(file_path)?;
+    verify_ed25519(&data, base64_signature, base64_public_key)
 }
