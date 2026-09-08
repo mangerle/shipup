@@ -125,10 +125,10 @@ fn unpack_single_zip_entry(
         return Ok(());
     }
 
-    if let Some(parent) = dest_path.parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = dest_path.parent()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent)?;
     }
 
     let mut out_file = File::create(dest_path)?;
@@ -239,10 +239,10 @@ fn unpack_single_tar_entry<R: Read>(
         return Ok(());
     }
 
-    if let Some(parent) = dest_path.parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = dest_path.parent()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent)?;
     }
 
     let mut out_file = File::create(dest_path)?;
@@ -289,10 +289,10 @@ fn find_single_executable(dir: &Path) -> Result<PathBuf> {
             if path.is_file() {
                 #[cfg(windows)]
                 {
-                    if let Some(ext) = path.extension() {
-                        if ext.eq_ignore_ascii_case("exe") {
-                            files.push(path);
-                        }
+                    if let Some(ext) = path.extension()
+                        && ext.eq_ignore_ascii_case("exe")
+                    {
+                        files.push(path);
                     }
                 }
                 #[cfg(not(windows))]
@@ -302,10 +302,10 @@ fn find_single_executable(dir: &Path) -> Result<PathBuf> {
             } else if path.is_dir() {
                 #[cfg(target_os = "macos")]
                 {
-                    if let Some(ext) = path.extension() {
-                        if ext.eq_ignore_ascii_case("app") {
-                            return Ok(path);
-                        }
+                    if let Some(ext) = path.extension()
+                        && ext.eq_ignore_ascii_case("app")
+                    {
+                        return Ok(path);
                     }
                 }
             }

@@ -212,25 +212,24 @@ impl Manifest {
         let current_version = options.current_version;
 
         // 1. 如果指定了特定通道且存在该通道配置，优先匹配通道
-        if let Some(ch) = options.channel {
-            if let Some(channel_info) = self.channels.get(ch) {
-                if let Some(package) = match_package(&channel_info.packages, options.target) {
-                    let is_mandatory = channel_info.force_update
-                        || channel_info
-                            .min_supported_version
-                            .as_ref()
-                            .is_some_and(|min_ver| current_version < min_ver);
+        if let Some(ch) = options.channel
+            && let Some(channel_info) = self.channels.get(ch)
+            && let Some(package) = match_package(&channel_info.packages, options.target)
+        {
+            let is_mandatory = channel_info.force_update
+                || channel_info
+                    .min_supported_version
+                    .as_ref()
+                    .is_some_and(|min_ver| current_version < min_ver);
 
-                    return Ok(ResolvedRelease {
-                        version: channel_info.version.clone(),
-                        min_supported_version: channel_info.min_supported_version.clone(),
-                        is_mandatory,
-                        pub_date: channel_info.pub_date.clone(),
-                        notes: channel_info.notes.clone(),
-                        package: package.clone(),
-                    });
-                }
-            }
+            return Ok(ResolvedRelease {
+                version: channel_info.version.clone(),
+                min_supported_version: channel_info.min_supported_version.clone(),
+                is_mandatory,
+                pub_date: channel_info.pub_date.clone(),
+                notes: channel_info.notes.clone(),
+                package: package.clone(),
+            });
         }
 
         // 2. 回退到顶层默认配置进行匹配

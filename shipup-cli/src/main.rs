@@ -1,7 +1,7 @@
 // shipup-cli 跨平台自更新系统 - 发布端打包与签名命令行工具
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
@@ -255,10 +255,10 @@ fn handle_release(args: &ReleaseArgs) -> Result<(), Box<dyn std::error::Error>> 
     );
 
     let json_output = serde_json::to_string_pretty(&manifest)?;
-    if let Some(parent) = args.manifest.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = args.manifest.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
     fs::write(&args.manifest, json_output)?;
 

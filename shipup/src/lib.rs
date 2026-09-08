@@ -28,9 +28,9 @@ pub use builder::{UpdaterBuilder, UpdaterConfig};
 pub use error::{Result, UpdateError};
 pub use event::UpdateEvent;
 pub use manifest::{
-    current_target_triple, ChannelInfo, Manifest, PackageInfo, PackageType, ResolveOptions,
-    ResolvedRelease,
+    ChannelInfo, Manifest, PackageInfo, PackageType, ResolveOptions, ResolvedRelease,
+    current_target_triple,
 };
 pub use platform::cleanup_old_backups;
-pub use restart::{is_restarted_by_shipup, restart_with, RestartContext, SHIPUP_RESTARTED_ARG};
+pub use restart::{RestartContext, SHIPUP_RESTARTED_ARG, is_restarted_by_shipup, restart_with};
 pub use updater::{Update, Updater};

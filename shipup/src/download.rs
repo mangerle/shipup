@@ -9,8 +9,8 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "blocking")]
 const BUFFER_SIZE: usize = 64 * 1024; // 64KB 缓冲区
@@ -104,13 +104,13 @@ where
     let mut buffer = [0u8; BUFFER_SIZE];
 
     loop {
-        if let Some(ref flag) = options.cancel_flag {
-            if flag.load(Ordering::Relaxed) {
-                log::warn!("检测到用户主动取消下载信号，正在清理临时文件");
-                drop(file);
-                let _ = fs::remove_file(options.target_path);
-                return Err(UpdateError::Cancelled);
-            }
+        if let Some(ref flag) = options.cancel_flag
+            && flag.load(Ordering::Relaxed)
+        {
+            log::warn!("检测到用户主动取消下载信号，正在清理临时文件");
+            drop(file);
+            let _ = fs::remove_file(options.target_path);
+            return Err(UpdateError::Cancelled);
         }
 
         let read_bytes = match response.read(&mut buffer) {
@@ -217,13 +217,13 @@ where
     let mut stream = response.bytes_stream();
 
     while let Some(chunk_res) = stream.next().await {
-        if let Some(ref flag) = options.cancel_flag {
-            if flag.load(Ordering::Relaxed) {
-                log::warn!("检测到用户主动取消异步下载信号，正在清理临时文件");
-                drop(file);
-                let _ = fs::remove_file(options.target_path);
-                return Err(UpdateError::Cancelled);
-            }
+        if let Some(ref flag) = options.cancel_flag
+            && flag.load(Ordering::Relaxed)
+        {
+            log::warn!("检测到用户主动取消异步下载信号，正在清理临时文件");
+            drop(file);
+            let _ = fs::remove_file(options.target_path);
+            return Err(UpdateError::Cancelled);
         }
 
         let chunk = match chunk_res {

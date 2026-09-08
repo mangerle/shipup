@@ -11,13 +11,13 @@ use crate::manifest::{Manifest, PackageType, ResolveOptions, ResolvedRelease};
 use crate::platform::{
     cleanup_old_backups, get_same_volume_temp_path, replace_binary, spawn_installer,
 };
-use crate::restart::{restart_with, RestartContext};
+use crate::restart::{RestartContext, restart_with};
 use crate::signature::{verify_ed25519, verify_sha256};
 use semver::Version;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 /// 更新器核心实体

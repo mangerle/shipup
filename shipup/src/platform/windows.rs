@@ -24,20 +24,19 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 /// - **核心优势**：自动无感闭环，不需要额外的清理批处理脚本或临时服务。
 /// - **代价与局限**：若由于权限受限未能删除，将在下一次启动时继续重试。
 pub fn cleanup_old_backup_files() {
-    if let Ok(current_exe) = env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            if let Ok(entries) = fs::read_dir(parent) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                        if file_name.ends_with(OLD_BACKUP_SUFFIX) {
-                            if let Err(e) = fs::remove_file(&path) {
-                                log::debug!("清理遗留旧副本文件失败 ({}): {}", path.display(), e);
-                            } else {
-                                log::debug!("成功清理遗留旧副本文件: {}", path.display());
-                            }
-                        }
-                    }
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(parent) = current_exe.parent()
+        && let Ok(entries) = fs::read_dir(parent)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+                && file_name.ends_with(OLD_BACKUP_SUFFIX)
+            {
+                if let Err(e) = fs::remove_file(&path) {
+                    log::debug!("清理遗留旧副本文件失败 ({}): {}", path.display(), e);
+                } else {
+                    log::debug!("成功清理遗留旧副本文件: {}", path.display());
                 }
             }
         }

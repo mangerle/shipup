@@ -1,13 +1,13 @@
 // shipup 跨平台自更新系统 - 核心逻辑单元与集成测试
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
 use semver::Version;
+use shipup::Updater;
 use shipup::manifest::{ChannelInfo, Manifest, PackageInfo, PackageType};
 use shipup::signature::{verify_ed25519, verify_sha256};
-use shipup::Updater;
 use std::collections::HashMap;
 
 #[test]
@@ -116,11 +116,13 @@ fn test_sha256_verification() {
     let expected = format!("sha256:{:x}", hasher.finalize());
 
     assert!(verify_sha256(payload, &expected).is_ok());
-    assert!(verify_sha256(
-        payload,
-        "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-    )
-    .is_err());
+    assert!(
+        verify_sha256(
+            payload,
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        )
+        .is_err()
+    );
 }
 
 #[test]

@@ -1,8 +1,8 @@
 // shipup 跨平台自更新系统 - SHA-256 完整性与 Ed25519 签名校验器
 
 use crate::error::{Result, UpdateError};
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 
