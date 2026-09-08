@@ -6,7 +6,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "通用、轻量级、无 UI 绑定的跨平台软件自更新系统"
+description.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 default = ["blocking", "async", "archive-zip", "archive-tar"]

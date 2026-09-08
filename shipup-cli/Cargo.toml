@@ -9,7 +9,7 @@ rust-version.workspace = true
 description = "shipup 开发者与 CI/CD 发布端命令行工具"
 
 [dependencies]
-shipup = { path = "../shipup", default-features = false }
+shipup = { workspace = true }
 
 clap = { workspace = true }
 log = { workspace = true }
