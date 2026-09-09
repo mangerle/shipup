@@ -8,7 +8,7 @@ use std::fs::{self, File};
 #[cfg(feature = "blocking")]
 use std::io::Read;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -20,8 +20,76 @@ use reqwest::header::RANGE;
 
 use crate::signature::verify_sha256_file;
 
-#[cfg(feature = "blocking")]
+#[cfg(any(feature = "blocking", feature = "async"))]
 const BUFFER_SIZE: usize = 64 * 1024; // 64KB 缓冲区
+
+/// URL 百分号解码（Percent-Decode）
+pub(crate) fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(hex) = u8::from_str_radix(&input[i + 1..i + 3], 16)
+        {
+            decoded.push(hex);
+            i += 3;
+            continue;
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| input.to_string())
+}
+
+/// 检查指定 URL 是否为本地或共享文件协议（file://，忽略 Scheme 大小写）
+pub(crate) fn is_file_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.len() >= 7 {
+        trimmed[..7].eq_ignore_ascii_case("file://")
+    } else {
+        false
+    }
+}
+
+/// 解析 file:// 协议 URL 为跨平台本地绝对路径
+pub(crate) fn parse_file_url_to_path(url: &str) -> Result<PathBuf> {
+    let trimmed = url.trim();
+    if !is_file_url(trimmed) {
+        return Err(UpdateError::FileProtocolNotAllowed(url.to_string()));
+    }
+    let after_scheme = &trimmed[7..];
+    // 去除 localhost 域名前缀（如 file://localhost/path）
+    let path_part = if after_scheme.to_ascii_lowercase().starts_with("localhost/") {
+        &after_scheme[10..]
+    } else {
+        after_scheme
+    };
+
+    let decoded = percent_decode(path_part);
+
+    #[cfg(windows)]
+    {
+        // 兼容 Windows 格式：file:///C:/path 或 file://C:/path
+        let normalized = if decoded.starts_with('/') && decoded.len() >= 3 {
+            let bytes = decoded.as_bytes();
+            if bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+                &decoded[1..]
+            } else {
+                &decoded[..]
+            }
+        } else {
+            &decoded[..]
+        };
+        Ok(PathBuf::from(normalized))
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(PathBuf::from(decoded))
+    }
+}
 
 /// 进度度量采样器
 ///
@@ -434,6 +502,52 @@ where
 }
 
 #[cfg(feature = "blocking")]
+fn copy_local_file_blocking<F>(options: &DownloadOptions<'_>, event_callback: &mut F) -> Result<()>
+where
+    F: FnMut(UpdateEvent),
+{
+    let src_path = parse_file_url_to_path(options.url)?;
+    let mut src_file = File::open(&src_path)?;
+    let total_bytes = src_file.metadata()?.len();
+
+    if let Some(expected) = options.expected_size
+        && total_bytes != expected
+    {
+        return Err(UpdateError::PayloadSizeMismatch {
+            expected,
+            actual: total_bytes,
+        });
+    }
+
+    if let Some(parent) = options.target_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = File::create(options.target_path)?;
+
+    event_callback(UpdateEvent::DownloadStarted {
+        total_bytes: Some(total_bytes),
+    });
+
+    let ctx = StreamPipeContext {
+        file,
+        initial_downloaded: 0,
+        total_bytes: Some(total_bytes),
+        expected_size: options.expected_size,
+        rate_limiter: options.max_bytes_per_sec.map(RateLimiter::new),
+        cancel_flag: options.cancel_flag.as_ref(),
+        event_callback,
+    };
+    pipe_blocking_stream(&mut src_file, ctx)?;
+
+    log::info!(
+        "本地文件流式复制完成，源文件: {}，目标临时文件: {}",
+        src_path.display(),
+        options.target_path.display()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "blocking")]
 fn download_file_blocking_attempt<F>(
     client: &reqwest::blocking::Client,
     options: &DownloadOptions<'_>,
@@ -442,6 +556,10 @@ fn download_file_blocking_attempt<F>(
 where
     F: FnMut(UpdateEvent),
 {
+    if is_file_url(options.url) {
+        return copy_local_file_blocking(options, event_callback);
+    }
+
     let existing_len = fs::metadata(options.target_path)
         .map(|m| m.len())
         .unwrap_or(0);
@@ -554,11 +672,9 @@ struct StreamPipeContext<'a, TFile, F> {
 }
 
 #[cfg(feature = "blocking")]
-fn pipe_blocking_stream<F>(
-    response: &mut reqwest::blocking::Response,
-    mut ctx: StreamPipeContext<'_, File, F>,
-) -> Result<()>
+fn pipe_blocking_stream<R, F>(source: &mut R, mut ctx: StreamPipeContext<'_, File, F>) -> Result<()>
 where
+    R: Read,
     F: FnMut(UpdateEvent),
 {
     let mut downloaded_bytes: u64 = ctx.initial_downloaded;
@@ -573,7 +689,7 @@ where
             return Err(UpdateError::Cancelled);
         }
 
-        let read_bytes = match response.read(&mut buffer) {
+        let read_bytes = match source.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => return Err(UpdateError::Io(e)),
@@ -673,6 +789,82 @@ where
 }
 
 #[cfg(feature = "async")]
+async fn copy_local_file_async<F>(
+    options: &DownloadOptions<'_>,
+    event_callback: &mut F,
+) -> Result<()>
+where
+    F: FnMut(UpdateEvent) + Send,
+{
+    use tokio::io::AsyncReadExt;
+    let src_path = parse_file_url_to_path(options.url)?;
+    let mut src_file = tokio::fs::File::open(&src_path).await?;
+    let total_bytes = src_file.metadata().await?.len();
+
+    if let Some(expected) = options.expected_size
+        && total_bytes != expected
+    {
+        return Err(UpdateError::PayloadSizeMismatch {
+            expected,
+            actual: total_bytes,
+        });
+    }
+
+    if let Some(parent) = options.target_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut file = tokio::fs::File::create(options.target_path).await?;
+
+    event_callback(UpdateEvent::DownloadStarted {
+        total_bytes: Some(total_bytes),
+    });
+
+    let mut downloaded_bytes: u64 = 0;
+    let mut tracker = DownloadProgressTracker::new(Some(total_bytes));
+    let mut rate_limiter = options.max_bytes_per_sec.map(RateLimiter::new);
+    let mut buffer = [0u8; BUFFER_SIZE];
+
+    loop {
+        if let Some(flag) = options.cancel_flag.as_ref()
+            && flag.load(Ordering::Relaxed)
+        {
+            log::warn!("检测到用户主动取消本地文件复制信号");
+            return Err(UpdateError::Cancelled);
+        }
+
+        let read_bytes = match src_file.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => return Err(UpdateError::Io(e)),
+        };
+
+        downloaded_bytes = downloaded_bytes.saturating_add(read_bytes as u64);
+        tokio::io::AsyncWriteExt::write_all(&mut file, &buffer[..read_bytes]).await?;
+
+        if let Some(ref mut limiter) = rate_limiter {
+            limiter.record_and_throttle_async(read_bytes).await;
+        }
+
+        let (percent, speed_bytes_per_sec, eta) = tracker.update(downloaded_bytes);
+        event_callback(UpdateEvent::DownloadProgress {
+            downloaded_bytes,
+            total_bytes: Some(total_bytes),
+            percent,
+            speed_bytes_per_sec,
+            eta,
+        });
+    }
+
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    log::info!(
+        "异步本地文件流式复制完成，源文件: {}，目标临时文件: {}",
+        src_path.display(),
+        options.target_path.display()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "async")]
 async fn download_file_async_attempt<F>(
     client: &reqwest::Client,
     options: &DownloadOptions<'_>,
@@ -681,6 +873,10 @@ async fn download_file_async_attempt<F>(
 where
     F: FnMut(UpdateEvent) + Send,
 {
+    if is_file_url(options.url) {
+        return copy_local_file_async(options, event_callback).await;
+    }
+
     let existing_len = match tokio::fs::metadata(options.target_path).await {
         Ok(m) => m.len(),
         Err(_) => 0,
@@ -1042,5 +1238,74 @@ mod tests {
         let start = Instant::now();
         limiter.record_and_throttle_blocking(512);
         assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_parse_file_url_to_path() {
+        // 非 file:// 报错
+        assert!(parse_file_url_to_path("https://example.com/test").is_err());
+
+        // 带 localhost
+        let _parsed = parse_file_url_to_path("file://localhost/path/to/file.txt").unwrap();
+        #[cfg(not(windows))]
+        assert_eq!(_parsed, PathBuf::from("/path/to/file.txt"));
+
+        // 百分号解码
+        let decoded = parse_file_url_to_path("file:///path/to/my%20file.txt").unwrap();
+        assert!(decoded.to_string_lossy().contains("my file.txt"));
+
+        #[cfg(windows)]
+        {
+            let win_path = parse_file_url_to_path("file:///C:/Windows/notepad.exe").unwrap();
+            assert_eq!(win_path, PathBuf::from("C:/Windows/notepad.exe"));
+        }
+    }
+
+    #[cfg(feature = "blocking")]
+    #[test]
+    fn test_copy_local_file_blocking_and_events() {
+        let temp_dir = std::env::temp_dir();
+        let src_file = temp_dir.join(format!("shipup_src_{}.bin", std::process::id()));
+        let dst_file = temp_dir.join(format!("shipup_dst_{}.bin", std::process::id()));
+        let data = b"offline package payload test content";
+        fs::write(&src_file, data).unwrap();
+
+        let src_url = if cfg!(windows) {
+            format!(
+                "file:///{}",
+                src_file.display().to_string().replace('\\', "/")
+            )
+        } else {
+            format!("file://{}", src_file.display())
+        };
+
+        let mut events = Vec::new();
+        let options = DownloadOptions {
+            url: &src_url,
+            target_path: &dst_file,
+            cancel_flag: None,
+            max_retries: 1,
+            retry_delay: Duration::from_millis(10),
+            expected_checksum: None,
+            expected_size: Some(data.len() as u64),
+            max_bytes_per_sec: None,
+        };
+
+        let res = copy_local_file_blocking(&options, &mut |ev| events.push(ev));
+        assert!(res.is_ok());
+        assert_eq!(fs::read(&dst_file).unwrap(), data);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, UpdateEvent::DownloadStarted { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, UpdateEvent::DownloadProgress { .. }))
+        );
+
+        let _ = fs::remove_file(&src_file);
+        let _ = fs::remove_file(&dst_file);
     }
 }

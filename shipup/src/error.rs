@@ -102,6 +102,12 @@ pub enum UpdateError {
     /// 目标磁盘可用存储空间不足
     #[error("目标磁盘可用空间不足: 需要至少 {required} 字节，当前磁盘剩余可用 {available} 字节")]
     InsufficientDiskSpace { required: u64, available: u64 },
+
+    /// 本地文件传输协议受限拦截（如未开启 allow_file_protocol）
+    #[error(
+        "本地文件传输协议受限: 地址 '{0}' 采用 file:// 协议，需通过 allow_file_protocol 显式允许"
+    )]
+    FileProtocolNotAllowed(String),
 }
 
 impl From<semver::Error> for UpdateError {

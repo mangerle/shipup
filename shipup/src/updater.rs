@@ -47,6 +47,7 @@ pub(crate) struct NetworkSecurityConfig {
     pub dangerous_insecure_transport_protocol: bool,
     pub require_signature: bool,
     pub max_bytes_per_sec: Option<u64>,
+    pub allow_file_protocol: bool,
 }
 
 /// 更新器内部共享核心状态实体
@@ -60,6 +61,7 @@ struct UpdaterInner {
     version_comparator: Option<VersionComparator>,
     preference: Mutex<UpdatePreference>,
     preference_path: Option<PathBuf>,
+    fallback_manifest: Option<Manifest>,
 }
 
 impl std::fmt::Debug for UpdaterInner {
@@ -76,6 +78,7 @@ impl std::fmt::Debug for UpdaterInner {
                 &self.version_comparator.is_some(),
             )
             .field("preference_path", &self.preference_path)
+            .field("has_fallback_manifest", &self.fallback_manifest.is_some())
             .finish()
     }
 }
@@ -104,6 +107,11 @@ impl Updater {
     /// 获取当前配置的全部更新检查端点列表切片
     pub fn endpoints(&self) -> &[String] {
         &self.inner.endpoints
+    }
+
+    /// 获取当前配置的内嵌 Fallback Manifest 兜底清单只读引用（若未配置则返回 None）
+    pub fn fallback_manifest(&self) -> Option<&Manifest> {
+        self.inner.fallback_manifest.as_ref()
     }
 
     /// 标记跳过特定版本升级提醒并持久化到磁盘
@@ -253,10 +261,12 @@ impl Updater {
                         .dangerous_insecure_transport_protocol,
                     require_signature: config.require_signature,
                     max_bytes_per_sec: config.max_bytes_per_sec,
+                    allow_file_protocol: config.allow_file_protocol,
                 }),
                 version_comparator: config.version_comparator,
                 preference: Mutex::new(preference),
                 preference_path,
+                fallback_manifest: config.fallback_manifest,
             }),
         }
     }
@@ -294,7 +304,18 @@ impl Updater {
                 endpoint
             );
 
-            match fetch_manifest_blocking(&client, &endpoint) {
+            let fetch_result = if download::is_file_url(&endpoint) {
+                if !self.inner.config.allow_file_protocol {
+                    Err(UpdateError::FileProtocolNotAllowed(endpoint.clone()))
+                } else {
+                    let path = download::parse_file_url_to_path(&endpoint)?;
+                    fs::read_to_string(&path).map_err(UpdateError::Io)
+                }
+            } else {
+                fetch_manifest_blocking(&client, &endpoint)
+            };
+
+            match fetch_result {
                 Ok(body) => match self.evaluate_manifest(&body) {
                     Ok(res) => return Ok(res),
                     Err(e) => {
@@ -311,6 +332,11 @@ impl Updater {
                     last_error = Some(e);
                 }
             }
+        }
+
+        if let Some(ref fallback) = self.inner.fallback_manifest {
+            log::warn!("所有配置的更新源端点均无法连通，降级采用内嵌 Fallback Manifest 评估更新");
+            return self.evaluate_manifest_struct(fallback);
         }
 
         Err(last_error.unwrap_or_else(|| {
@@ -351,7 +377,20 @@ impl Updater {
                 endpoint
             );
 
-            match fetch_manifest_async(&client, &endpoint).await {
+            let fetch_result = if download::is_file_url(&endpoint) {
+                if !self.inner.config.allow_file_protocol {
+                    Err(UpdateError::FileProtocolNotAllowed(endpoint.clone()))
+                } else {
+                    let path = download::parse_file_url_to_path(&endpoint)?;
+                    tokio::fs::read_to_string(&path)
+                        .await
+                        .map_err(UpdateError::Io)
+                }
+            } else {
+                fetch_manifest_async(&client, &endpoint).await
+            };
+
+            match fetch_result {
                 Ok(body) => match self.evaluate_manifest(&body) {
                     Ok(res) => return Ok(res),
                     Err(e) => {
@@ -370,15 +409,26 @@ impl Updater {
             }
         }
 
+        if let Some(ref fallback) = self.inner.fallback_manifest {
+            log::warn!(
+                "所有配置的更新源端点均无法异步连通，降级采用内嵌 Fallback Manifest 评估更新"
+            );
+            return self.evaluate_manifest_struct(fallback);
+        }
+
         Err(last_error.unwrap_or_else(|| {
             UpdateError::Network("所有配置的更新源端点均无法连接访问".to_string())
         }))
     }
 
-    /// 解析并评估 Manifest 版本信息
+    /// 解析并评估 Manifest 文本信息
     fn evaluate_manifest(&self, manifest_json: &str) -> Result<Option<Update>> {
         let manifest = Manifest::from_json_str(manifest_json)?;
+        self.evaluate_manifest_struct(&manifest)
+    }
 
+    /// 针对 Manifest 实体结构执行验签与版本评估
+    fn evaluate_manifest_struct(&self, manifest: &Manifest) -> Result<Option<Update>> {
         if !self.inner.config.public_keys.is_empty() {
             if let Some(ref _sig) = manifest.signature {
                 manifest.verify_signature(&self.inner.config.public_keys)?;
@@ -570,6 +620,12 @@ impl Update {
             ));
         }
 
+        if !self.config.allow_file_protocol && download::is_file_url(&self.release.package.url) {
+            return Err(UpdateError::FileProtocolNotAllowed(
+                self.release.package.url.clone(),
+            ));
+        }
+
         let client = build_blocking_http_client(
             self.config.timeout,
             self.config.user_agent.as_deref(),
@@ -667,6 +723,12 @@ impl Update {
             && is_insecure_http_url(&self.release.package.url)
         {
             return Err(UpdateError::InsecureTransportProtocol(
+                self.release.package.url.clone(),
+            ));
+        }
+
+        if !self.config.allow_file_protocol && download::is_file_url(&self.release.package.url) {
+            return Err(UpdateError::FileProtocolNotAllowed(
                 self.release.package.url.clone(),
             ));
         }
@@ -1286,5 +1348,78 @@ mod tests {
             &Version::parse("1.0.0").unwrap()
         );
         assert_eq!(downloaded.downloaded_path(), temp_path.as_path());
+    }
+
+    #[cfg(feature = "blocking")]
+    #[test]
+    fn test_offline_fallback_manifest_activation() {
+        let manifest_json = r#"{
+            "version": "2.0.0",
+            "notes": "离线兜底版本更新",
+            "packages": {
+                "x86_64-pc-windows-msvc": {
+                    "url": "https://example.com/app-2.0.0.zip",
+                    "package_type": "archive"
+                }
+            }
+        }"#;
+
+        let updater = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .target("x86_64-pc-windows-msvc")
+            .endpoint("https://127.0.0.1:9/unreachable/manifest.json")
+            .timeout(Duration::from_millis(50))
+            .max_retries(0)
+            .fallback_manifest_json(manifest_json)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let update = updater.check().unwrap();
+        assert!(update.is_some());
+        assert_eq!(update.unwrap().version(), &Version::parse("2.0.0").unwrap());
+    }
+
+    #[cfg(feature = "blocking")]
+    #[test]
+    fn test_offline_file_protocol_check() {
+        let temp_dir = std::env::temp_dir();
+        let manifest_file = temp_dir.join(format!("offline_manifest_{}.json", std::process::id()));
+        let manifest_content = r#"{
+            "version": "2.1.0",
+            "notes": "file 协议测试",
+            "packages": {
+                "x86_64-pc-windows-msvc": {
+                    "url": "https://example.com/app-2.1.0.zip",
+                    "package_type": "archive"
+                }
+            }
+        }"#;
+        fs::write(&manifest_file, manifest_content).unwrap();
+
+        let file_url = if cfg!(windows) {
+            format!(
+                "file:///{}",
+                manifest_file.display().to_string().replace('\\', "/")
+            )
+        } else {
+            format!("file://{}", manifest_file.display())
+        };
+
+        let updater = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .target("x86_64-pc-windows-msvc")
+            .manifest_url(&file_url)
+            .allow_file_protocol(true)
+            .build()
+            .unwrap();
+
+        let update = updater.check().unwrap();
+        assert!(update.is_some());
+        assert_eq!(update.unwrap().version(), &Version::parse("2.1.0").unwrap());
+
+        let _ = fs::remove_file(&manifest_file);
     }
 }

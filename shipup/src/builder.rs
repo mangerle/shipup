@@ -1,7 +1,8 @@
 // shipup 跨平台自更新系统 - UpdaterBuilder 构建器
 
+use crate::download::is_file_url;
 use crate::error::{Result, UpdateError};
-use crate::manifest::current_target_triple;
+use crate::manifest::{Manifest, current_target_triple};
 use crate::updater::Updater;
 use semver::Version;
 use std::collections::HashMap;
@@ -54,6 +55,10 @@ pub struct UpdaterConfig {
     pub preference_path: Option<PathBuf>,
     /// 后台下载最大带宽限速（字节/秒，若为 None 则不限速）
     pub max_bytes_per_sec: Option<u64>,
+    /// 是否允许本地及共享协议（file://，默认为 false）
+    pub allow_file_protocol: bool,
+    /// 内嵌 Fallback Manifest 离线容灾兜底元数据
+    pub fallback_manifest: Option<Manifest>,
 }
 
 impl std::fmt::Debug for UpdaterConfig {
@@ -124,6 +129,8 @@ pub struct UpdaterBuilder {
     pub(crate) version_comparator: Option<VersionComparator>,
     pub(crate) preference_path: Option<PathBuf>,
     pub(crate) max_bytes_per_sec: Option<u64>,
+    pub(crate) allow_file_protocol: bool,
+    pub(crate) fallback_manifest: Option<Manifest>,
 }
 
 impl std::fmt::Debug for UpdaterBuilder {
@@ -153,6 +160,8 @@ impl std::fmt::Debug for UpdaterBuilder {
             )
             .field("preference_path", &self.preference_path)
             .field("max_bytes_per_sec", &self.max_bytes_per_sec)
+            .field("allow_file_protocol", &self.allow_file_protocol)
+            .field("has_fallback_manifest", &self.fallback_manifest.is_some())
             .finish()
     }
 }
@@ -178,6 +187,8 @@ impl Default for UpdaterBuilder {
             version_comparator: None,
             preference_path: None,
             max_bytes_per_sec: None,
+            allow_file_protocol: false,
+            fallback_manifest: None,
         }
     }
 }
@@ -378,17 +389,49 @@ impl UpdaterBuilder {
         self
     }
 
+    /// 设置是否允许使用本地及共享协议（file://）（默认为 false）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：满足企业内网、离线隔离网络或本地介质部署环境的更新诉求。
+    /// - **安全契约**：默认禁用以避免恶意相对路径注入或未授权本地文件读取，需显式声明开启。
+    pub fn allow_file_protocol(mut self, allow: bool) -> Self {
+        self.allow_file_protocol = allow;
+        self
+    }
+
+    /// 设置内嵌 Fallback Manifest 离线容灾兜底元数据
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：在所有网络端点均无法连通时，提供离线保底更新清单进行版本裁决。
+    /// - **核心优势**：提升客户端在极端网络中断或无外网单机场景下的可用性。
+    pub fn fallback_manifest(mut self, manifest: Manifest) -> Self {
+        self.fallback_manifest = Some(manifest);
+        self
+    }
+
+    /// 通过 JSON 字符串设置内嵌 Fallback Manifest 离线容灾兜底元数据
+    ///
+    /// # Errors
+    /// 当 JSON 字符串无法反序列化为合法 Manifest 时返回 [`UpdateError::ManifestParse`]。
+    pub fn fallback_manifest_json(mut self, json_str: &str) -> Result<Self> {
+        let manifest = Manifest::from_json_str(json_str)?;
+        self.fallback_manifest = Some(manifest);
+        Ok(self)
+    }
+
     /// 构建 Updater 实例并完成前置安全门禁与合法性校验
     ///
     /// # 校验内容
     /// 1. 验证 `current_version` 已提供。
     /// 2. 验证至少提供了一个有效的更新源端点（`manifest_url` 或 `endpoints`）。
     /// 3. 在未显式开启 `dangerous_insecure_transport_protocol` 时，拦截任何明文 HTTP 端点。
-    /// 4. 在 `require_signature` 为 true 时，强制要求至少配置一枚验签公钥。
+    /// 4. 在未显式开启 `allow_file_protocol` 时，拦截任何 `file://` 协议端点。
+    /// 5. 在 `require_signature` 为 true 时，强制要求至少配置一枚验签公钥。
     ///
     /// # Errors
     /// - 当缺少必填字段时返回 [`UpdateError::ManifestParse`]。
     /// - 当端点使用明文 HTTP 且未显式允许时返回 [`UpdateError::InsecureTransportProtocol`]。
+    /// - 当端点使用 file:// 且未显式允许时返回 [`UpdateError::FileProtocolNotAllowed`]。
     /// - 当强制验签模式下缺少公钥时返回 [`UpdateError::MissingPublicKey`]。
     pub fn build(self) -> Result<Updater> {
         let current_version = self.current_version.ok_or_else(|| {
@@ -401,11 +444,12 @@ impl UpdaterBuilder {
             ));
         }
 
-        if !self.dangerous_insecure_transport_protocol {
-            for ep in &self.endpoints {
-                if is_insecure_http_url(ep) {
-                    return Err(UpdateError::InsecureTransportProtocol(ep.clone()));
-                }
+        for ep in &self.endpoints {
+            if !self.dangerous_insecure_transport_protocol && is_insecure_http_url(ep) {
+                return Err(UpdateError::InsecureTransportProtocol(ep.clone()));
+            }
+            if !self.allow_file_protocol && is_file_url(ep) {
+                return Err(UpdateError::FileProtocolNotAllowed(ep.clone()));
             }
         }
 
@@ -432,6 +476,8 @@ impl UpdaterBuilder {
             version_comparator: self.version_comparator,
             preference_path: self.preference_path,
             max_bytes_per_sec: self.max_bytes_per_sec,
+            allow_file_protocol: self.allow_file_protocol,
+            fallback_manifest: self.fallback_manifest,
         };
 
         Ok(Updater::new(config))
@@ -608,5 +654,46 @@ mod tests {
             updater.endpoints()[1],
             "https://backup-cdn.example.com/manifest.json"
         );
+    }
+
+    #[test]
+    fn test_builder_file_protocol_security_gate() {
+        // 1. 默认未开启 allow_file_protocol 时拦截 file:// 协议
+        let err = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .manifest_url("file:///tmp/manifest.json")
+            .build();
+        assert!(matches!(err, Err(UpdateError::FileProtocolNotAllowed(_))));
+
+        // 2. 显式开启 allow_file_protocol 后允许通过
+        let ok = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .manifest_url("file:///tmp/manifest.json")
+            .allow_file_protocol(true)
+            .build();
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn test_builder_fallback_manifest_config() {
+        let manifest_json = r#"{
+            "version": "1.1.0",
+            "notes": "离线兜底版本",
+            "pub_date": "2026-09-09T00:00:00Z",
+            "platforms": {}
+        }"#;
+
+        let updater = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .manifest_url("https://example.com/manifest.json")
+            .fallback_manifest_json(manifest_json)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert!(updater.fallback_manifest().is_some());
     }
 }
