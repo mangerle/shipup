@@ -118,6 +118,12 @@ pub fn replace_current_bundle(new_bundle_path: &Path) -> Result<()> {
 }
 
 /// macOS 原地替换单个可执行文件
+///
+/// # 设计原理
+/// - **实现初衷**：针对非 Bundle 形态的 macOS CLI 或守护进程提供单二进制替换，并在替换后自动清除 `com.apple.quarantine` 隔离属性。
+///
+/// # Errors
+/// 当底层重命名失败或隔离属性清理出错时返回 [`UpdateError::SelfReplace`]。
 pub fn replace_current_binary(new_binary_path: &Path) -> Result<()> {
     self_replace::self_replace(new_binary_path)
         .map_err(|e| UpdateError::SelfReplace(format!("macOS 原地替换可执行程序失败: {}", e)))?;
@@ -132,6 +138,9 @@ pub fn replace_current_binary(new_binary_path: &Path) -> Result<()> {
 }
 
 /// 构建 macOS 安装器执行命令
+///
+/// # 设计原理
+/// - **实现初衷**：针对 `.pkg` 安装包且要求提权场景，通过 `osascript` 唤起 macOS 系统原生管理员凭据对话框；其他场景通过 `open` 命令直接交给系统分发。
 pub(crate) fn build_macos_installer_command(
     installer_path: &Path,
     user_args: &[String],
@@ -161,7 +170,13 @@ pub(crate) fn build_macos_installer_command(
     }
 }
 
-/// 拉起 macOS 外部安装程序（支持 .pkg 静默安装与 .dmg 镜像自动处理）
+/// 拉起 macOS 外部安装程序（支持 .pkg 静默安装与 .dmg 镜像自动调度）
+///
+/// # 设计原理
+/// - **实现初衷**：解耦安装程序派生，支持企业级 PKG 静默部署及普通 DMG 挂载安装。
+///
+/// # Errors
+/// 当子进程启动失败时返回 [`UpdateError::InstallerSpawn`]。
 pub fn spawn_installer(installer_path: &Path, options: &InstallerOptions<'_>) -> Result<()> {
     let mut cmd =
         build_macos_installer_command(installer_path, options.user_args, options.require_elevation);
@@ -172,7 +187,13 @@ pub fn spawn_installer(installer_path: &Path, options: &InstallerOptions<'_>) ->
     Ok(())
 }
 
-/// 获取同卷临时文件路径
+/// 获取 macOS 平台当前程序同卷目录下的临时下载路径
+///
+/// # 设计原理
+/// - **实现初衷**：确保在相同 APFS 容器或 HFS+ 卷内生成临时文件，规避跨卷链接与跨盘移动带来的破坏。
+///
+/// # Errors
+/// 当获取当前进程可执行文件路径失败时返回错误。
 pub fn get_same_volume_temp_path() -> Result<PathBuf> {
     let current_exe = env::current_exe()?;
     let exe_name = current_exe

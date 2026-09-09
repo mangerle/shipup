@@ -60,16 +60,13 @@ pub fn replace_current_binary(new_binary_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 派生拉起外部安装器，并使子进程脱离当前进程树
+/// 根据 Windows 安装器类型（MSI / EXE）与交互模式组装启动命令与静默参数
 ///
 /// # 设计原理
-/// - **实现初衷**：注入 DETACHED_PROCESS 与 CREATE_NEW_PROCESS_GROUP 标志，切断父子进程控制台句柄继承。
-/// - **核心优势**：主程序在后续 `process::exit(0)` 退出后，安装器子进程能够顺畅运行并拥有完整文件重写能力。
-///   当 `require_elevation` 为 true 时，通过 PowerShell 触发 UAC 凭据对话框以 Administrator 提权执行。
-///
-/// # Errors
-/// 当进程派生失败时返回 [`UpdateError::InstallerSpawn`]。
-/// 根据安装器扩展名与配置选项组装 Windows 启动程序与参数列表
+/// - **实现初衷**：统一抽象 Windows 下主流安装包的静默与被动参数规范。
+///   MSI 安装包通过 `msiexec.exe /i <path>` 拉起，结合 `/passive`、`/qn` 与 `/norestart`；
+///   EXE 安装程序（如 NSIS 或 Inno Setup）则注入 `/S` 或 `/passive`。
+/// - **核心优势**：用户自定义参数追加在标准标志之后，兼具标准化与高度灵活性。
 pub(crate) fn build_windows_installer_args(
     installer_path: &Path,
     options: &InstallerOptions<'_>,

@@ -29,12 +29,12 @@ use reqwest::Proxy;
 #[cfg(any(feature = "blocking", feature = "async"))]
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
-/// 更新器核心实体
+/// 网络传输与数字签名安全配置内部聚合实体
 ///
 /// # 设计原理
-/// - **实现初衷**：作为客户端更新系统的统一生命周期管理器，封装检查元数据、路由选择及防降级判断。
-/// - **核心优势**：在初始化时自动静默清理 Windows 旧副本锁残留，状态内聚且无全局可变状态污染。
-/// - **代价与局限**：实例不可变借用，配置在构建完成后不可动态篡改。
+/// - **实现初衷**：将网络请求策略（超时、代理、重试、请求头）与加密签名策略（多公钥、TLS 防护、强制验签）内聚为不可变的上下文配置。
+/// - **核心优势**：配置通过 `Arc` 跨线程安全共享，不可被外部篡改，杜绝运行时竞争性安全降级。
+/// - **代价与局限**：一旦初始化完成，运行时连接参数即固定不可动态重载。
 #[derive(Debug)]
 pub(crate) struct NetworkSecurityConfig {
     pub public_keys: Vec<String>,
@@ -48,6 +48,7 @@ pub(crate) struct NetworkSecurityConfig {
     pub require_signature: bool,
 }
 
+/// 更新器内部共享核心状态实体
 struct UpdaterInner {
     current_version: Version,
     endpoints: Vec<String>,
@@ -78,6 +79,14 @@ impl std::fmt::Debug for UpdaterInner {
     }
 }
 
+/// 客户端更新器统一生命周期管理器
+///
+/// # 设计原理
+/// - **实现初衷**：作为更新引擎对外的总控门面，统一封装元数据检测、多端点故障转移、版本比较裁决与用户更新偏好。
+/// - **核心优势**：
+///   - 状态轻量且通过 `Arc` 内部共享，实现廉价 `Clone`，可安全在多线程与异步任务间传递。
+///   - 默认构造时保持纯净无副作用，仅静默清理 Windows 历史锁残留，不产生多余磁盘写入。
+/// - **代价与局限**：实例不可变借用，更新策略在构建完成后固定，无法动态修改目标端点或验签模式。
 #[derive(Debug, Clone)]
 pub struct Updater {
     inner: Arc<UpdaterInner>,
@@ -85,16 +94,25 @@ pub struct Updater {
 
 impl Updater {
     /// 获取 UpdaterBuilder 构建器入口
+    ///
+    /// 提供流式、强类型的链式配置接口，用于逐步设定版本、端点、公钥及策略。
     pub fn builder() -> UpdaterBuilder {
         UpdaterBuilder::new()
     }
 
-    /// 获取配置的更新检查端点列表切片
+    /// 获取当前配置的全部更新检查端点列表切片
     pub fn endpoints(&self) -> &[String] {
         &self.inner.endpoints
     }
 
-    /// 标记跳过特定版本升级提醒并持久化
+    /// 标记跳过特定版本升级提醒并持久化到磁盘
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：响应用户在界面上点击“跳过此版本”的交互诉求，后续检查版本时将自动忽略该版本。
+    /// - **核心优势**：内存状态即刻生效并同步原子写入磁盘，进程重启后偏好依然生效；强制更新（mandatory）可自动绕过此限制。
+    ///
+    /// # Errors
+    /// 当磁盘写权限不足或偏好文件序列化失败时，返回 [`UpdateError::Io`]。
     pub fn skip_version(&self, version: Version) -> Result<()> {
         let mut pref = self
             .inner
@@ -108,7 +126,13 @@ impl Updater {
         Ok(())
     }
 
-    /// 撤销对特定版本的跳过标记并持久化
+    /// 撤销对特定版本的跳过标记并持久化到磁盘
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：允许用户在设置中心重置或恢复特定版本的升级提醒。
+    ///
+    /// # Errors
+    /// 当偏好文件写入磁盘受阻时返回对应底层错误。
     pub fn unskip_version(&self, version: &Version) -> Result<()> {
         let mut pref = self
             .inner
@@ -122,7 +146,17 @@ impl Updater {
         Ok(())
     }
 
-    /// 设置稍后提醒（在指定时间内静默忽略非强制更新提醒）并持久化
+    /// 设置稍后提醒静默期并持久化到磁盘
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：响应用户“稍后提醒（如 1 小时或 1 天后）”诉求，在此期间内忽略所有非强制更新弹窗。
+    /// - **核心优势**：基于绝对 Unix 时间戳计算截止时间，不受系统短暂停机影响；过期后自动恢复提醒。
+    ///
+    /// # 参数
+    /// * `duration`: 静默持续时长
+    ///
+    /// # Errors
+    /// 当偏好文件写入磁盘失败时返回错误。
     pub fn snooze(&self, duration: Duration) -> Result<()> {
         let mut pref = self
             .inner
@@ -136,7 +170,10 @@ impl Updater {
         Ok(())
     }
 
-    /// 清空所有用户偏好（跳过版本与稍后提醒）并持久化
+    /// 清空所有用户偏好（包括所有已跳过版本与稍后提醒记录）并持久化
+    ///
+    /// # Errors
+    /// 当偏好文件写入磁盘失败时返回错误。
     pub fn clear_preferences(&self) -> Result<()> {
         let mut pref = self
             .inner
@@ -396,8 +433,17 @@ impl Updater {
     #[cfg(feature = "blocking")]
     /// 启动基于独立 OS 线程的后台同步静默轮询工作器
     ///
+    /// # 设计原理
+    /// - **实现初衷**：为传统同步桌面程序提供开箱即用的常驻后台更新检测与静默预载服务，无需宿主手动维护工作线程。
+    /// - **核心优势**：在后台独立执行网络轮询与更新包下载，期间不阻塞宿主主界面的事件循环。
+    /// - **代价与局限**：每个轮询器占用一个系统原生线程栈，通过毫秒级切片睡眠响应退出，保障随进程优雅关闭。
+    ///
+    /// # 参数
+    /// * `options`: 轮询周期、首次触发及静默下载选项
+    /// * `callback`: 事件通知闭包，跨线程接收检查、下载中及更新就绪等事件
+    ///
     /// # Errors
-    /// 当派生操作系统线程失败时返回 [`std::io::Error`]。
+    /// 当操作系统创建原生线程受限时返回 [`std::io::Error`]。
     pub fn start_polling_thread<F>(
         &self,
         options: crate::poller::AutoPollOptions,
@@ -411,6 +457,15 @@ impl Updater {
 
     #[cfg(feature = "async")]
     /// 启动基于 Tokio 的后台异步静默轮询任务
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：在异步应用（如 GPUI 或 Tokio 后端）中以协作式轻量级协程常驻运行，实现极低内存开销的更新监控。
+    /// - **核心优势**：采用 Tokio 原生定时器与异步网络请求，零额外系统线程开销。
+    /// - **代价与局限**：要求调用上下文处于活跃的 Tokio 异步运行时中。
+    ///
+    /// # 参数
+    /// * `options`: 轮询周期、首次触发及静默下载选项
+    /// * `callback`: 事件通知闭包，接收检查、下载中及更新就绪等事件
     pub fn start_polling_task<F>(
         &self,
         options: crate::poller::AutoPollOptions,
@@ -759,30 +814,43 @@ pub struct DownloadedUpdate {
 }
 
 impl DownloadedUpdate {
-    /// 获取当前本地版本
+    /// 获取宿主程序当前运行的本地版本号
     pub fn current_version(&self) -> &Version {
         &self.current_version
     }
 
-    /// 获取目标新版本
+    /// 获取即将安装的目标新版本号
     pub fn version(&self) -> &Version {
         &self.release.version
     }
 
-    /// 获取已下载并验签完毕的本地文件物理路径
+    /// 获取已完成网络下载且通过完整性哈希与多公钥数字签名的本地暂存文件物理路径
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：向宿主暴露物理文件句柄，便于上层需要展示文件信息或在沙箱内进一步自检。
     pub fn downloaded_path(&self) -> &Path {
         &self.downloaded_path
     }
 
-    /// 获取解析后的版本元数据引用
+    /// 获取匹配解析后的完整版本发布元数据引用
     pub fn release(&self) -> &ResolvedRelease {
         &self.release
     }
 
-    /// 执行物理安装、解压替换或派生拉起外部安装器
+    /// 执行物理安装、解压替换或拉起外部安装器
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：将实际对本地磁盘运行程序的修改收敛至调用端显式触发的受控时机。
+    /// - **核心优势**：
+    ///   - 对于二进制模式（Binary），基于同卷原子重命名替换正在运行的文件并记录自愈标记；
+    ///   - 对于归档模式（Archive），在隔离沙箱内解压验证并同步非二进制资源，防范 Zip Slip 攻击；
+    ///   - 对于安装器模式（Installer），根据 Windows/macOS/Linux 平台特性展开标准静默参数并脱离父进程树派生。
+    ///
+    /// # 参数
+    /// * `callback`: 安装进度事件回调闭包，按顺序接收 [`UpdateEvent::Installing`]、[`UpdateEvent::ReadyToRestart`] 等通知。
     ///
     /// # Errors
-    /// 当解压、二进制替换或安装器派生失败时返回对应错误。
+    /// 当解压归档包、二进制原地重命名或派生拉起安装器失败时返回对应的 [`UpdateError`]。
     pub fn install<F>(&self, mut callback: F) -> Result<()>
     where
         F: FnMut(UpdateEvent),

@@ -118,7 +118,11 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// 执行密钥对生成
+/// 执行 Ed25519 密钥对生成并将私钥与公钥输出至指定目录
+///
+/// # 设计原理
+/// - **实现初衷**：基于系统安全随机数（`getrandom`）生成 32 字节高熵种子，派生出标准 Ed25519 密钥对并以 Base64 编码保存。
+/// - **安全警示**：`ed25519.key` 为极高敏感私钥，严禁检入版本控制系统；`ed25519.pub` 为公钥，供嵌入客户端 `UpdaterBuilder`。
 fn handle_keygen(out_dir: &Path) -> Result<()> {
     log::info!("开始生成 Ed25519 密钥对，输出目录: {}", out_dir.display());
     fs::create_dir_all(out_dir)
@@ -244,7 +248,11 @@ fn update_manifest_entries(
     }
 }
 
-/// 执行发布包签名与 Manifest 合并
+/// 执行发布包签名与 Manifest 清单合并
+///
+/// # 设计原理
+/// - **实现初衷**：支持流水线持续集成（CI/CD）中跨 Windows、macOS、Linux 多 Job 逐步合并发布成果物至单份 Manifest 中。
+/// - **核心优势**：若目标清单文件已存在，将自动保留已有平台的发布包配置，实现平台矩阵安全增量追加。
 fn handle_release(args: &ReleaseArgs) -> Result<()> {
     let version = Version::parse(&args.version).with_context(|| {
         format!(

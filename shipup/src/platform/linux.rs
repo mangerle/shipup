@@ -98,6 +98,14 @@ pub(crate) fn build_linux_installer_command(
 }
 
 /// 拉起 Linux 外部安装器（支持 .deb、.rpm 包管理器与 .AppImage/脚本原生调度）
+///
+/// # 设计原理
+/// - **实现初衷**：统一调度 Linux 平台多种形态的安装介质。针对二进制文件前置修正 0o755 权限，通过 `pkexec` 调度图形化鉴权提权。
+/// - **核心优势**：自动解耦子进程，主程序退出后仍能保证 dpkg/rpm 事务完整执行。
+/// - **代价与局限**：依赖宿主系统预装对应的包管理程序或 PolicyKit 服务。
+///
+/// # Errors
+/// 当权限赋予失败或安装器子进程派生失败时返回 [`UpdateError::InstallerSpawn`]。
 pub fn spawn_installer(installer_path: &Path, options: &InstallerOptions<'_>) -> Result<()> {
     let ext = installer_path
         .extension()
@@ -119,7 +127,14 @@ pub fn spawn_installer(installer_path: &Path, options: &InstallerOptions<'_>) ->
     Ok(())
 }
 
-/// 获取同卷临时文件路径
+/// 获取 Linux 平台可执行文件同卷目录下的临时下载路径
+///
+/// # 设计原理
+/// - **实现初衷**：在 Linux 系统中，跨磁盘分区（如从 `/tmp` tmpfs 到 `/opt` ext4）进行重命名会触发 `EXDEV: Cross-device link` 异常导致原地替换失败。
+/// - **核心优势**：强制在当前程序同级目录生成带 PID 的临时文件，确保 `rename` 绝对为原子操作。
+///
+/// # Errors
+/// 当获取当前进程可执行文件路径失败时返回错误。
 pub fn get_same_volume_temp_path() -> Result<PathBuf> {
     let current_exe = env::current_exe()?;
     let exe_name = current_exe

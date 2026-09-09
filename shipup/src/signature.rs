@@ -98,7 +98,7 @@ pub fn verify_ed25519(data: &[u8], base64_signature: &str, base64_public_key: &s
 /// - **核心优势**：固定 64KB 缓冲区循环迭代哈希计算，无论目标文件多大，内存消耗始终恒定。
 ///
 /// # Errors
-/// 当底层文件读取失败或计算哈希值与期望哈希不一致时返回对应错误。
+/// 当底层文件读取失败或计算哈希值与期望哈希不一致时，分别返回 [`UpdateError::Io`] 或 [`UpdateError::ChecksumMismatch`]。
 pub fn verify_sha256_file(file_path: &Path, expected_checksum: &str) -> Result<()> {
     let mut file = File::open(file_path)?;
     let mut buffer = [0u8; HASH_BUFFER_SIZE];
@@ -134,10 +134,13 @@ pub fn verify_sha256_file(file_path: &Path, expected_checksum: &str) -> Result<(
     Ok(())
 }
 
-/// 针对文件路径执行 Ed25519 数字签名验证
+/// 针对单个本地文件执行单公钥 Ed25519 数字签名验证
+///
+/// # 设计原理
+/// - **实现初衷**：为传统单私钥签名场景提供直接便利的方法入口。
 ///
 /// # Errors
-/// 当文件读取失败或签名不匹配时返回错误。
+/// 当文件读取失败、签名格式不合法或密码学签名不匹配时返回错误。
 pub fn verify_ed25519_file(
     file_path: &Path,
     base64_signature: &str,
@@ -172,10 +175,13 @@ pub fn verify_ed25519_any_key(
     Err(UpdateError::InvalidSignature)
 }
 
-/// 针对文件路径使用候选公钥列表验证数字签名
+/// 针对本地文件路径使用候选公钥列表执行 Ed25519 数字签名验证
+///
+/// # 设计原理
+/// - **实现初衷**：将下载完成的临时物理文件与配置的公钥环进行整体真实性校验，只要通过任一公钥验证即放行。
 ///
 /// # Errors
-/// 当文件读取失败或所有候选公钥均验证失败时返回错误。
+/// 当底层文件读取失败或所有候选公钥均验证失败时返回对应错误。
 pub fn verify_ed25519_file_any_key(
     file_path: &Path,
     base64_signature: &str,

@@ -49,7 +49,11 @@ pub enum HealthCheckStatus {
     },
 }
 
-/// 在程序同级目录记录更新状态标记
+/// 在指定目录中持久化记录更新自愈状态标记与旧版本备份路径
+///
+/// # 设计原理
+/// - **实现初衷**：在物理原子覆盖新版本前，将旧版本备份位置与目标版本号落盘，为异常崩溃提供可追溯恢复点。
+/// - **核心优势**：格式简洁，崩溃计数器初始化为 0，若新版本正常启动并确认则立刻安全销毁。
 ///
 /// # Errors
 /// 当状态序列化失败或写入磁盘文件出错时返回 [`UpdateError::Io`]。
@@ -84,8 +88,13 @@ pub fn record_update_state(
 
 /// 执行启动健康自检与异常连续崩溃自愈回滚
 ///
+/// # 设计原理
+/// - **实现初衷**：防范因缺少动态库、配置不兼容或新代码缺陷导致的程序连续启动崩溃死锁。
+/// - **核心优势**：当崩溃次数超过阈值（`max_allowed_crashes`），自动用历史稳定备份原子覆盖当前崩溃二进制，实现无人值守自愈。
+/// - **代价与局限**：每次未确认启动均会递增崩溃计数器，因此宿主程序启动平稳后必须显式调用确认函数。
+///
 /// # Errors
-/// 当回滚覆盖文件底层失败时返回 [`UpdateError::SelfReplace`]。
+/// 当回滚覆盖底层文件失败时返回 [`UpdateError::SelfReplace`]。
 pub fn check_and_recover(
     state_dir: &Path,
     current_exe: &Path,
@@ -189,10 +198,14 @@ fn execute_rollback(state: &UpdateState, current_exe: &Path, state_file: &Path) 
     Ok(())
 }
 
-/// 显式确认新版本升级健康，清除旧版本备份与状态标记
+/// 在指定目录显式确认新版本升级健康，彻底销毁旧版本备份与状态标记
+///
+/// # 设计原理
+/// - **实现初衷**：为自动化测试沙箱或指定安装路径提供确定性的升级完成确认接口。
+/// - **核心优势**：确认后立即安全删除历史 `.shipup.old` 备份与 `.shipup.state` 状态文件，解除磁盘占用。
 ///
 /// # Errors
-/// 当定位当前运行路径失败时返回错误。
+/// 当删除旧备份或移除状态标记遇到 IO 故障时返回 [`UpdateError::Io`]。
 pub fn confirm_update_success_in_dir(state_dir: &Path) -> Result<bool> {
     let state_file = state_dir.join(UPDATE_STATE_FILENAME);
     if !state_file.exists() {
@@ -217,6 +230,9 @@ pub fn confirm_update_success_in_dir(state_dir: &Path) -> Result<bool> {
 
 /// 检查并确认当前应用升级成功（在应用完成启动并平稳运行后调用）
 ///
+/// # 设计原理
+/// - **实现初衷**：作为宿主程序（如 UI 就绪、主业务线程正常启动后）调用的一站式健康确认接口。
+///
 /// # Errors
 /// 当获取当前运行可执行文件路径失败时返回对应错误。
 pub fn confirm_update_success() -> Result<bool> {
@@ -228,7 +244,10 @@ pub fn confirm_update_success() -> Result<bool> {
     }
 }
 
-/// 执行当前可执行文件同级目录的自检与自愈恢复（在更新器初始化或 main 函数首部调用）
+/// 执行当前可执行文件同级目录的自检与自愈恢复（推荐在应用入口 main 首行调用）
+///
+/// # 设计原理
+/// - **实现初衷**：在宿主加载任何重量级依赖或动态库之前前置介入自检，保证在程序因缺失新 DLL 导致崩溃时仍能被捕获。
 ///
 /// # Errors
 /// 当回滚覆盖底层失败时返回 [`UpdateError::SelfReplace`]。

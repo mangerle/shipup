@@ -183,44 +183,69 @@ impl UpdaterBuilder {
         Self::default()
     }
 
-    /// 设置本地当前运行版本号（SemVer 2.0 字符串或已解析的 Version）
+    /// 设置本地宿主程序当前运行版本号（SemVer 2.0 字符串或已解析的 Version）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：以严格的语义化版本（SemVer 2.0）作为客户端基准，用于后续与远端 Manifest 中的新版本进行比较。
+    ///
+    /// # Errors
+    /// 当版本号字符串不符合 SemVer 2.0 规范（例如缺失主/次版本号或含有非法字符）时，返回 [`UpdateError::SemVer`]。
     pub fn current_version(mut self, version: impl AsRef<str>) -> Result<Self> {
         let parsed = Version::parse(version.as_ref())?;
         self.current_version = Some(parsed);
         Ok(self)
     }
 
-    /// 设置 Manifest 元数据 JSON 的下载地址（向后兼容的主端点方法）
+    /// 设置 Manifest 元数据 JSON 的主下载地址（向后兼容的便捷单端点方法）
+    ///
+    /// 等价于调用 [`Self::endpoint`]。支持在 URL 中使用模板占位符（如 `{{target}}`、`{{channel}}`）。
     pub fn manifest_url(mut self, url: impl Into<String>) -> Self {
         self.endpoints.push(url.into());
         self
     }
 
     /// 添加单个更新检查端点（可多次调用以配置多端点冗余与故障转移）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：支持跨 CDN、主备机房配置多个清单下载端点，按配置顺序依序尝试。
+    /// - **核心优势**：在检查更新时若首选端点网络超时或遭遇 HTTP 5xx 异常，自动降级至备选端点。
     pub fn endpoint(mut self, url: impl Into<String>) -> Self {
         self.endpoints.push(url.into());
         self
     }
 
-    /// 批量添加更新检查端点列表（按顺序尝试，支持主备容灾降级）
+    /// 批量添加更新检查端点列表（按顺序尝试，支持主备容灾与自动故障转移）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：支持从配置文件或外部服务动态载入多个可用 CDN 源列表。
     pub fn endpoints(mut self, urls: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.endpoints.extend(urls.into_iter().map(Into::into));
         self
     }
 
-    /// 设置更新通道（如 "beta", "alpha", "stable"）
+    /// 设置目标发布通道（如 "beta", "alpha", "stable"）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：支持多环境（正式版、预览版）复用单份 Manifest 配置文件，客户端根据通道名称精准路由至对应的软件包。
+    /// - **代价与局限**：若指定了通道但 Manifest 中未声明该通道，将直接报告错误，杜绝非预期的静默回退。
     pub fn channel(mut self, channel: impl Into<String>) -> Self {
         self.channel = Some(channel.into());
         self
     }
 
     /// 添加单个 Ed25519 验证公钥（Base64 编码，可多次调用以配置多枚公钥实现平滑轮换）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：支持配置多个合法发布者公钥，当旧私钥泄漏或证书周期性轮换时，新旧客户端均能无感平滑迁移。
     pub fn public_key(mut self, public_key: impl Into<String>) -> Self {
         self.public_keys.push(public_key.into());
         self
     }
 
     /// 批量设置或追加 Ed25519 验证公钥列表（Base64 编码）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：支持一次性导入备用公钥环，任何一枚公钥签名校验通过即视为合法更新。
     pub fn public_keys(mut self, public_keys: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.public_keys
             .extend(public_keys.into_iter().map(Into::into));
@@ -233,19 +258,25 @@ impl UpdaterBuilder {
         self
     }
 
-    /// 设置 HTTP 请求的 User-Agent 标识
+    /// 设置 HTTP 请求的自定义 User-Agent 标识
     pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
         self.user_agent = Some(user_agent.into());
         self
     }
 
-    /// 手动指定目标 Target Triple 标识（缺省自动探测宿主平台）
+    /// 手动指定目标 Target Triple 标识（缺省时自动探测宿主平台架构与 libc）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：在自动化测试、交叉编译模拟运行或特殊嵌入式架构中，允许上层手动覆写目标平台标识。
     pub fn target(mut self, target: impl Into<String>) -> Self {
         self.target = target.into();
         self
     }
 
     /// 是否允许降级安装（默认为 false，防降级攻击）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：默认开启防降级攻击保护，杜绝中间人或恶意配置诱导客户端安装含有已知漏洞的历史旧版本。
     pub fn allow_downgrade(mut self, allow: bool) -> Self {
         self.allow_downgrade = allow;
         self
@@ -333,10 +364,18 @@ impl UpdaterBuilder {
         self
     }
 
-    /// 构建 Updater 实例
+    /// 构建 Updater 实例并完成前置安全门禁与合法性校验
+    ///
+    /// # 校验内容
+    /// 1. 验证 `current_version` 已提供。
+    /// 2. 验证至少提供了一个有效的更新源端点（`manifest_url` 或 `endpoints`）。
+    /// 3. 在未显式开启 `dangerous_insecure_transport_protocol` 时，拦截任何明文 HTTP 端点。
+    /// 4. 在 `require_signature` 为 true 时，强制要求至少配置一枚验签公钥。
     ///
     /// # Errors
-    /// 当未提供 `current_version` 或 `manifest_url` 等必填配置时，返回 [`UpdateError::ManifestParse`]。
+    /// - 当缺少必填字段时返回 [`UpdateError::ManifestParse`]。
+    /// - 当端点使用明文 HTTP 且未显式允许时返回 [`UpdateError::InsecureTransportProtocol`]。
+    /// - 当强制验签模式下缺少公钥时返回 [`UpdateError::MissingPublicKey`]。
     pub fn build(self) -> Result<Updater> {
         let current_version = self.current_version.ok_or_else(|| {
             UpdateError::ManifestParse("构建 Updater 必须提供 current_version".to_string())

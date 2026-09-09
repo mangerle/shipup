@@ -49,19 +49,29 @@ impl Default for AutoPollOptions {
 }
 
 impl AutoPollOptions {
-    /// 设置轮询时间间隔
+    /// 设置后台轮询的时间间隔时长（例如 `Duration::from_secs(3600 * 2)`）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：为不同业务类型提供差异化的轮询频率，高频（如 1 小时）适用于关键内测，低频（如 24 小时）适用于稳定正式版。
     pub fn interval(mut self, interval: Duration) -> Self {
         self.interval = interval;
         self
     }
 
-    /// 设置是否在启动时立即执行首次检查
+    /// 设置工作器启动时是否立即执行首次更新检测（默认为 true）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：true 可让应用在冷启动时立即完成一次更新感知；若应用启动时有繁重初始化网络请求，可设为 false 延后一个周期检查以避免资源争抢。
     pub fn check_immediately(mut self, check: bool) -> Self {
         self.check_immediately = check;
         self
     }
 
-    /// 设置是否在后台静默下载更新包
+    /// 设置检测到可用新版本后是否在后台静默下载并暂存更新包（默认为 true）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：为桌面用户提供“无感预载”极致体验。后台仅下载与验签（产出 [`DownloadedUpdate`] 并触发 [`AutoPollEvent::UpdateReady`]），不发生任何正在运行二进制的磁盘覆盖。
+    /// - **关闭场景**：当希望仅通知用户有新版本、并在用户显式点击界面“立即下载”时再发起下载时，可将此项设为 false。
     pub fn silent_download(mut self, silent: bool) -> Self {
         self.silent_download = silent;
         self
@@ -105,7 +115,22 @@ impl Drop for AutoPollerHandle {
 }
 
 #[cfg(feature = "blocking")]
-/// 启动基于 OS 独立线程的后台轮询工作器
+/// 启动基于操作系统独立原生线程的后台周期性轮询工作器
+///
+/// # 设计原理
+/// - **实现初衷**：为基于同步模型或带有 GUI 主事件循环的桌面程序（如 Slint、Egui）提供非阻塞的后台更新巡检机制。
+/// - **核心优势**：
+///   - 独立线程调度，绝对杜绝耗时网络检查或百兆更新包下载阻塞 GUI 渲染帧率。
+///   - 睡眠切片算法：将大跨度长等待拆分为 500ms 检查片，确保调用 [`AutoPollerHandle::stop`] 时可在半秒内快速响应退出。
+/// - **代价与局限**：占用一个操作系统原生线程资源。
+///
+/// # 参数
+/// * `updater`: 更新器实例（内部状态 Arc 共享）
+/// * `options`: 轮询频率与行为策略
+/// * `callback`: 事件通知闭包，负责向宿主派发轮询状态事件
+///
+/// # Errors
+/// 当向底层操作系统申请创建原生线程失败时，返回 [`std::io::Error`]。
 pub fn spawn_polling_thread<F>(
     updater: Updater,
     options: AutoPollOptions,
@@ -174,7 +199,19 @@ where
 }
 
 #[cfg(feature = "async")]
-/// 启动基于 Tokio 的后台异步轮询任务
+/// 启动基于 Tokio 运行时的后台异步轮询协作任务
+///
+/// # 设计原理
+/// - **实现初衷**：在全面异步化的现代客户端（如 GPUI）或高并发服务节点中，以极低开销常驻执行更新感知。
+/// - **核心优势**：
+///   - 依托 Tokio 定时器与异步 HTTP，零额外操作系统线程开销，内存占用极小。
+///   - 优雅取消集成：持有返回的 [`AutoPollerHandle`] 可随时通知任务安全析构，下载中亦支持即时中断。
+/// - **代价与局限**：必须运行在有效的 Tokio 异步运行时上下文中。
+///
+/// # 参数
+/// * `updater`: 更新器实例
+/// * `options`: 轮询频率与策略
+/// * `callback`: 事件通知闭包
 pub fn spawn_polling_task<F>(
     updater: Updater,
     options: AutoPollOptions,

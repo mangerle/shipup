@@ -75,28 +75,41 @@ impl UpdatePreference {
         Ok(())
     }
 
-    /// 标记跳过特定版本
+    /// 标记用户跳过特定版本的升级提醒
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：将指定版本号存入集合去重，使后续更新检查自动忽略该版本的非强制更新提醒。
     pub fn skip_version(&mut self, version: Version) {
         self.skipped_versions.insert(version);
     }
 
-    /// 移除对特定版本的跳过标记
+    /// 移除对特定版本的跳过标记，恢复该版本的更新提醒
     pub fn unskip_version(&mut self, version: &Version) {
         self.skipped_versions.remove(version);
     }
 
     /// 检查特定版本是否已被用户显式跳过
+    ///
+    /// # 返回值
+    /// 若集合中包含该版本则返回 true，否则返回 false。
     pub fn is_skipped(&self, version: &Version) -> bool {
         self.skipped_versions.contains(version)
     }
 
-    /// 设置稍后提醒（从当前系统时间开始推迟指定的持续时长）
+    /// 设置稍后提醒（以当前 Unix 时间戳为基准，向后推迟指定持续时长）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：采用绝对时间戳而非相对定时器，即便宿主进程在静默期间重启，静默期依然能够正确计算与延续。
+    /// - **核心优势**：使用饱和算术（`saturating_add`）防范时间戳溢出。
     pub fn snooze(&mut self, duration: Duration) {
         let now = current_unix_timestamp();
         self.snooze_until = Some(now.saturating_add(duration.as_secs()));
     }
 
-    /// 检查当前是否仍处于稍后提醒静默期内
+    /// 检查当前系统时钟是否仍处于稍后提醒静默期内
+    ///
+    /// # 返回值
+    /// 若当前时间尚未到达截止时间戳返回 true，否则返回 false。
     pub fn is_snoozed(&self) -> bool {
         if let Some(until) = self.snooze_until {
             let now = current_unix_timestamp();
@@ -106,7 +119,7 @@ impl UpdatePreference {
         }
     }
 
-    /// 清空所有跳过版本与稍后提醒记录
+    /// 清空所有跳过的版本号记录与稍后提醒静默期，恢复初始状态
     pub fn clear(&mut self) {
         self.skipped_versions.clear();
         self.snooze_until = None;
