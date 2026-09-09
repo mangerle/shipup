@@ -1472,7 +1472,7 @@ dependencies = [
 
 [[package]]
 name = "shipup"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "shipup-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
