@@ -84,7 +84,7 @@ pub fn spawn_installer(
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let mut args: Vec<String> = Vec::new();
+    let mut args: Vec<String> = Vec::with_capacity(user_args.len() + 3);
     let program: String;
 
     if ext == "msi" {
