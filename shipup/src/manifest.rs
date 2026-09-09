@@ -50,6 +50,23 @@ impl FromStr for PackageType {
     }
 }
 
+/// 外部安装程序的交互与显示模式
+///
+/// # 设计原理
+/// - **实现初衷**：统一抽象不同平台外部安装器（如 MSI、NSIS）的界面交互与静默级别，避免参数混乱。
+/// - **核心优势**：支持在 Manifest 元数据中声明，并由平台层自动映射为对应的标准 CLI 参数序列。
+/// - **代价与局限**：具体呈现效果依赖底层安装包本身的打包规范。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InstallMode {
+    /// 被动安装模式（显示基础进度条界面，无需用户手动交互确认）
+    Passive,
+    /// 完全静默模式（无任何弹窗与界面，后台静默完成安装）
+    Quiet,
+    /// 基础 UI 模式（显示简易安装向导界面）
+    BasicUi,
+}
+
 /// 针对特定平台的发布包配置信息
 ///
 /// # 设计原理
@@ -72,7 +89,11 @@ pub struct PackageInfo {
     /// 安装包模式（binary / archive / installer）
     pub package_type: PackageType,
 
-    /// 启动安装器时的静默参数列表（如 ["/S"]）
+    /// 安装器交互模式（如 passive / quiet / basicUi）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_mode: Option<InstallMode>,
+
+    /// 启动安装器时的静默或附加参数列表（如 ["/S"]）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub install_args: Vec<String>,
 
@@ -424,6 +445,7 @@ mod tests {
                 signature: None,
                 checksum: None,
                 package_type: PackageType::Binary,
+                install_mode: None,
                 install_args: vec![],
                 executable_path: None,
                 require_elevation: false,
@@ -439,6 +461,7 @@ mod tests {
                 signature: None,
                 checksum: None,
                 package_type: PackageType::Archive,
+                install_mode: None,
                 install_args: vec![],
                 executable_path: None,
                 require_elevation: false,
@@ -515,5 +538,28 @@ mod tests {
         let elevated_json = r#"{"url":"https://example.com/setup.exe","package_type":"installer","require_elevation":true}"#;
         let elevated_pkg: PackageInfo = serde_json::from_str(elevated_json).unwrap();
         assert!(elevated_pkg.require_elevation);
+    }
+
+    #[test]
+    fn test_package_info_install_mode_deserialize() {
+        // 1. 未配置 install_mode 默认解析为 None
+        let default_json = r#"{"url":"https://example.com/setup.msi","package_type":"installer"}"#;
+        let default_pkg: PackageInfo = serde_json::from_str(default_json).unwrap();
+        assert_eq!(default_pkg.install_mode, None);
+
+        // 2. 显式配置 passive
+        let passive_json = r#"{"url":"https://example.com/setup.msi","package_type":"installer","install_mode":"passive"}"#;
+        let passive_pkg: PackageInfo = serde_json::from_str(passive_json).unwrap();
+        assert_eq!(passive_pkg.install_mode, Some(InstallMode::Passive));
+
+        // 3. 显式配置 quiet
+        let quiet_json = r#"{"url":"https://example.com/setup.msi","package_type":"installer","install_mode":"quiet"}"#;
+        let quiet_pkg: PackageInfo = serde_json::from_str(quiet_json).unwrap();
+        assert_eq!(quiet_pkg.install_mode, Some(InstallMode::Quiet));
+
+        // 4. 显式配置 basicUi (camelCase)
+        let basic_json = r#"{"url":"https://example.com/setup.msi","package_type":"installer","install_mode":"basicUi"}"#;
+        let basic_pkg: PackageInfo = serde_json::from_str(basic_json).unwrap();
+        assert_eq!(basic_pkg.install_mode, Some(InstallMode::BasicUi));
     }
 }

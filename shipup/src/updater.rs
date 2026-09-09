@@ -9,7 +9,7 @@ use crate::error::{Result, UpdateError};
 use crate::event::UpdateEvent;
 use crate::manifest::{Manifest, PackageType, ResolveOptions, ResolvedRelease};
 use crate::platform::{
-    cleanup_old_backups, get_temp_download_path, replace_binary, spawn_installer,
+    InstallerOptions, cleanup_old_backups, get_temp_download_path, replace_binary, spawn_installer,
 };
 use crate::restart::{RestartContext, restart_with};
 use crate::signature::{verify_ed25519_file_any_key, verify_sha256_file};
@@ -604,11 +604,12 @@ impl Update {
             }
             PackageType::Installer => {
                 callback(UpdateEvent::Installing);
-                spawn_installer(
-                    temp_path,
-                    &self.release.package.install_args,
-                    self.release.package.require_elevation,
-                )?;
+                let installer_options = InstallerOptions {
+                    user_args: &self.release.package.install_args,
+                    install_mode: self.release.package.install_mode,
+                    require_elevation: self.release.package.require_elevation,
+                };
+                spawn_installer(temp_path, &installer_options)?;
                 callback(UpdateEvent::ReadyToRestart);
             }
         }

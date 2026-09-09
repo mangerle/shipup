@@ -1,6 +1,5 @@
-// shipup 跨平台自更新系统 - Linux 专属平台适配
-
 use crate::error::{Result, UpdateError};
+use crate::platform::InstallerOptions;
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -99,11 +98,7 @@ pub(crate) fn build_linux_installer_command(
 }
 
 /// 拉起 Linux 外部安装器（支持 .deb、.rpm 包管理器与 .AppImage/脚本原生调度）
-pub fn spawn_installer(
-    installer_path: &Path,
-    user_args: &[String],
-    require_elevation: bool,
-) -> Result<()> {
+pub fn spawn_installer(installer_path: &Path, options: &InstallerOptions<'_>) -> Result<()> {
     let ext = installer_path
         .extension()
         .and_then(|e| e.to_str())
@@ -115,7 +110,8 @@ pub fn spawn_installer(
         ensure_executable(installer_path)?;
     }
 
-    let mut cmd = build_linux_installer_command(installer_path, user_args, require_elevation);
+    let mut cmd =
+        build_linux_installer_command(installer_path, options.user_args, options.require_elevation);
 
     cmd.spawn()
         .map_err(|e| UpdateError::InstallerSpawn(format!("拉起 Linux 安装器失败: {}", e)))?;

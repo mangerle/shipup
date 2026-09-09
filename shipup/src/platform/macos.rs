@@ -1,6 +1,5 @@
-// shipup 跨平台自更新系统 - macOS 专属平台适配
-
 use crate::error::{Result, UpdateError};
+use crate::platform::InstallerOptions;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -163,12 +162,9 @@ pub(crate) fn build_macos_installer_command(
 }
 
 /// 拉起 macOS 外部安装程序（支持 .pkg 静默安装与 .dmg 镜像自动处理）
-pub fn spawn_installer(
-    installer_path: &Path,
-    user_args: &[String],
-    require_elevation: bool,
-) -> Result<()> {
-    let mut cmd = build_macos_installer_command(installer_path, user_args, require_elevation);
+pub fn spawn_installer(installer_path: &Path, options: &InstallerOptions<'_>) -> Result<()> {
+    let mut cmd =
+        build_macos_installer_command(installer_path, options.user_args, options.require_elevation);
 
     cmd.spawn()
         .map_err(|e| UpdateError::InstallerSpawn(format!("拉起 macOS 安装器失败: {}", e)))?;

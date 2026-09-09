@@ -31,10 +31,13 @@ pub use builder::{UpdaterBuilder, UpdaterConfig, VersionComparator};
 pub use error::{Result, UpdateError};
 pub use event::UpdateEvent;
 pub use manifest::{
-    ChannelInfo, Manifest, PackageInfo, PackageType, ResolveOptions, ResolvedRelease,
+    ChannelInfo, InstallMode, Manifest, PackageInfo, PackageType, ResolveOptions, ResolvedRelease,
     current_target_triple,
 };
-pub use platform::{cleanup_old_backups, get_same_volume_temp_path, get_temp_download_path};
+pub use platform::{
+    InstallerOptions, cleanup_old_backups, get_same_volume_temp_path, get_temp_download_path,
+    spawn_installer,
+};
 pub use poller::{AutoPollEvent, AutoPollOptions, AutoPollerHandle};
 pub use recovery::{
     HealthCheckStatus, check_and_recover_current, check_and_recover_once, confirm_update_success,

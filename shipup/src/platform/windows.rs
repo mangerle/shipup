@@ -1,6 +1,8 @@
 // shipup 跨平台自更新系统 - Windows 专属平台适配
 
 use crate::error::{Result, UpdateError};
+use crate::manifest::InstallMode;
+use crate::platform::InstallerOptions;
 use std::env;
 use std::fs;
 use std::os::windows::process::CommandExt;
@@ -67,46 +69,94 @@ pub fn replace_current_binary(new_binary_path: &Path) -> Result<()> {
 ///
 /// # Errors
 /// 当进程派生失败时返回 [`UpdateError::InstallerSpawn`]。
-pub fn spawn_installer(
+/// 根据安装器扩展名与配置选项组装 Windows 启动程序与参数列表
+pub(crate) fn build_windows_installer_args(
     installer_path: &Path,
-    user_args: &[String],
-    require_elevation: bool,
-) -> Result<()> {
-    log::info!(
-        "正在派生拉起 Windows 外部安装器: {} (UAC 提权: {})",
-        installer_path.display(),
-        require_elevation
-    );
-
+    options: &InstallerOptions<'_>,
+) -> (String, Vec<String>) {
     let ext = installer_path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let mut args: Vec<String> = Vec::with_capacity(user_args.len() + 3);
+    let mut args = Vec::with_capacity(options.user_args.len() + 4);
     let program: String;
 
     if ext == "msi" {
         program = "msiexec".to_string();
         args.push("/i".to_string());
         args.push(installer_path.to_string_lossy().to_string());
-        if user_args.is_empty() {
-            args.push("/passive".to_string());
-            args.push("/norestart".to_string());
-        } else {
-            args.extend(user_args.iter().cloned());
+
+        match options.install_mode {
+            Some(InstallMode::Passive) => {
+                args.push("/passive".to_string());
+                args.push("/norestart".to_string());
+            }
+            Some(InstallMode::Quiet) => {
+                args.push("/qn".to_string());
+                args.push("/norestart".to_string());
+            }
+            Some(InstallMode::BasicUi) => {
+                args.push("/qb".to_string());
+                args.push("/norestart".to_string());
+            }
+            None => {
+                if options.user_args.is_empty() {
+                    args.push("/passive".to_string());
+                    args.push("/norestart".to_string());
+                }
+            }
         }
+        // 用户自定义参数追加在标准模式参数之后，避免粗暴全覆盖
+        args.extend(options.user_args.iter().cloned());
     } else {
         program = installer_path.to_string_lossy().to_string();
-        if user_args.is_empty() {
-            args.push("/S".to_string());
-        } else {
-            args.extend(user_args.iter().cloned());
+
+        match options.install_mode {
+            Some(InstallMode::Passive) => {
+                args.push("/passive".to_string());
+            }
+            Some(InstallMode::Quiet) => {
+                args.push("/S".to_string());
+            }
+            Some(InstallMode::BasicUi) => {
+                // 基础 UI 模式不注入静默标志
+            }
+            None => {
+                if options.user_args.is_empty() {
+                    args.push("/S".to_string());
+                }
+            }
         }
+        // 用户自定义参数追加在标准模式参数之后
+        args.extend(options.user_args.iter().cloned());
     }
 
-    if require_elevation {
+    (program, args)
+}
+
+/// 派生拉起外部安装器，并使子进程脱离当前进程树
+///
+/// # 设计原理
+/// - **实现初衷**：注入 DETACHED_PROCESS 与 CREATE_NEW_PROCESS_GROUP 标志，切断父子进程控制台句柄继承。
+/// - **核心优势**：主程序在后续 `process::exit(0)` 退出后，安装器子进程能够顺畅运行并拥有完整文件重写能力。
+///   当 `options.require_elevation` 为 true 时，通过 PowerShell 触发 UAC 凭据对话框以 Administrator 提权执行。
+/// - **代价与局限**：Windows 安装器一旦派生，主程序无法持续监控其退出码，依赖安装器自闭环。
+///
+/// # Errors
+/// 当进程派生失败时返回 [`UpdateError::InstallerSpawn`]。
+pub fn spawn_installer(installer_path: &Path, options: &InstallerOptions<'_>) -> Result<()> {
+    log::info!(
+        "正在派生拉起 Windows 外部安装器: {} (模式: {:?}, UAC 提权: {})",
+        installer_path.display(),
+        options.install_mode,
+        options.require_elevation
+    );
+
+    let (program, args) = build_windows_installer_args(installer_path, options);
+
+    if options.require_elevation {
         log::info!("正在通过 PowerShell 以 UAC 管理员提权拉起安装器");
         let arg_list = args.join(" ");
         let mut ps_cmd = Command::new("powershell");
@@ -154,4 +204,85 @@ pub fn get_same_volume_temp_path() -> Result<PathBuf> {
         .ok_or_else(|| UpdateError::SelfReplace("获取当前执行文件父目录失败".to_string()))?;
 
     Ok(parent.join(temp_name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_windows_installer_args_msi() {
+        let path = Path::new("C:\\temp\\setup.msi");
+
+        // 默认无参数且无 mode
+        let empty_args: [String; 0] = [];
+        let opt_default = InstallerOptions {
+            user_args: &empty_args,
+            install_mode: None,
+            require_elevation: false,
+        };
+        let (prog, args) = build_windows_installer_args(path, &opt_default);
+        assert_eq!(prog, "msiexec");
+        assert_eq!(
+            args,
+            vec!["/i", "C:\\temp\\setup.msi", "/passive", "/norestart"]
+        );
+
+        // Quiet 模式且附加自定义属性参数
+        let custom_args = vec!["ALLUSERS=1".to_string()];
+        let opt_quiet = InstallerOptions {
+            user_args: &custom_args,
+            install_mode: Some(InstallMode::Quiet),
+            require_elevation: false,
+        };
+        let (prog, args) = build_windows_installer_args(path, &opt_quiet);
+        assert_eq!(prog, "msiexec");
+        assert_eq!(
+            args,
+            vec![
+                "/i",
+                "C:\\temp\\setup.msi",
+                "/qn",
+                "/norestart",
+                "ALLUSERS=1"
+            ]
+        );
+
+        // BasicUi 模式
+        let opt_basic = InstallerOptions {
+            user_args: &empty_args,
+            install_mode: Some(InstallMode::BasicUi),
+            require_elevation: false,
+        };
+        let (prog, args) = build_windows_installer_args(path, &opt_basic);
+        assert_eq!(prog, "msiexec");
+        assert_eq!(args, vec!["/i", "C:\\temp\\setup.msi", "/qb", "/norestart"]);
+    }
+
+    #[test]
+    fn test_build_windows_installer_args_exe() {
+        let path = Path::new("C:\\temp\\setup.exe");
+        let empty_args: [String; 0] = [];
+
+        // 默认无模式：自动映射 /S
+        let opt_default = InstallerOptions {
+            user_args: &empty_args,
+            install_mode: None,
+            require_elevation: false,
+        };
+        let (prog, args) = build_windows_installer_args(path, &opt_default);
+        assert_eq!(prog, "C:\\temp\\setup.exe");
+        assert_eq!(args, vec!["/S"]);
+
+        // Passive 模式并附加目标路径
+        let custom_args = vec!["/D=C:\\MyApp".to_string()];
+        let opt_passive = InstallerOptions {
+            user_args: &custom_args,
+            install_mode: Some(InstallMode::Passive),
+            require_elevation: false,
+        };
+        let (prog, args) = build_windows_installer_args(path, &opt_passive);
+        assert_eq!(prog, "C:\\temp\\setup.exe");
+        assert_eq!(args, vec!["/passive", "/D=C:\\MyApp"]);
+    }
 }

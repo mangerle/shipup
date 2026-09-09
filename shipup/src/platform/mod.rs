@@ -1,7 +1,7 @@
 // shipup 跨平台自更新系统 - 平台专属抽象层
 
 use crate::error::Result;
-use crate::manifest::PackageType;
+use crate::manifest::{InstallMode, PackageType};
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
@@ -10,6 +10,21 @@ pub mod linux;
 pub mod macos;
 #[cfg(windows)]
 pub mod windows;
+
+/// 外部安装器执行配置选项
+///
+/// # 设计原理
+/// - **实现初衷**：统一收敛安装器调用参数（路径、自定义参数、标准模式、管理员提权），避免函数入参过多。
+/// - **核心优势**：消除超过 3 个参数的散乱平铺，后续扩展环境变数或执行选项时不破坏下游 API 兼容性。
+#[derive(Debug, Clone, Default)]
+pub struct InstallerOptions<'a> {
+    /// 附加或用户自定义 CLI 参数列表
+    pub user_args: &'a [String],
+    /// 安装器交互模式（如 Passive / Quiet / BasicUi）
+    pub install_mode: Option<InstallMode>,
+    /// 是否需要提升至操作系统管理员权限执行
+    pub require_elevation: bool,
+}
 
 /// 清理以往更新遗留的临时或备份文件
 ///
@@ -74,30 +89,26 @@ pub fn replace_binary(new_binary_path: &Path) -> Result<()> {
 ///
 /// # Errors
 /// 当安装器子进程派生失败时返回 [`crate::error::UpdateError::InstallerSpawn`]。
-pub fn spawn_installer(
-    installer_path: &Path,
-    user_args: &[String],
-    require_elevation: bool,
-) -> Result<()> {
+pub fn spawn_installer(installer_path: &Path, options: &InstallerOptions<'_>) -> Result<()> {
     #[cfg(windows)]
     {
-        windows::spawn_installer(installer_path, user_args, require_elevation)
+        windows::spawn_installer(installer_path, options)
     }
 
     #[cfg(target_os = "macos")]
     {
-        macos::spawn_installer(installer_path, user_args, require_elevation)
+        macos::spawn_installer(installer_path, options)
     }
 
     #[cfg(target_os = "linux")]
     {
-        linux::spawn_installer(installer_path, user_args, require_elevation)
+        linux::spawn_installer(installer_path, options)
     }
 
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let mut cmd = std::process::Command::new(installer_path);
-        cmd.args(user_args);
+        cmd.args(options.user_args);
         cmd.spawn().map_err(|e| {
             crate::error::UpdateError::InstallerSpawn(format!("拉起安装器失败: {}", e))
         })?;

@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signer, SigningKey};
 use semver::Version;
 use sha2::{Digest, Sha256};
-use shipup::{ChannelInfo, Manifest, PackageInfo, PackageType};
+use shipup::{ChannelInfo, InstallMode, Manifest, PackageInfo, PackageType};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -76,6 +76,10 @@ struct ReleaseArgs {
     /// 是否标记为强制更新
     #[arg(long, default_value_t = false)]
     force_update: bool,
+
+    /// 安装器交互模式（passive / quiet / basicUi，仅在 installer 模式下有效）
+    #[arg(long)]
+    install_mode: Option<String>,
 
     /// 启动外部安装器的静默参数（仅在 installer 模式下有效）
     #[arg(long)]
@@ -264,11 +268,25 @@ fn handle_release(args: &ReleaseArgs) -> Result<()> {
 
     let (checksum, signature) = compute_payload_integrity(&args.package, args.key.as_deref())?;
 
+    let parsed_install_mode = match args.install_mode {
+        Some(ref mode) => match mode.to_ascii_lowercase().as_str() {
+            "passive" => Some(InstallMode::Passive),
+            "quiet" => Some(InstallMode::Quiet),
+            "basicui" | "basic-ui" => Some(InstallMode::BasicUi),
+            other => anyhow::bail!(
+                "不支持的安装模式: {}，可选值为 passive / quiet / basicUi",
+                other
+            ),
+        },
+        None => None,
+    };
+
     let package_info = PackageInfo {
         url: args.url.clone(),
         signature,
         checksum: Some(checksum),
         package_type: parsed_pkg_type,
+        install_mode: parsed_install_mode,
         install_args: args.install_args.clone(),
         executable_path: args.executable_path.clone(),
         require_elevation: args.require_elevation,
