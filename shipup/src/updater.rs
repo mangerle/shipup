@@ -46,6 +46,7 @@ pub(crate) struct NetworkSecurityConfig {
     pub retry_delay: Duration,
     pub dangerous_insecure_transport_protocol: bool,
     pub require_signature: bool,
+    pub max_bytes_per_sec: Option<u64>,
 }
 
 /// 更新器内部共享核心状态实体
@@ -251,6 +252,7 @@ impl Updater {
                     dangerous_insecure_transport_protocol: config
                         .dangerous_insecure_transport_protocol,
                     require_signature: config.require_signature,
+                    max_bytes_per_sec: config.max_bytes_per_sec,
                 }),
                 version_comparator: config.version_comparator,
                 preference: Mutex::new(preference),
@@ -584,6 +586,8 @@ impl Update {
             max_retries: self.config.max_retries,
             retry_delay: self.config.retry_delay,
             expected_checksum: self.release.package.checksum.as_deref(),
+            expected_size: self.release.package.size,
+            max_bytes_per_sec: self.config.max_bytes_per_sec,
         };
 
         if let Err(e) = (|| -> Result<()> {
@@ -683,6 +687,8 @@ impl Update {
             max_retries: self.config.max_retries,
             retry_delay: self.config.retry_delay,
             expected_checksum: self.release.package.checksum.as_deref(),
+            expected_size: self.release.package.size,
+            max_bytes_per_sec: self.config.max_bytes_per_sec,
         };
 
         let download_and_verify_result: Result<()> = async {
@@ -1263,6 +1269,7 @@ mod tests {
                 install_args: vec![],
                 executable_path: None,
                 require_elevation: false,
+                size: None,
             },
         };
 

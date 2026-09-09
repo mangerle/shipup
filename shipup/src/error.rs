@@ -94,6 +94,14 @@ pub enum UpdateError {
         "不安全传输协议: 地址 '{0}' 采用明文 HTTP 协议，默认被拒绝。如需强制允许请开启 dangerous_insecure_transport_protocol"
     )]
     InsecureTransportProtocol(String),
+
+    /// 更新包大小不匹配或流式传输超出限制
+    #[error("更新包文件体积异常: 期望大小为 {expected} 字节，实际为 {actual} 字节")]
+    PayloadSizeMismatch { expected: u64, actual: u64 },
+
+    /// 目标磁盘可用存储空间不足
+    #[error("目标磁盘可用空间不足: 需要至少 {required} 字节，当前磁盘剩余可用 {available} 字节")]
+    InsufficientDiskSpace { required: u64, available: u64 },
 }
 
 impl From<semver::Error> for UpdateError {

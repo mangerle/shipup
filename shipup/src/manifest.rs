@@ -104,6 +104,10 @@ pub struct PackageInfo {
     /// 是否需要操作系统管理员提权（UAC / Sudo）执行（针对 Windows 安装器等场景）
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_elevation: bool,
+
+    /// 更新包物理文件大小（字节，用于硬校验与目标磁盘空间预检）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 /// 单独发布通道中的更新信息
@@ -477,6 +481,7 @@ mod tests {
                 install_args: vec![],
                 executable_path: None,
                 require_elevation: false,
+                size: None,
             },
         );
 
@@ -493,6 +498,7 @@ mod tests {
                 install_args: vec![],
                 executable_path: None,
                 require_elevation: false,
+                size: None,
             },
         );
 

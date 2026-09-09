@@ -97,6 +97,195 @@ impl DownloadProgressTracker {
     }
 }
 
+/// 下载流量带宽限速器
+///
+/// # 设计原理
+/// - **实现初衷**：在后台轮询静默下载时防止占满用户全速带宽影响前台交互业务。
+/// - **核心优势**：基于毫秒自适应等待与秒级滑动窗口重置，避免频繁陷入系统休眠与时钟溢出。
+#[derive(Debug, Clone)]
+pub(crate) struct RateLimiter {
+    max_bytes_per_sec: u64,
+    last_check: Instant,
+    bytes_in_window: u64,
+}
+
+impl RateLimiter {
+    pub(crate) fn new(max_bytes_per_sec: u64) -> Self {
+        Self {
+            max_bytes_per_sec,
+            last_check: Instant::now(),
+            bytes_in_window: 0,
+        }
+    }
+
+    #[cfg(feature = "blocking")]
+    pub(crate) fn record_and_throttle_blocking(&mut self, bytes: usize) {
+        if self.max_bytes_per_sec == 0 || bytes == 0 {
+            return;
+        }
+        self.bytes_in_window = self.bytes_in_window.saturating_add(bytes as u64);
+        let elapsed = self.last_check.elapsed();
+        let expected_duration =
+            Duration::from_secs_f64(self.bytes_in_window as f64 / self.max_bytes_per_sec as f64);
+        if expected_duration > elapsed {
+            let sleep_time = expected_duration - elapsed;
+            if sleep_time > Duration::from_millis(5) {
+                std::thread::sleep(sleep_time);
+            }
+        }
+        if self.last_check.elapsed() >= Duration::from_secs(1) {
+            self.last_check = Instant::now();
+            self.bytes_in_window = 0;
+        }
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) async fn record_and_throttle_async(&mut self, bytes: usize) {
+        if self.max_bytes_per_sec == 0 || bytes == 0 {
+            return;
+        }
+        self.bytes_in_window = self.bytes_in_window.saturating_add(bytes as u64);
+        let elapsed = self.last_check.elapsed();
+        let expected_duration =
+            Duration::from_secs_f64(self.bytes_in_window as f64 / self.max_bytes_per_sec as f64);
+        if expected_duration > elapsed {
+            let sleep_time = expected_duration - elapsed;
+            if sleep_time > Duration::from_millis(5) {
+                tokio::time::sleep(sleep_time).await;
+            }
+        }
+        if self.last_check.elapsed() >= Duration::from_secs(1) {
+            self.last_check = Instant::now();
+            self.bytes_in_window = 0;
+        }
+    }
+}
+
+/// 检查指定目标路径所在磁盘分区的可用存储空间
+///
+/// # 设计原理
+/// - **实现初衷**：在下载和解包前核验磁盘剩余容量，避免半途写满磁盘导致进程或操作系统崩溃。
+/// - **容错降级**：若系统接口调用失败或环境受限，以警告日志记录并降级放行，杜绝误杀正常更新。
+pub(crate) fn check_disk_space_available(target_path: &Path, required_bytes: u64) -> Result<()> {
+    if required_bytes == 0 {
+        return Ok(());
+    }
+    match get_available_disk_space(target_path) {
+        Ok(available) => {
+            if available < required_bytes {
+                log::error!(
+                    "目标磁盘可用存储空间不足: 需要 {} 字节，实际仅剩余 {} 字节",
+                    required_bytes,
+                    available
+                );
+                return Err(UpdateError::InsufficientDiskSpace {
+                    required: required_bytes,
+                    available,
+                });
+            }
+            Ok(())
+        }
+        Err(e) => {
+            log::warn!("探测磁盘可用空间失败: {}，降级跳过预检直接尝试写入", e);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn get_available_disk_space(target_path: &Path) -> std::io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let dir = if target_path.is_dir() {
+        target_path
+    } else {
+        target_path.parent().unwrap_or_else(|| Path::new("."))
+    };
+    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    wide.push(0);
+
+    let mut free_bytes_available = 0u64;
+    let mut total_number_of_bytes = 0u64;
+    let mut total_number_of_free_bytes = 0u64;
+
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+
+    let ret = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_bytes_available,
+            &mut total_number_of_bytes,
+            &mut total_number_of_free_bytes,
+        )
+    };
+
+    if ret == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(free_bytes_available)
+    }
+}
+
+#[cfg(unix)]
+fn get_available_disk_space(target_path: &Path) -> std::io::Result<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = if target_path.is_dir() {
+        target_path
+    } else {
+        target_path.parent().unwrap_or_else(|| Path::new("."))
+    };
+
+    let c_path = CString::new(dir.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    #[repr(C)]
+    struct Statvfs {
+        f_bsize: std::os::raw::c_ulong,
+        f_frsize: std::os::raw::c_ulong,
+        f_blocks: u64,
+        f_bfree: u64,
+        f_bavail: u64,
+        f_files: u64,
+        f_ffree: u64,
+        f_favail: u64,
+        f_fsid: std::os::raw::c_ulong,
+        f_flag: std::os::raw::c_ulong,
+        f_namemax: std::os::raw::c_ulong,
+        __f_spare: [std::os::raw::c_int; 6],
+    }
+
+    unsafe extern "C" {
+        fn statvfs(path: *const std::os::raw::c_char, buf: *mut Statvfs) -> std::os::raw::c_int;
+    }
+
+    let mut stat = std::mem::MaybeUninit::<Statvfs>::zeroed();
+    let res = unsafe { statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+    if res == 0 {
+        let stat = unsafe { stat.assume_init() };
+        let frsize = if stat.f_frsize > 0 {
+            stat.f_frsize as u64
+        } else {
+            stat.f_bsize as u64
+        };
+        Ok(stat.f_bavail.saturating_mul(frsize))
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+fn get_available_disk_space(_target_path: &Path) -> std::io::Result<u64> {
+    Ok(u64::MAX)
+}
+
 /// 更新包流式下载配置选项
 ///
 /// # 设计原理
@@ -118,6 +307,10 @@ pub struct DownloadOptions<'a> {
     pub retry_delay: Duration,
     /// 预期的 SHA-256 完整性哈希（用于直接比对本地已有文件实现秒级缓存命中）
     pub expected_checksum: Option<&'a str>,
+    /// 预期的物理文件大小（字节，用于流式与落盘硬校验及磁盘空间预检）
+    pub expected_size: Option<u64>,
+    /// 最大允许下载带宽（字节/秒，用于后台平滑下载流控，若为 None 则不限速）
+    pub max_bytes_per_sec: Option<u64>,
 }
 
 pub(crate) fn try_hit_local_cache<F>(
@@ -205,6 +398,10 @@ where
         &mut event_callback,
     ) {
         return Ok(());
+    }
+
+    if let Some(exp_size) = options.expected_size {
+        check_disk_space_available(options.target_path, exp_size.saturating_mul(2))?;
     }
 
     let mut attempts = 0;
@@ -299,15 +496,44 @@ where
         (f, 0, total)
     };
 
+    if let (Some(expected), Some(actual_total)) = (options.expected_size, total_bytes)
+        && actual_total != expected
+    {
+        log::error!(
+            "HTTP 响应声明的包体积 ({} 字节) 与清单期望值 ({} 字节) 不符",
+            actual_total,
+            expected
+        );
+        return Err(UpdateError::PayloadSizeMismatch {
+            expected,
+            actual: actual_total,
+        });
+    }
+
     event_callback(UpdateEvent::DownloadStarted { total_bytes });
     let ctx = StreamPipeContext {
         file,
         initial_downloaded,
         total_bytes,
+        expected_size: options.expected_size,
+        rate_limiter: options.max_bytes_per_sec.map(RateLimiter::new),
         cancel_flag: options.cancel_flag.as_ref(),
         event_callback,
     };
     pipe_blocking_stream(&mut response, ctx)?;
+
+    if let Some(expected) = options.expected_size {
+        let final_len = fs::metadata(options.target_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if final_len != expected {
+            let _ = fs::remove_file(options.target_path);
+            return Err(UpdateError::PayloadSizeMismatch {
+                expected,
+                actual: final_len,
+            });
+        }
+    }
 
     log::info!(
         "更新包同步下载完成，临时路径: {}",
@@ -321,6 +547,8 @@ struct StreamPipeContext<'a, TFile, F> {
     file: TFile,
     initial_downloaded: u64,
     total_bytes: Option<u64>,
+    expected_size: Option<u64>,
+    rate_limiter: Option<RateLimiter>,
     cancel_flag: Option<&'a Arc<AtomicBool>>,
     event_callback: &'a mut F,
 }
@@ -351,11 +579,24 @@ where
             Err(e) => return Err(UpdateError::Io(e)),
         };
 
+        downloaded_bytes = downloaded_bytes.saturating_add(read_bytes as u64);
+        if let Some(expected) = ctx.expected_size
+            && downloaded_bytes > expected
+        {
+            return Err(UpdateError::PayloadSizeMismatch {
+                expected,
+                actual: downloaded_bytes,
+            });
+        }
+
         if let Err(e) = ctx.file.write_all(&buffer[..read_bytes]) {
             return Err(UpdateError::Io(e));
         }
 
-        downloaded_bytes = downloaded_bytes.saturating_add(read_bytes as u64);
+        if let Some(ref mut limiter) = ctx.rate_limiter {
+            limiter.record_and_throttle_blocking(read_bytes);
+        }
+
         let (percent, speed_bytes_per_sec, eta) = tracker.update(downloaded_bytes);
 
         (ctx.event_callback)(UpdateEvent::DownloadProgress {
@@ -396,6 +637,10 @@ where
         &mut event_callback,
     ) {
         return Ok(());
+    }
+
+    if let Some(exp_size) = options.expected_size {
+        check_disk_space_available(options.target_path, exp_size.saturating_mul(2))?;
     }
 
     let mut attempts = 0;
@@ -493,15 +738,45 @@ where
         (f, 0, total)
     };
 
+    if let (Some(expected), Some(actual_total)) = (options.expected_size, total_bytes)
+        && actual_total != expected
+    {
+        log::error!(
+            "异步 HTTP 响应声明的包体积 ({} 字节) 与清单期望值 ({} 字节) 不符",
+            actual_total,
+            expected
+        );
+        return Err(UpdateError::PayloadSizeMismatch {
+            expected,
+            actual: actual_total,
+        });
+    }
+
     event_callback(UpdateEvent::DownloadStarted { total_bytes });
     let ctx = StreamPipeContext {
         file,
         initial_downloaded,
         total_bytes,
+        expected_size: options.expected_size,
+        rate_limiter: options.max_bytes_per_sec.map(RateLimiter::new),
         cancel_flag: options.cancel_flag.as_ref(),
         event_callback,
     };
     pipe_async_stream(response, ctx).await?;
+
+    if let Some(expected) = options.expected_size {
+        let final_len = match tokio::fs::metadata(options.target_path).await {
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        };
+        if final_len != expected {
+            let _ = tokio::fs::remove_file(options.target_path).await;
+            return Err(UpdateError::PayloadSizeMismatch {
+                expected,
+                actual: final_len,
+            });
+        }
+    }
 
     log::info!(
         "更新包异步下载完成，临时路径: {}",
@@ -537,11 +812,24 @@ where
             Err(e) => return Err(UpdateError::Network(format!("下载数据流中断: {}", e))),
         };
 
+        downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
+        if let Some(expected) = ctx.expected_size
+            && downloaded_bytes > expected
+        {
+            return Err(UpdateError::PayloadSizeMismatch {
+                expected,
+                actual: downloaded_bytes,
+            });
+        }
+
         if let Err(e) = ctx.file.write_all(&chunk).await {
             return Err(UpdateError::Io(e));
         }
 
-        downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
+        if let Some(ref mut limiter) = ctx.rate_limiter {
+            limiter.record_and_throttle_async(chunk.len()).await;
+        }
+
         let (percent, speed_bytes_per_sec, eta) = tracker.update(downloaded_bytes);
 
         (ctx.event_callback)(UpdateEvent::DownloadProgress {
@@ -722,5 +1010,37 @@ mod tests {
             }
         );
         assert_eq!(completed_ev, UpdateEvent::Completed);
+    }
+
+    #[test]
+    fn test_check_disk_space_available_thresholds() {
+        let temp_dir = std::env::temp_dir();
+        // 1. 0 字节需求恒成功
+        assert!(check_disk_space_available(&temp_dir, 0).is_ok());
+
+        // 2. 10KB 需求在正常操作系统环境下必定满足
+        let small_req = 10 * 1024;
+        assert!(check_disk_space_available(&temp_dir, small_req).is_ok());
+
+        // 3. 天文数字容量需求应当触发 InsufficientDiskSpace 错误
+        let impossible_req = 1_000_000_000_000_000_000u64;
+        let err = check_disk_space_available(&temp_dir, impossible_req);
+        match err {
+            Err(UpdateError::InsufficientDiskSpace {
+                required,
+                available: _,
+            }) => {
+                assert_eq!(required, impossible_req);
+            }
+            other => panic!("预期返回 InsufficientDiskSpace 错误，实际为: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_record_and_throttle() {
+        let mut limiter = RateLimiter::new(1024 * 1024); // 1MB/s
+        let start = Instant::now();
+        limiter.record_and_throttle_blocking(512);
+        assert!(start.elapsed() < Duration::from_millis(100));
     }
 }

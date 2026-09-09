@@ -445,6 +445,10 @@ fn handle_release(args: &ReleaseArgs) -> Result<()> {
         None => None,
     };
 
+    let package_size = fs::metadata(&args.package)
+        .with_context(|| format!("获取发布包元数据失败: {}", args.package.display()))?
+        .len();
+
     let package_info = PackageInfo {
         url: args.url.clone(),
         signature,
@@ -454,6 +458,7 @@ fn handle_release(args: &ReleaseArgs) -> Result<()> {
         install_args: args.install_args.clone(),
         executable_path: args.executable_path.clone(),
         require_elevation: args.require_elevation,
+        size: Some(package_size),
     };
 
     let pub_date = args.pub_date.clone().unwrap_or_else(current_utc_rfc3339);
@@ -588,6 +593,7 @@ mod tests {
                 install_args: vec![],
                 executable_path: None,
                 require_elevation: false,
+                size: None,
             },
         };
 
@@ -632,6 +638,7 @@ mod tests {
                 install_args: vec![],
                 executable_path: None,
                 require_elevation: false,
+                size: None,
             },
         };
 

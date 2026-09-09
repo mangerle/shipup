@@ -52,6 +52,8 @@ pub struct UpdaterConfig {
     pub version_comparator: Option<VersionComparator>,
     /// 用户更新偏好持久化文件路径（若为 None 则使用默认同级目录）
     pub preference_path: Option<PathBuf>,
+    /// 后台下载最大带宽限速（字节/秒，若为 None 则不限速）
+    pub max_bytes_per_sec: Option<u64>,
 }
 
 impl std::fmt::Debug for UpdaterConfig {
@@ -121,6 +123,7 @@ pub struct UpdaterBuilder {
     pub(crate) require_signature: bool,
     pub(crate) version_comparator: Option<VersionComparator>,
     pub(crate) preference_path: Option<PathBuf>,
+    pub(crate) max_bytes_per_sec: Option<u64>,
 }
 
 impl std::fmt::Debug for UpdaterBuilder {
@@ -149,6 +152,7 @@ impl std::fmt::Debug for UpdaterBuilder {
                 &self.version_comparator.is_some(),
             )
             .field("preference_path", &self.preference_path)
+            .field("max_bytes_per_sec", &self.max_bytes_per_sec)
             .finish()
     }
 }
@@ -173,6 +177,7 @@ impl Default for UpdaterBuilder {
             require_signature: !cfg!(debug_assertions),
             version_comparator: None,
             preference_path: None,
+            max_bytes_per_sec: None,
         }
     }
 }
@@ -364,6 +369,15 @@ impl UpdaterBuilder {
         self
     }
 
+    /// 设置后台更新下载最大带宽速率限制（字节/秒，若不设置则不限速）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：允许客户端根据业务场景对更新流量实施 QoS 调控，避免后台更新占满网络。
+    pub fn max_bytes_per_sec(mut self, limit: u64) -> Self {
+        self.max_bytes_per_sec = Some(limit);
+        self
+    }
+
     /// 构建 Updater 实例并完成前置安全门禁与合法性校验
     ///
     /// # 校验内容
@@ -417,6 +431,7 @@ impl UpdaterBuilder {
             require_signature: self.require_signature,
             version_comparator: self.version_comparator,
             preference_path: self.preference_path,
+            max_bytes_per_sec: self.max_bytes_per_sec,
         };
 
         Ok(Updater::new(config))
