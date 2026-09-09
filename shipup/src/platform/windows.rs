@@ -218,7 +218,7 @@ pub fn get_same_volume_temp_path() -> Result<PathBuf> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("app.exe");
-    let temp_name = format!("{}.{}.shipup.tmp", exe_name, std::process::id());
+    let temp_name = format!("{}{}", exe_name, TEMP_SUFFIX);
 
     let parent = current_exe
         .parent()

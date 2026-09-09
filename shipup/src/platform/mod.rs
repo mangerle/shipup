@@ -161,7 +161,26 @@ pub fn get_same_volume_temp_path() -> Result<PathBuf> {
 ///
 /// # Errors
 /// 当路径探测失败或系统临时目录不可用时返回错误。
+/// 计算目标下载 URL 的简短确定性十六进制哈希指纹（前 12 位）
+///
+/// # 设计原理
+/// - **实现初衷**：以确定性哈希替代易变的操作系统进程 PID，确保跨进程会话能够定位到同一文件。
+/// - **核心优势**：恢复本地缓存命中率与断点续传可用性，同时避免多更新包在同一目录下发生文件名碰撞。
+pub(crate) fn compute_url_hash_token(url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(url.as_bytes());
+    let hash = hasher.finalize();
+    let mut hex = String::with_capacity(12);
+    for b in &hash[..6] {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
 pub fn get_temp_download_path(package_type: PackageType, url: &str) -> Result<PathBuf> {
+    let token = compute_url_hash_token(url);
     if package_type == PackageType::Installer {
         let temp_dir = std::env::temp_dir();
         let url_path = Path::new(url.split('?').next().unwrap_or(url));
@@ -179,8 +198,19 @@ pub fn get_temp_download_path(package_type: PackageType, url: &str) -> Result<Pa
                 "bin"
             }
         });
-        let file_name = format!("shipup_installer_{}.{}", std::process::id(), ext);
+        let file_name = format!("shipup_installer_{}.{}", token, ext);
         return Ok(temp_dir.join(file_name));
+    }
+
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        let exe_name = current_exe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("app");
+        let file_name = format!("{}.{}.shipup.tmp", exe_name, token);
+        return Ok(parent.join(file_name));
     }
 
     get_same_volume_temp_path()
