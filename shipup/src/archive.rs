@@ -101,7 +101,9 @@ pub fn extract_archive(
 fn extract_zip(archive_path: &Path, canonical_sandbox: &Path) -> Result<()> {
     let file = File::open(archive_path)?;
     let archive_len = file.metadata()?.len();
-    let max_allowed_bytes = (archive_len * MAX_EXPANSION_RATIO).min(MAX_EXTRACTED_BYTES);
+    let max_allowed_bytes = archive_len
+        .saturating_mul(MAX_EXPANSION_RATIO)
+        .min(MAX_EXTRACTED_BYTES);
 
     let mut zip = zip::ZipArchive::new(file)
         .map_err(|e| UpdateError::ArchiveExtract(format!("读取 zip 归档失败: {}", e)))?;
@@ -186,7 +188,9 @@ fn extract_zip(_archive_path: &Path, _canonical_sandbox: &Path) -> Result<()> {
 fn extract_tar_gz(archive_path: &Path, canonical_sandbox: &Path) -> Result<()> {
     let file = File::open(archive_path)?;
     let archive_len = file.metadata()?.len();
-    let max_allowed_bytes = (archive_len * MAX_EXPANSION_RATIO).min(MAX_EXTRACTED_BYTES);
+    let max_allowed_bytes = archive_len
+        .saturating_mul(MAX_EXPANSION_RATIO)
+        .min(MAX_EXTRACTED_BYTES);
 
     let gz = flate2::read::GzDecoder::new(file);
     let mut tar = tar::Archive::new(gz);
