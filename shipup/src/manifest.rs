@@ -198,6 +198,30 @@ pub struct Manifest {
     pub version_seq: Option<u64>,
 }
 
+/// Manifest 只读规范化借用视图（用于零内存深拷贝生成确定性验签序列化字节）
+#[derive(Serialize)]
+struct CanonicalManifestView<'a> {
+    version: &'a Version,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_supported_version: Option<&'a Version>,
+    force_update: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub_date: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<&'a str>,
+    packages: &'a BTreeMap<String, PackageInfo>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    channels: &'a BTreeMap<String, ChannelInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rollout_percentage: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version_seq: Option<u64>,
+}
+
 /// 解析路由后最终用于执行更新的结构体
 ///
 /// # 设计原理
@@ -262,12 +286,28 @@ impl Manifest {
 
     /// 提取 Manifest 规范化字节数据（排除 signature 字段本身），供生成与校验数字签名使用
     ///
+    /// # 设计原理
+    /// - **实现初衷**：在计算签名和验签前，需排除 `signature` 字段本身并生成确定性字节流。原先采用 `self.clone()` 全量深拷贝，存在无谓的堆内存分配与字符串克隆开销。
+    /// - **核心优势**：通过轻量借用视图（[`CanonicalManifestView`]）仅持有现有字段的只读切片与引用，在序列化时实现零额外深拷贝（Zero-Clone），显著降低 CPU 与内存开销。
+    /// - **代价与局限**：借用视图结构体字段名与序列化标记需与 Manifest 保持强一致同步。
+    ///
     /// # Errors
     /// 当 JSON 序列化失败时返回 [`UpdateError::ManifestParse`]。
     pub fn compute_canonical_bytes(&self) -> Result<Vec<u8>> {
-        let mut cloned = self.clone();
-        cloned.signature = None;
-        serde_json::to_vec(&cloned)
+        let view = CanonicalManifestView {
+            version: &self.version,
+            min_supported_version: self.min_supported_version.as_ref(),
+            force_update: self.force_update,
+            pub_date: self.pub_date.as_deref(),
+            notes: self.notes.as_deref(),
+            packages: &self.packages,
+            channels: &self.channels,
+            signature: None,
+            rollout_percentage: self.rollout_percentage,
+            expires_at: self.expires_at.as_deref(),
+            version_seq: self.version_seq,
+        };
+        serde_json::to_vec(&view)
             .map_err(|e| UpdateError::ManifestParse(format!("序列化规范化清单失败: {}", e)))
     }
 
