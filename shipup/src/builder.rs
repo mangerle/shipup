@@ -5,13 +5,17 @@ use crate::manifest::current_target_triple;
 use crate::updater::Updater;
 use semver::Version;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+
+/// 自定义版本比较器函数指针/闭包类型（输入当前版本与远端版本，返回 true 表示需要更新）
+pub type VersionComparator = Arc<dyn Fn(&Version, &Version) -> bool + Send + Sync>;
 
 /// 更新器核心配置结构体
 ///
 /// # 设计原理
 /// - **实现初衷**：收敛更新器实例化所需的版本号、目标通道、验签公钥与超时参数，彻底消除多参数平铺。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UpdaterConfig {
     /// 宿主应用当前运行版本号
     pub current_version: Version,
@@ -43,6 +47,37 @@ pub struct UpdaterConfig {
     pub dangerous_insecure_transport_protocol: bool,
     /// 是否强制要求更新包携带数字签名（Release 模式下默认开启）
     pub require_signature: bool,
+    /// 自定义版本比较器闭包（若未设置则按 SemVer 大于判断）
+    pub version_comparator: Option<VersionComparator>,
+}
+
+impl std::fmt::Debug for UpdaterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdaterConfig")
+            .field("current_version", &self.current_version)
+            .field("endpoints", &self.endpoints)
+            .field("channel", &self.channel)
+            .field("public_keys", &self.public_keys)
+            .field("timeout", &self.timeout)
+            .field("user_agent", &self.user_agent)
+            .field("headers", &self.headers)
+            .field("proxy", &self.proxy)
+            .field("max_retries", &self.max_retries)
+            .field("retry_delay", &self.retry_delay)
+            .field("target", &self.target)
+            .field("allow_downgrade", &self.allow_downgrade)
+            .field("auto_recover_on_init", &self.auto_recover_on_init)
+            .field(
+                "dangerous_insecure_transport_protocol",
+                &self.dangerous_insecure_transport_protocol,
+            )
+            .field("require_signature", &self.require_signature)
+            .field(
+                "has_custom_version_comparator",
+                &self.version_comparator.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl UpdaterConfig {
@@ -63,7 +98,7 @@ impl UpdaterConfig {
 /// - **实现初衷**：采用标准建造者模式（Builder Pattern）渐进式配置自更新策略，提供兼具易用性与类型安全的配置入口。
 /// - **核心优势**：默认提供合理的防降级策略（`false`）、默认超时（15s）及自动平台 Target 探测。
 /// - **代价与局限**：终结方法 `build()` 需校验必选参数（`current_version` 与 `endpoints`）是否已正确提供。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UpdaterBuilder {
     pub(crate) current_version: Option<Version>,
     pub(crate) endpoints: Vec<String>,
@@ -80,6 +115,36 @@ pub struct UpdaterBuilder {
     pub(crate) auto_recover_on_init: bool,
     pub(crate) dangerous_insecure_transport_protocol: bool,
     pub(crate) require_signature: bool,
+    pub(crate) version_comparator: Option<VersionComparator>,
+}
+
+impl std::fmt::Debug for UpdaterBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdaterBuilder")
+            .field("current_version", &self.current_version)
+            .field("endpoints", &self.endpoints)
+            .field("channel", &self.channel)
+            .field("public_keys", &self.public_keys)
+            .field("timeout", &self.timeout)
+            .field("user_agent", &self.user_agent)
+            .field("headers", &self.headers)
+            .field("proxy", &self.proxy)
+            .field("max_retries", &self.max_retries)
+            .field("retry_delay", &self.retry_delay)
+            .field("target", &self.target)
+            .field("allow_downgrade", &self.allow_downgrade)
+            .field("auto_recover_on_init", &self.auto_recover_on_init)
+            .field(
+                "dangerous_insecure_transport_protocol",
+                &self.dangerous_insecure_transport_protocol,
+            )
+            .field("require_signature", &self.require_signature)
+            .field(
+                "has_custom_version_comparator",
+                &self.version_comparator.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl Default for UpdaterBuilder {
@@ -100,6 +165,7 @@ impl Default for UpdaterBuilder {
             auto_recover_on_init: false,
             dangerous_insecure_transport_protocol: false,
             require_signature: !cfg!(debug_assertions),
+            version_comparator: None,
         }
     }
 }
@@ -208,6 +274,19 @@ impl UpdaterBuilder {
         self
     }
 
+    /// 设置自定义版本比较器（接收当前版本与远端版本引用，返回 true 表示应触发升级）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：满足自定义版本策略需求（如按语义化版本标签、灰度构建号、日期版本或忽略特定补丁升级）。
+    /// - **核心优势**：允许上层业务深度介入更新裁决，打破默认仅以 SemVer 大于判断的单一死板规则。
+    pub fn version_comparator(
+        mut self,
+        comparator: impl Fn(&Version, &Version) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.version_comparator = Some(Arc::new(comparator));
+        self
+    }
+
     /// 添加单个自定义 HTTP 请求头（可多次调用以添加多个，如 Authorization 凭证）
     pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(key.into(), value.into());
@@ -281,6 +360,7 @@ impl UpdaterBuilder {
             auto_recover_on_init: self.auto_recover_on_init,
             dangerous_insecure_transport_protocol: self.dangerous_insecure_transport_protocol,
             require_signature: self.require_signature,
+            version_comparator: self.version_comparator,
         };
 
         Ok(Updater::new(config))

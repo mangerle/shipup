@@ -27,7 +27,7 @@ pub mod template;
 pub(crate) mod updater;
 
 // 常用核心类型直接重导出
-pub use builder::{UpdaterBuilder, UpdaterConfig};
+pub use builder::{UpdaterBuilder, UpdaterConfig, VersionComparator};
 pub use error::{Result, UpdateError};
 pub use event::UpdateEvent;
 pub use manifest::{

@@ -3,7 +3,7 @@
 // shipup 跨平台自更新系统 - Updater 与 Update 核心交互实体
 
 use crate::archive::{extract_archive, sync_extracted_payload};
-use crate::builder::{UpdaterBuilder, UpdaterConfig};
+use crate::builder::{UpdaterBuilder, UpdaterConfig, VersionComparator};
 use crate::download::{self, DownloadOptions};
 use crate::error::{Result, UpdateError};
 use crate::event::UpdateEvent;
@@ -47,7 +47,6 @@ pub(crate) struct NetworkSecurityConfig {
     pub require_signature: bool,
 }
 
-#[derive(Debug)]
 struct UpdaterInner {
     current_version: Version,
     endpoints: Vec<String>,
@@ -55,6 +54,24 @@ struct UpdaterInner {
     target: String,
     allow_downgrade: bool,
     config: Arc<NetworkSecurityConfig>,
+    version_comparator: Option<VersionComparator>,
+}
+
+impl std::fmt::Debug for UpdaterInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdaterInner")
+            .field("current_version", &self.current_version)
+            .field("endpoints", &self.endpoints)
+            .field("channel", &self.channel)
+            .field("target", &self.target)
+            .field("allow_downgrade", &self.allow_downgrade)
+            .field("config", &self.config)
+            .field(
+                "has_custom_version_comparator",
+                &self.version_comparator.is_some(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +137,7 @@ impl Updater {
                         .dangerous_insecure_transport_protocol,
                     require_signature: config.require_signature,
                 }),
+                version_comparator: config.version_comparator,
             }),
         }
     }
@@ -248,9 +266,17 @@ impl Updater {
         };
         let release = manifest.resolve(&options)?;
 
-        if !self.inner.allow_downgrade && release.version <= self.inner.current_version {
+        let is_available = if let Some(ref comparator) = self.inner.version_comparator {
+            comparator(&self.inner.current_version, &release.version)
+        } else if self.inner.allow_downgrade {
+            release.version != self.inner.current_version
+        } else {
+            release.version > self.inner.current_version
+        };
+
+        if !is_available {
             log::info!(
-                "远端版本 ({}) 未高于本地当前版本 ({})，忽略更新",
+                "根据版本策略评估，远端版本 ({}) 无需更新（本地当前版本: {}）",
                 release.version,
                 self.inner.current_version
             );
@@ -740,4 +766,48 @@ async fn fetch_manifest_async(client: &reqwest::Client, endpoint: &str) -> Resul
         .text()
         .await
         .map_err(|e| UpdateError::Network(format!("异步读取端点 '{}' 响应失败: {}", endpoint, e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_custom_version_comparator() {
+        let manifest_json = r#"{
+            "version": "1.0.1",
+            "packages": {
+                "x86_64-pc-windows-msvc": {
+                    "url": "https://example.com/app-1.0.1.zip",
+                    "package_type": "archive",
+                    "checksum": "sha256:abc"
+                }
+            }
+        }"#;
+
+        // 默认情况下 1.0.0 -> 1.0.1 会检测到更新
+        let updater_default = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .target("x86_64-pc-windows-msvc")
+            .manifest_url("https://example.com/manifest.json")
+            .require_signature(false)
+            .build()
+            .unwrap();
+        let res = updater_default.evaluate_manifest(manifest_json).unwrap();
+        assert!(res.is_some());
+
+        // 使用自定义比较器：只有 Major 版本变化才升级，此时 1.0.0 到 1.0.1 不应触发升级
+        let updater_major_only = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .target("x86_64-pc-windows-msvc")
+            .manifest_url("https://example.com/manifest.json")
+            .require_signature(false)
+            .version_comparator(|current, remote| remote.major > current.major)
+            .build()
+            .unwrap();
+        let res2 = updater_major_only.evaluate_manifest(manifest_json).unwrap();
+        assert!(res2.is_none());
+    }
 }
