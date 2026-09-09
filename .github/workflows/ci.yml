@@ -63,3 +63,15 @@ jobs:
 
       - name: 执行全工作区全特性测试
         run: cargo test --all-targets --all-features --verbose
+
+  audit:
+    name: 依赖安全漏洞审计 (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 运行依赖安全漏洞扫描
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
