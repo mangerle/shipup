@@ -149,8 +149,28 @@ fn execute_rollback(state: &UpdateState, current_exe: &Path, state_file: &Path) 
             state.backup_path.display(),
             current_exe.display()
         );
-        if let Err(e) = self_replace::self_replace(&state.backup_path) {
-            return Err(UpdateError::SelfReplace(format!("执行自愈回滚失败: {}", e)));
+
+        let is_running_exe = env::current_exe()
+            .map(|running| {
+                match (running.canonicalize(), current_exe.canonicalize()) {
+                    (Ok(p1), Ok(p2)) => p1 == p2,
+                    _ => running == current_exe,
+                }
+            })
+            .unwrap_or(false);
+
+        if is_running_exe {
+            if let Err(e) = self_replace::self_replace(&state.backup_path) {
+                return Err(UpdateError::SelfReplace(format!("执行自愈回滚失败: {}", e)));
+            }
+        } else {
+            // 当目标并非当前正在运行的进程二进制（例如测试或外部托管沙箱）时，直接安全覆盖目标文件
+            if current_exe.exists() {
+                let _ = fs::remove_file(current_exe);
+            }
+            if let Err(e) = fs::copy(&state.backup_path, current_exe) {
+                return Err(UpdateError::SelfReplace(format!("还原备份文件到目标可执行文件失败: {}", e)));
+            }
         }
         let _ = fs::remove_file(&state.backup_path);
     } else {
@@ -279,6 +299,10 @@ mod tests {
             }
         );
 
+        // 验证目标可执行文件已成功被备份文件还原为稳定版本
+        assert_eq!(fs::read(&dummy_exe).unwrap(), b"old-stable-binary");
+        // 历史备份文件已被消费清理
+        assert!(!dummy_backup.exists());
         // 状态标记已被自动清理
         assert!(!temp_dir.join(UPDATE_STATE_FILENAME).exists());
 
