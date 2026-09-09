@@ -12,7 +12,7 @@ use crate::platform::{
     cleanup_old_backups, get_temp_download_path, replace_binary, spawn_installer,
 };
 use crate::restart::{RestartContext, restart_with};
-use crate::signature::{verify_ed25519_file, verify_sha256_file};
+use crate::signature::{verify_ed25519_file_any_key, verify_sha256_file};
 use semver::Version;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -35,7 +35,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 /// - **代价与局限**：实例不可变借用，配置在构建完成后不可动态篡改。
 #[derive(Debug)]
 pub(crate) struct NetworkSecurityConfig {
-    pub public_key: Option<String>,
+    pub public_keys: Vec<String>,
     pub timeout: Duration,
     pub user_agent: Option<String>,
     pub headers: HashMap<String, String>,
@@ -103,7 +103,7 @@ impl Updater {
                 target: config.target,
                 allow_downgrade: config.allow_downgrade,
                 config: Arc::new(NetworkSecurityConfig {
-                    public_key: config.public_key,
+                    public_keys: config.public_keys,
                     timeout: config.timeout,
                     user_agent: config.user_agent,
                     headers: config.headers,
@@ -455,24 +455,24 @@ impl Update {
 
         if self.config.require_signature {
             callback(UpdateEvent::VerifyingSignature);
-            let pub_key = self
-                .config
-                .public_key
-                .as_deref()
-                .ok_or(UpdateError::MissingPublicKey)?;
+            if self.config.public_keys.is_empty() {
+                return Err(UpdateError::MissingPublicKey);
+            }
             let sig = self.release.package.signature.as_deref().ok_or_else(|| {
                 let _ = fs::remove_file(temp_path);
                 UpdateError::MissingSignature
             })?;
-            if let Err(e) = verify_ed25519_file(temp_path, sig, pub_key) {
+            if let Err(e) = verify_ed25519_file_any_key(temp_path, sig, &self.config.public_keys) {
                 let _ = fs::remove_file(temp_path);
                 return Err(e);
             }
-        } else if let Some(ref pub_key) = self.config.public_key {
+        } else if !self.config.public_keys.is_empty() {
             callback(UpdateEvent::VerifyingSignature);
             match self.release.package.signature {
                 Some(ref sig) => {
-                    if let Err(e) = verify_ed25519_file(temp_path, sig, pub_key) {
+                    if let Err(e) =
+                        verify_ed25519_file_any_key(temp_path, sig, &self.config.public_keys)
+                    {
                         let _ = fs::remove_file(temp_path);
                         return Err(e);
                     }

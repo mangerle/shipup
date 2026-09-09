@@ -143,8 +143,46 @@ pub fn verify_ed25519_file(
     base64_signature: &str,
     base64_public_key: &str,
 ) -> Result<()> {
+    verify_ed25519_file_any_key(file_path, base64_signature, &[base64_public_key])
+}
+
+/// 使用候选公钥列表验证数字签名（任一公钥验签通过即判定合法）
+///
+/// # 设计原理
+/// - **实现初衷**：支持公钥平滑轮换（Key Rotation）与多信任源，避免因更换私钥导致老版本更新锁死。
+/// - **核心优势**：一旦匹配即刻短路返回，且不产生堆内存重新分配。
+///
+/// # Errors
+/// 当公钥列表为空时返回 [`UpdateError::MissingPublicKey`]；当所有公钥均验证失败时返回 [`UpdateError::InvalidSignature`]。
+pub fn verify_ed25519_any_key(
+    data: &[u8],
+    base64_signature: &str,
+    base64_public_keys: &[impl AsRef<str>],
+) -> Result<()> {
+    if base64_public_keys.is_empty() {
+        return Err(UpdateError::MissingPublicKey);
+    }
+
+    for pub_key in base64_public_keys {
+        if verify_ed25519(data, base64_signature, pub_key.as_ref()).is_ok() {
+            return Ok(());
+        }
+    }
+
+    Err(UpdateError::InvalidSignature)
+}
+
+/// 针对文件路径使用候选公钥列表验证数字签名
+///
+/// # Errors
+/// 当文件读取失败或所有候选公钥均验证失败时返回错误。
+pub fn verify_ed25519_file_any_key(
+    file_path: &Path,
+    base64_signature: &str,
+    base64_public_keys: &[impl AsRef<str>],
+) -> Result<()> {
     let data = std::fs::read(file_path)?;
-    verify_ed25519(&data, base64_signature, base64_public_key)
+    verify_ed25519_any_key(&data, base64_signature, base64_public_keys)
 }
 
 #[cfg(test)]
@@ -215,6 +253,48 @@ mod tests {
         assert!(matches!(
             verify_ed25519(payload, "invalid-base64!@", &pub_b64),
             Err(UpdateError::Base64(_))
+        ));
+    }
+
+    #[test]
+    fn test_ed25519_multi_key_rotation() {
+        let payload = b"software-update-v2-binary";
+
+        // 生成旧密钥对
+        let old_seed = [1u8; 32];
+        let old_signing = SigningKey::from_bytes(&old_seed);
+        let old_pub_b64 = BASE64.encode(old_signing.verifying_key().to_bytes());
+
+        // 生成新密钥对
+        let new_seed = [2u8; 32];
+        let new_signing = SigningKey::from_bytes(&new_seed);
+        let new_pub_b64 = BASE64.encode(new_signing.verifying_key().to_bytes());
+
+        // 客户端同时信任旧公钥与新公钥
+        let trusted_keys = vec![old_pub_b64.clone(), new_pub_b64.clone()];
+
+        // 1. 新密钥签名的更新包，在客户端多公钥列表下成功验签通过
+        let new_sig = BASE64.encode(new_signing.sign(payload).to_bytes());
+        assert!(verify_ed25519_any_key(payload, &new_sig, &trusted_keys).is_ok());
+
+        // 2. 旧密钥签名的历史包，在客户端多公钥列表下同样成功验签通过
+        let old_sig = BASE64.encode(old_signing.sign(payload).to_bytes());
+        assert!(verify_ed25519_any_key(payload, &old_sig, &trusted_keys).is_ok());
+
+        // 3. 未被信任的第三方密钥签名的恶意包，验签失败
+        let rogue_seed = [3u8; 32];
+        let rogue_signing = SigningKey::from_bytes(&rogue_seed);
+        let rogue_sig = BASE64.encode(rogue_signing.sign(payload).to_bytes());
+        assert!(matches!(
+            verify_ed25519_any_key(payload, &rogue_sig, &trusted_keys),
+            Err(UpdateError::InvalidSignature)
+        ));
+
+        // 4. 空公钥列表返回 MissingPublicKey
+        let empty_keys: Vec<String> = Vec::new();
+        assert!(matches!(
+            verify_ed25519_any_key(payload, &new_sig, &empty_keys),
+            Err(UpdateError::MissingPublicKey)
         ));
     }
 }

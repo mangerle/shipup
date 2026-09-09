@@ -19,8 +19,8 @@ pub struct UpdaterConfig {
     pub manifest_url: String,
     /// 目标发布通道
     pub channel: Option<String>,
-    /// Ed25519 验签公钥（Base64 编码）
-    pub public_key: Option<String>,
+    /// Ed25519 验签公钥列表（Base64 编码，支持多公钥共存与平滑轮换）
+    pub public_keys: Vec<String>,
     /// 网络超时时长
     pub timeout: Duration,
     /// 自定义 HTTP User-Agent
@@ -45,6 +45,13 @@ pub struct UpdaterConfig {
     pub require_signature: bool,
 }
 
+impl UpdaterConfig {
+    /// 获取首选主验签公钥（向后兼容接口）
+    pub fn public_key(&self) -> Option<&str> {
+        self.public_keys.first().map(|s| s.as_str())
+    }
+}
+
 /// 更新器链式构建器
 ///
 /// # 设计原理
@@ -56,7 +63,7 @@ pub struct UpdaterBuilder {
     pub(crate) current_version: Option<Version>,
     pub(crate) manifest_url: Option<String>,
     pub(crate) channel: Option<String>,
-    pub(crate) public_key: Option<String>,
+    pub(crate) public_keys: Vec<String>,
     pub(crate) timeout: Duration,
     pub(crate) user_agent: Option<String>,
     pub(crate) headers: HashMap<String, String>,
@@ -76,7 +83,7 @@ impl Default for UpdaterBuilder {
             current_version: None,
             manifest_url: None,
             channel: None,
-            public_key: None,
+            public_keys: Vec::new(),
             timeout: Duration::from_secs(15),
             user_agent: None,
             headers: HashMap::new(),
@@ -117,9 +124,16 @@ impl UpdaterBuilder {
         self
     }
 
-    /// 设置 Ed25519 公钥（Base64 编码，若不配置则关闭公钥验签）
+    /// 添加单个 Ed25519 验证公钥（Base64 编码，可多次调用以配置多枚公钥实现平滑轮换）
     pub fn public_key(mut self, public_key: impl Into<String>) -> Self {
-        self.public_key = Some(public_key.into());
+        self.public_keys.push(public_key.into());
+        self
+    }
+
+    /// 批量设置或追加 Ed25519 验证公钥列表（Base64 编码）
+    pub fn public_keys(mut self, public_keys: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.public_keys
+            .extend(public_keys.into_iter().map(Into::into));
         self
     }
 
@@ -224,7 +238,7 @@ impl UpdaterBuilder {
             return Err(UpdateError::InsecureTransportProtocol(manifest_url));
         }
 
-        if self.require_signature && self.public_key.is_none() {
+        if self.require_signature && self.public_keys.is_empty() {
             return Err(UpdateError::MissingPublicKey);
         }
 
@@ -232,7 +246,7 @@ impl UpdaterBuilder {
             current_version,
             manifest_url,
             channel: self.channel,
-            public_key: self.public_key,
+            public_keys: self.public_keys,
             timeout: self.timeout,
             user_agent: self.user_agent,
             headers: self.headers,
