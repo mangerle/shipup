@@ -166,10 +166,12 @@ pub fn verify_ed25519_file(
 ///
 /// # 设计原理
 /// - **实现初衷**：支持公钥平滑轮换（Key Rotation）与多信任源，避免因更换私钥导致老版本更新锁死。
-/// - **核心优势**：一旦匹配即刻短路返回，且不产生堆内存重新分配。
+/// - **核心优势**：一旦匹配即刻短路返回；全部失败时收集各个公钥的具体失败原因，杜绝空洞的通用错误。
 ///
 /// # Errors
-/// 当公钥列表为空时返回 [`UpdateError::MissingPublicKey`]；当所有公钥均验证失败时返回 [`UpdateError::InvalidSignature`]。
+/// 当公钥列表为空时返回 [`UpdateError::MissingPublicKey`]；
+/// 当单公钥失败时直接冒泡其底层具体错误；
+/// 当多公钥全部失败时返回包含结构化诊断详情的 [`UpdateError::MultiKeyVerificationFailed`]。
 pub fn verify_ed25519_any_key(
     data: &[u8],
     base64_signature: &str,
@@ -179,13 +181,29 @@ pub fn verify_ed25519_any_key(
         return Err(UpdateError::MissingPublicKey);
     }
 
-    for pub_key in base64_public_keys {
-        if verify_ed25519(data, base64_signature, pub_key.as_ref()).is_ok() {
-            return Ok(());
+    let mut errors: Vec<String> = Vec::with_capacity(base64_public_keys.len());
+
+    for (idx, pub_key) in base64_public_keys.iter().enumerate() {
+        match verify_ed25519(data, base64_signature, pub_key.as_ref()) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                errors.push(format!(
+                    "[候选公钥 #{}/{}]: {e}",
+                    idx + 1,
+                    base64_public_keys.len()
+                ));
+            }
         }
     }
 
-    Err(UpdateError::InvalidSignature)
+    if base64_public_keys.len() == 1 {
+        verify_ed25519(data, base64_signature, base64_public_keys[0].as_ref())
+    } else {
+        Err(UpdateError::MultiKeyVerificationFailed {
+            count: base64_public_keys.len(),
+            details: errors.join("; "),
+        })
+    }
 }
 
 /// 允许一次性读入内存执行 Ed25519 签名验证的最大文件体积上限（512MB）
@@ -207,11 +225,16 @@ pub fn verify_ed25519_file_any_key(
     base64_signature: &str,
     base64_public_keys: &[impl AsRef<str>],
 ) -> Result<()> {
+    if base64_public_keys.is_empty() {
+        return Err(UpdateError::MissingPublicKey);
+    }
+
     // 1. 优先尝试 TUF/Sigstore 规范的标准摘要验签（流式计算 32 字节哈希）
     let digest = compute_file_sha256_digest(file_path)?;
-    if verify_ed25519_any_key(&digest, base64_signature, base64_public_keys).is_ok() {
-        return Ok(());
-    }
+    let digest_err = match verify_ed25519_any_key(&digest, base64_signature, base64_public_keys) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
 
     // 2. 向前兼容回退：若摘要验签未通过，尝试对全文字节进行兼容验证（限制 <= 512MB 安全上限）
     // 消除 TOCTOU 竞态：先打开句柄，基于同一文件句柄查询元数据并执行读取，杜绝路径替换与竞态攻击
@@ -236,7 +259,8 @@ pub fn verify_ed25519_file_any_key(
         }
     }
 
-    Err(UpdateError::InvalidSignature)
+    // 向后兼容路径亦未通过，返回摘要验签时的完整结构化诊断上下文
+    Err(digest_err)
 }
 
 #[cfg(test)]
@@ -335,14 +359,19 @@ mod tests {
         let old_sig = BASE64.encode(old_signing.sign(payload).to_bytes());
         assert!(verify_ed25519_any_key(payload, &old_sig, &trusted_keys).is_ok());
 
-        // 3. 未被信任的第三方密钥签名的恶意包，验签失败
+        // 3. 未被信任的第三方密钥签名的恶意包，验签失败并返回结构化诊断上下文
         let rogue_seed = [3u8; 32];
         let rogue_signing = SigningKey::from_bytes(&rogue_seed);
         let rogue_sig = BASE64.encode(rogue_signing.sign(payload).to_bytes());
-        assert!(matches!(
-            verify_ed25519_any_key(payload, &rogue_sig, &trusted_keys),
-            Err(UpdateError::InvalidSignature)
-        ));
+        let res = verify_ed25519_any_key(payload, &rogue_sig, &trusted_keys);
+        match res {
+            Err(UpdateError::MultiKeyVerificationFailed { count, details }) => {
+                assert_eq!(count, 2);
+                assert!(details.contains("[候选公钥 #1/2]"));
+                assert!(details.contains("[候选公钥 #2/2]"));
+            }
+            other => panic!("期望 MultiKeyVerificationFailed，实际为: {:?}", other),
+        }
 
         // 4. 空公钥列表返回 MissingPublicKey
         let empty_keys: Vec<String> = Vec::new();
@@ -350,6 +379,25 @@ mod tests {
             verify_ed25519_any_key(payload, &new_sig, &empty_keys),
             Err(UpdateError::MissingPublicKey)
         ));
+    }
+
+    #[test]
+    fn test_multi_key_verification_heterogeneous_failure_context() {
+        let payload = b"critical firmware code";
+        let invalid_b64_key = "not_valid_base64!!!";
+        let dummy_key = BASE64.encode([1u8; 32]);
+        let keys = vec![invalid_b64_key.to_string(), dummy_key];
+
+        let dummy_sig = BASE64.encode([0u8; 64]);
+        let err = verify_ed25519_any_key(payload, &dummy_sig, &keys).unwrap_err();
+        match err {
+            UpdateError::MultiKeyVerificationFailed { count, details } => {
+                assert_eq!(count, 2);
+                assert!(details.contains("Base64 解码错误"));
+                assert!(details.contains("数字签名无效"));
+            }
+            other => panic!("期望 MultiKeyVerificationFailed，实际为: {:?}", other),
+        }
     }
 
     #[test]

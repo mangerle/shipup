@@ -41,6 +41,10 @@ pub enum UpdateError {
     #[error("数字签名无效或文件已被篡改")]
     InvalidSignature,
 
+    /// 多候选公钥轮换验签全部失败，携带各个公钥失败的诊断上下文
+    #[error("多候选公钥验签全部失败（共尝试 {count} 个候选公钥）: {details}")]
+    MultiKeyVerificationFailed { count: usize, details: String },
+
     /// 客户端配置了公钥但远端包缺少签名
     #[error("签名配置缺失: 客户端启用了验签但 Manifest 未包含签名")]
     MissingSignature,
