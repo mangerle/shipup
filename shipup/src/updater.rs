@@ -15,6 +15,7 @@ use crate::restart::{RestartContext, restart_with};
 use crate::signature::{verify_ed25519_file, verify_sha256_file};
 use semver::Version;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -526,8 +527,8 @@ impl Update {
     /// 优雅重启宿主程序，并在进程退出前执行清理闭包
     ///
     /// # Errors
-    /// 当拉起新进程失败时返回 [`UpdateError::SelfReplace`]。
-    pub fn restart_with<F>(&self, cleanup: F) -> Result<()>
+    /// 当拉起新进程失败时返回 [`UpdateError::SelfReplace`]。若新进程拉起成功，将在执行清理闭包后退出当前进程，正常情况下不会返回。
+    pub fn restart_with<F>(&self, cleanup: F) -> Result<Infallible>
     where
         F: FnOnce(&mut RestartContext),
     {
@@ -537,8 +538,8 @@ impl Update {
     /// 直接重启宿主程序
     ///
     /// # Errors
-    /// 当拉起新进程失败时返回 [`UpdateError::SelfReplace`]。
-    pub fn restart(&self) -> Result<()> {
+    /// 当拉起新进程失败时返回 [`UpdateError::SelfReplace`]。若新进程拉起成功，将退出当前进程，正常情况下不会返回。
+    pub fn restart(&self) -> Result<Infallible> {
         restart_with(|_| {})
     }
 }

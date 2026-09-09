@@ -1,6 +1,7 @@
 // shipup 跨平台自更新系统 - 跨平台程序自重启与清理钩子移交
 
 use crate::error::{Result, UpdateError};
+use std::convert::Infallible;
 use std::env;
 use std::process::{self, Command};
 
@@ -49,8 +50,8 @@ pub fn is_restarted_by_shipup() -> bool {
 /// - **代价与局限**：此方法成功执行后会导致当前旧进程直接退出，不可在其后安排依赖旧进程的后续逻辑。
 ///
 /// # Errors
-/// 当子进程派生失败时返回 [`UpdateError::SelfReplace`]。
-pub fn restart_with<F>(cleanup_wrapper: F) -> Result<()>
+/// 当子进程派生失败时返回 [`UpdateError::SelfReplace`]。若新进程拉起成功，将在执行清理闭包后退出当前进程，正常情况下不会返回。
+pub fn restart_with<F>(cleanup_wrapper: F) -> Result<Infallible>
 where
     F: FnOnce(&mut RestartContext),
 {
