@@ -43,6 +43,7 @@ pub(crate) struct NetworkSecurityConfig {
     pub max_retries: u32,
     pub retry_delay: Duration,
     pub dangerous_insecure_transport_protocol: bool,
+    pub require_signature: bool,
 }
 
 #[derive(Debug)]
@@ -111,6 +112,7 @@ impl Updater {
                     retry_delay: config.retry_delay,
                     dangerous_insecure_transport_protocol: config
                         .dangerous_insecure_transport_protocol,
+                    require_signature: config.require_signature,
                 }),
             }),
         }
@@ -451,7 +453,22 @@ impl Update {
             }
         }
 
-        if let Some(ref pub_key) = self.config.public_key {
+        if self.config.require_signature {
+            callback(UpdateEvent::VerifyingSignature);
+            let pub_key = self
+                .config
+                .public_key
+                .as_deref()
+                .ok_or(UpdateError::MissingPublicKey)?;
+            let sig = self.release.package.signature.as_deref().ok_or_else(|| {
+                let _ = fs::remove_file(temp_path);
+                UpdateError::MissingSignature
+            })?;
+            if let Err(e) = verify_ed25519_file(temp_path, sig, pub_key) {
+                let _ = fs::remove_file(temp_path);
+                return Err(e);
+            }
+        } else if let Some(ref pub_key) = self.config.public_key {
             callback(UpdateEvent::VerifyingSignature);
             match self.release.package.signature {
                 Some(ref sig) => {

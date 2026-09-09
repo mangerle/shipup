@@ -45,6 +45,10 @@ pub enum UpdateError {
     #[error("签名配置缺失: 客户端启用了验签但 Manifest 未包含签名")]
     MissingSignature,
 
+    /// 缺少验签公钥配置
+    #[error("验签公钥缺失: 当前安全模式强制要求校验数字签名，但未提供公钥")]
+    MissingPublicKey,
+
     /// 目标文件或目录写入权限不足
     #[error("目标目录写权限受限: {0}。对于系统受保护目录，建议配置为安装器（installer）模式")]
     PermissionDenied(String),

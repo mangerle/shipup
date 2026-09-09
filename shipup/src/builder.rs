@@ -41,6 +41,8 @@ pub struct UpdaterConfig {
     pub auto_recover_on_init: bool,
     /// 是否允许不安全的明文 HTTP 传输协议（默认为 false）
     pub dangerous_insecure_transport_protocol: bool,
+    /// 是否强制要求更新包携带数字签名（Release 模式下默认开启）
+    pub require_signature: bool,
 }
 
 /// 更新器链式构建器
@@ -65,6 +67,7 @@ pub struct UpdaterBuilder {
     pub(crate) allow_downgrade: bool,
     pub(crate) auto_recover_on_init: bool,
     pub(crate) dangerous_insecure_transport_protocol: bool,
+    pub(crate) require_signature: bool,
 }
 
 impl Default for UpdaterBuilder {
@@ -84,6 +87,7 @@ impl Default for UpdaterBuilder {
             allow_downgrade: false,
             auto_recover_on_init: false,
             dangerous_insecure_transport_protocol: false,
+            require_signature: !cfg!(debug_assertions),
         }
     }
 }
@@ -163,6 +167,16 @@ impl UpdaterBuilder {
         self
     }
 
+    /// 设置是否强制要求更新包携带数字签名（Release 模式下默认开启）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：将验签模型由默认 Fail-Open 升级为 Fail-Close，防止开发者疏漏公钥导致恶意安装包直接执行。
+    /// - **安全契约**：若启用该选项，构建更新器时若未配置公钥，或清单中包未包含签名，更新流程将被阻断。
+    pub fn require_signature(mut self, require: bool) -> Self {
+        self.require_signature = require;
+        self
+    }
+
     /// 添加单个自定义 HTTP 请求头（可多次调用以添加多个，如 Authorization 凭证）
     pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(key.into(), value.into());
@@ -210,6 +224,10 @@ impl UpdaterBuilder {
             return Err(UpdateError::InsecureTransportProtocol(manifest_url));
         }
 
+        if self.require_signature && self.public_key.is_none() {
+            return Err(UpdateError::MissingPublicKey);
+        }
+
         let config = UpdaterConfig {
             current_version,
             manifest_url,
@@ -225,6 +243,7 @@ impl UpdaterBuilder {
             allow_downgrade: self.allow_downgrade,
             auto_recover_on_init: self.auto_recover_on_init,
             dangerous_insecure_transport_protocol: self.dangerous_insecure_transport_protocol,
+            require_signature: self.require_signature,
         };
 
         Ok(Updater::new(config))
@@ -322,5 +341,30 @@ mod tests {
             .dangerous_insecure_transport_protocol(true)
             .build();
         assert!(insecure_allowed.is_ok());
+    }
+
+    #[test]
+    fn test_require_signature_validation() {
+        // 1. 强制要求验签模式下，未配置公钥将返回 MissingPublicKey
+        let missing_key_err = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .manifest_url("https://example.com/manifest.json")
+            .require_signature(true)
+            .build();
+        assert!(matches!(
+            missing_key_err,
+            Err(UpdateError::MissingPublicKey)
+        ));
+
+        // 2. 传入公钥后通过校验构建成功
+        let valid_builder = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .manifest_url("https://example.com/manifest.json")
+            .public_key("dGVzdC1wdWJsaWMta2V5")
+            .require_signature(true)
+            .build();
+        assert!(valid_builder.is_ok());
     }
 }
