@@ -543,6 +543,37 @@ impl Update {
     }
 }
 
+#[cfg(any(feature = "blocking", feature = "async"))]
+fn parse_header_map(headers: &HashMap<String, String>) -> Result<Option<HeaderMap>> {
+    if headers.is_empty() {
+        return Ok(None);
+    }
+    let mut header_map = HeaderMap::with_capacity(headers.len());
+    for (k, v) in headers {
+        let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
+            UpdateError::Network(format!("无效的 HTTP 请求头名称 '{}': {}", k, e))
+        })?;
+        let val = HeaderValue::from_str(v).map_err(|e| {
+            UpdateError::Network(format!("无效的 HTTP 请求头数值 '{}': {}", v, e))
+        })?;
+        header_map.insert(name, val);
+    }
+    Ok(Some(header_map))
+}
+
+#[cfg(any(feature = "blocking", feature = "async"))]
+fn parse_proxy(proxy: Option<&str>) -> Result<Option<Proxy>> {
+    match proxy {
+        Some(proxy_url) => {
+            let proxy_config = Proxy::all(proxy_url).map_err(|e| {
+                UpdateError::Network(format!("配置代理服务器 '{}' 失败: {}", proxy_url, e))
+            })?;
+            Ok(Some(proxy_config))
+        }
+        None => Ok(None),
+    }
+}
+
 #[cfg(feature = "blocking")]
 fn build_blocking_http_client(
     timeout: Duration,
@@ -554,23 +585,10 @@ fn build_blocking_http_client(
     if let Some(ua) = user_agent {
         builder = builder.user_agent(ua);
     }
-    if !headers.is_empty() {
-        let mut header_map = HeaderMap::with_capacity(headers.len());
-        for (k, v) in headers {
-            let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
-                UpdateError::Network(format!("无效的 HTTP 请求头名称 '{}': {}", k, e))
-            })?;
-            let val = HeaderValue::from_str(v).map_err(|e| {
-                UpdateError::Network(format!("无效的 HTTP 请求头数值 '{}': {}", v, e))
-            })?;
-            header_map.insert(name, val);
-        }
+    if let Some(header_map) = parse_header_map(headers)? {
         builder = builder.default_headers(header_map);
     }
-    if let Some(proxy_url) = proxy {
-        let proxy_config = Proxy::all(proxy_url).map_err(|e| {
-            UpdateError::Network(format!("配置代理服务器 '{}' 失败: {}", proxy_url, e))
-        })?;
+    if let Some(proxy_config) = parse_proxy(proxy)? {
         builder = builder.proxy(proxy_config);
     }
     builder
@@ -589,23 +607,10 @@ fn build_async_http_client(
     if let Some(ua) = user_agent {
         builder = builder.user_agent(ua);
     }
-    if !headers.is_empty() {
-        let mut header_map = HeaderMap::with_capacity(headers.len());
-        for (k, v) in headers {
-            let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
-                UpdateError::Network(format!("无效的 HTTP 请求头名称 '{}': {}", k, e))
-            })?;
-            let val = HeaderValue::from_str(v).map_err(|e| {
-                UpdateError::Network(format!("无效的 HTTP 请求头数值 '{}': {}", v, e))
-            })?;
-            header_map.insert(name, val);
-        }
+    if let Some(header_map) = parse_header_map(headers)? {
         builder = builder.default_headers(header_map);
     }
-    if let Some(proxy_url) = proxy {
-        let proxy_config = Proxy::all(proxy_url).map_err(|e| {
-            UpdateError::Network(format!("配置代理服务器 '{}' 失败: {}", proxy_url, e))
-        })?;
+    if let Some(proxy_config) = parse_proxy(proxy)? {
         builder = builder.proxy(proxy_config);
     }
     builder
