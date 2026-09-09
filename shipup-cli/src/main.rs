@@ -10,8 +10,10 @@ use sha2::{Digest, Sha256};
 use shipup::{ChannelInfo, InstallMode, Manifest, PackageInfo, PackageType};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(
@@ -68,6 +70,10 @@ struct ReleaseArgs {
     /// 版本更新日志说明内容
     #[arg(long)]
     notes: Option<String>,
+
+    /// 版本发布时间（ISO 8601 / RFC 3339 格式，如未指定则自动注入当前 UTC 时间）
+    #[arg(long)]
+    pub_date: Option<String>,
 
     /// 最低支持版本（低于该版本将触发强制更新）
     #[arg(long)]
@@ -152,16 +158,102 @@ fn handle_keygen(out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 计算发布包的 SHA-256 哈希值与可选的 Ed25519 数字签名
+/// 最大支持 Ed25519 内存签名的发布包体积上限（256MB）
+const MAX_SIGNING_PAYLOAD_SIZE: u64 = 256 * 1024 * 1024;
+
+/// 获取当前系统 UTC 时间的 RFC 3339 格式字符串（例如 "2026-09-09T12:00:00Z"）
+///
+/// # 设计原理
+/// - **实现初衷**：避免为简单的日期格式化引入庞大的第三方依赖，基于标准库 `SystemTime` 原生计算。
+/// - **算法保障**：遵循格里高利历标准闰年规则，精确将自 1970 年 UNIX 纪元以来的秒数转为标准时间戳。
+fn current_utc_rfc3339() -> String {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format_timestamp_rfc3339(duration.as_secs())
+}
+
+/// 将自 UNIX 纪元以来的秒数格式化为 RFC 3339 字符串
+fn format_timestamp_rfc3339(total_secs: u64) -> String {
+    let sec = (total_secs % 60) as u32;
+    let total_mins = total_secs / 60;
+    let min = (total_mins % 60) as u32;
+    let total_hours = total_mins / 60;
+    let hour = (total_hours % 24) as u32;
+    let mut days = (total_hours / 24) as i64;
+
+    let mut year = 1970i32;
+    loop {
+        let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let days_in_year = if is_leap { 366 } else { 365 };
+        if days >= days_in_year {
+            days -= days_in_year;
+            year += 1;
+        } else {
+            break;
+        }
+    }
+
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let days_in_months = [
+        31,
+        if is_leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+
+    let mut month = 1u32;
+    for &dim in &days_in_months {
+        if days >= dim as i64 {
+            days -= dim as i64;
+            month += 1;
+        } else {
+            break;
+        }
+    }
+    let day = (days + 1) as u32;
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// 流式读取发布包计算 SHA-256 哈希值，并在提供私钥且体积安全时生成 Ed25519 数字签名
+///
+/// # 设计原理
+/// - **实现初衷**：为防止发布大型安装包时将全量文件直接读入内存导致 OOM，采用 64KB 固定缓冲区流式计算 SHA-256。
+/// - **内存保护**：Ed25519 签名需要持有待签名报文切片，因此在签名分支增加 256MB 上限防护，超限明确拦截。
 fn compute_payload_integrity(
     package_path: &Path,
     key_path: Option<&Path>,
 ) -> Result<(String, Option<String>)> {
-    let package_bytes = fs::read(package_path)
-        .with_context(|| format!("读取发布包文件失败: {}", package_path.display()))?;
+    let file = fs::File::open(package_path)
+        .with_context(|| format!("打开发布包文件失败: {}", package_path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("获取发布包元数据失败: {}", package_path.display()))?;
+    let file_size = metadata.len();
 
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
     let mut hasher = Sha256::new();
-    hasher.update(&package_bytes);
+    let mut buffer = [0u8; 64 * 1024];
+
+    loop {
+        let bytes_read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("流式读取发布包数据失败: {}", package_path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
     let hash = hasher.finalize();
     let mut hex = String::with_capacity(hash.len() * 2);
     for b in hash {
@@ -171,6 +263,16 @@ fn compute_payload_integrity(
     let checksum = format!("sha256:{hex}");
 
     let signature = if let Some(kp) = key_path {
+        if file_size > MAX_SIGNING_PAYLOAD_SIZE {
+            anyhow::bail!(
+                "发布包文件体积 ({} 字节) 超过 Ed25519 单次内存签名安全上限 ({} 字节)",
+                file_size,
+                MAX_SIGNING_PAYLOAD_SIZE
+            );
+        }
+
+        let package_bytes = fs::read(package_path)
+            .with_context(|| format!("读取待签名发布包失败: {}", package_path.display()))?;
         let key_str = fs::read_to_string(kp)
             .with_context(|| format!("读取私钥文件失败: {}", kp.display()))?;
         let key_bytes = BASE64
@@ -196,10 +298,16 @@ fn compute_payload_integrity(
 struct ManifestReleaseEntry {
     version: Version,
     min_supported_version: Option<Version>,
+    pub_date: String,
     package_info: PackageInfo,
 }
 
 /// 将包信息合并至指定通道或主通道的 Manifest 数据结构中
+///
+/// # 设计原理
+/// - **实现初衷**：支持跨平台 CI/CD 逐步合并发布包至同一清单，并防范低版本误操作降级覆盖高版本主信息。
+/// - **安全合并**：严格比对 SemVer 版本高低，仅在待合并版本大于或等于清单版本时更新元数据；
+///   低版本包合并时仅追加目标平台包矩阵，保留清单中更高版本的元数据（version、pub_date、notes 等）。
 fn update_manifest_entries(
     manifest: &mut Manifest,
     args: &ReleaseArgs,
@@ -213,39 +321,87 @@ fn update_manifest_entries(
                 version: entry.version.clone(),
                 min_supported_version: entry.min_supported_version.clone(),
                 force_update: args.force_update,
-                pub_date: None,
+                pub_date: Some(entry.pub_date.clone()),
                 notes: args.notes.clone(),
                 packages: HashMap::new(),
             });
 
-        ch_entry.version = entry.version;
-        if entry.min_supported_version.is_some() {
-            ch_entry.min_supported_version = entry.min_supported_version;
-        }
-        if args.force_update {
-            ch_entry.force_update = true;
-        }
-        if let Some(ref n) = args.notes {
-            ch_entry.notes = Some(n.clone());
+        if entry.version > ch_entry.version {
+            ch_entry.version = entry.version;
+            ch_entry.pub_date = Some(entry.pub_date);
+            if entry.min_supported_version.is_some() {
+                ch_entry.min_supported_version = entry.min_supported_version;
+            }
+            if args.force_update {
+                ch_entry.force_update = true;
+            }
+            if let Some(ref n) = args.notes {
+                ch_entry.notes = Some(n.clone());
+            }
+        } else if entry.version == ch_entry.version {
+            if ch_entry.pub_date.is_none() {
+                ch_entry.pub_date = Some(entry.pub_date);
+            }
+            if entry.min_supported_version.is_some() {
+                ch_entry.min_supported_version = entry.min_supported_version;
+            }
+            if args.force_update {
+                ch_entry.force_update = true;
+            }
+            if let Some(ref n) = args.notes {
+                ch_entry.notes = Some(n.clone());
+            }
+        } else {
+            log::warn!(
+                "发布通道 '{}' 待合并版本 {} 低于通道当前版本 {}，保留现有高版本元数据",
+                ch,
+                entry.version,
+                ch_entry.version
+            );
         }
         ch_entry
             .packages
             .insert(args.target.clone(), entry.package_info);
     } else {
-        manifest.version = entry.version;
-        if entry.min_supported_version.is_some() {
-            manifest.min_supported_version = entry.min_supported_version;
-        }
-        if args.force_update {
-            manifest.force_update = true;
-        }
-        if let Some(ref n) = args.notes {
-            manifest.notes = Some(n.clone());
+        if entry.version > manifest.version {
+            manifest.version = entry.version;
+            manifest.pub_date = Some(entry.pub_date);
+            if entry.min_supported_version.is_some() {
+                manifest.min_supported_version = entry.min_supported_version;
+            }
+            if args.force_update {
+                manifest.force_update = true;
+            }
+            if let Some(ref n) = args.notes {
+                manifest.notes = Some(n.clone());
+            }
+        } else if entry.version == manifest.version {
+            if manifest.pub_date.is_none() {
+                manifest.pub_date = Some(entry.pub_date);
+            }
+            if entry.min_supported_version.is_some() {
+                manifest.min_supported_version = entry.min_supported_version;
+            }
+            if args.force_update {
+                manifest.force_update = true;
+            }
+            if let Some(ref n) = args.notes {
+                manifest.notes = Some(n.clone());
+            }
+        } else {
+            log::warn!(
+                "主通道待合并版本 {} 低于清单当前版本 {}，保留现有高版本元数据",
+                entry.version,
+                manifest.version
+            );
         }
         manifest
             .packages
             .insert(args.target.clone(), entry.package_info);
     }
+
+    // 清单内容变更后，原有的全局签名已失效，予以重置
+    manifest.signature = None;
 }
 
 /// 执行发布包签名与 Manifest 清单合并
@@ -300,9 +456,12 @@ fn handle_release(args: &ReleaseArgs) -> Result<()> {
         require_elevation: args.require_elevation,
     };
 
+    let pub_date = args.pub_date.clone().unwrap_or_else(current_utc_rfc3339);
+
     let entry = ManifestReleaseEntry {
         version,
         min_supported_version,
+        pub_date,
         package_info,
     };
 
@@ -333,7 +492,7 @@ fn load_or_init_manifest(
             version: entry.version.clone(),
             min_supported_version: entry.min_supported_version.clone(),
             force_update: args.force_update,
-            pub_date: None,
+            pub_date: Some(entry.pub_date.clone()),
             notes: args.notes.clone(),
             packages: HashMap::new(),
             channels: HashMap::new(),
@@ -355,4 +514,154 @@ fn save_manifest_file(manifest_path: &Path, manifest: &Manifest) -> Result<()> {
     fs::write(manifest_path, json_output)
         .with_context(|| format!("写入 Manifest 文件失败: {}", manifest_path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_timestamp_rfc3339_unix_epoch() {
+        assert_eq!(format_timestamp_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_timestamp_rfc3339(1767225600), "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_current_utc_rfc3339_format() {
+        let ts = current_utc_rfc3339();
+        assert_eq!(ts.len(), 20);
+        assert!(ts.ends_with('Z'));
+        assert!(ts.contains('T'));
+    }
+
+    #[test]
+    fn test_compute_payload_integrity_streaming() -> Result<()> {
+        let temp_file = std::env::temp_dir().join(format!(
+            "test_shipup_cli_integrity_{}.bin",
+            std::process::id()
+        ));
+        let content = b"Shipup streaming sha256 test content repeated block";
+        fs::write(&temp_file, content)?;
+
+        let (checksum, signature) = compute_payload_integrity(&temp_file, None)?;
+        let _ = fs::remove_file(&temp_file);
+
+        assert!(signature.is_none());
+        assert!(checksum.starts_with("sha256:"));
+
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        let hash = hasher.finalize();
+        let mut expected_hex = String::new();
+        for b in hash {
+            use std::fmt::Write;
+            let _ = write!(expected_hex, "{b:02x}");
+        }
+        assert_eq!(checksum, format!("sha256:{expected_hex}"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_manifest_entries_semver_guard() {
+        let mut manifest = Manifest {
+            version: Version::parse("1.2.0").unwrap(),
+            min_supported_version: None,
+            force_update: false,
+            pub_date: Some("2026-09-01T00:00:00Z".to_string()),
+            notes: Some("版本 1.2.0".to_string()),
+            packages: HashMap::new(),
+            channels: HashMap::new(),
+            signature: Some("old_signature".to_string()),
+        };
+
+        // 1. 尝试合并低版本 1.1.0（例如补发旧平台包）
+        let entry_old = ManifestReleaseEntry {
+            version: Version::parse("1.1.0").unwrap(),
+            min_supported_version: None,
+            pub_date: "2026-08-01T00:00:00Z".to_string(),
+            package_info: PackageInfo {
+                url: "https://example.com/win-1.1.0.exe".to_string(),
+                signature: None,
+                checksum: Some("sha256:abc".to_string()),
+                package_type: PackageType::Binary,
+                install_mode: None,
+                install_args: vec![],
+                executable_path: None,
+                require_elevation: false,
+            },
+        };
+
+        let args_old = ReleaseArgs {
+            version: "1.1.0".to_string(),
+            target: "x86_64-pc-windows-msvc".to_string(),
+            package: PathBuf::from("dummy"),
+            package_type: "binary".to_string(),
+            url: "https://example.com/win-1.1.0.exe".to_string(),
+            key: None,
+            notes: Some("旧版 1.1.0".to_string()),
+            pub_date: None,
+            min_supported_version: None,
+            force_update: false,
+            install_mode: None,
+            install_args: vec![],
+            executable_path: None,
+            channel: None,
+            require_elevation: false,
+            manifest: PathBuf::from("latest.json"),
+        };
+
+        update_manifest_entries(&mut manifest, &args_old, entry_old);
+
+        // 验证：主版本依然保持 1.2.0，notes 依然保持 1.2.0，未被逆向降级！
+        assert_eq!(manifest.version, Version::parse("1.2.0").unwrap());
+        assert_eq!(manifest.notes.as_deref(), Some("版本 1.2.0"));
+        assert!(manifest.packages.contains_key("x86_64-pc-windows-msvc"));
+        assert_eq!(manifest.signature, None); // 签名已被安全失效重置
+
+        // 2. 合并更高版本 1.3.0
+        let entry_new = ManifestReleaseEntry {
+            version: Version::parse("1.3.0").unwrap(),
+            min_supported_version: None,
+            pub_date: "2026-10-01T00:00:00Z".to_string(),
+            package_info: PackageInfo {
+                url: "https://example.com/mac-1.3.0.tar.gz".to_string(),
+                signature: None,
+                checksum: Some("sha256:def".to_string()),
+                package_type: PackageType::Archive,
+                install_mode: None,
+                install_args: vec![],
+                executable_path: None,
+                require_elevation: false,
+            },
+        };
+
+        let args_new = ReleaseArgs {
+            version: "1.3.0".to_string(),
+            target: "aarch64-apple-darwin".to_string(),
+            package: PathBuf::from("dummy"),
+            package_type: "archive".to_string(),
+            url: "https://example.com/mac-1.3.0.tar.gz".to_string(),
+            key: None,
+            notes: Some("全新 1.3.0".to_string()),
+            pub_date: Some("2026-10-01T00:00:00Z".to_string()),
+            min_supported_version: None,
+            force_update: true,
+            install_mode: None,
+            install_args: vec![],
+            executable_path: None,
+            channel: None,
+            require_elevation: false,
+            manifest: PathBuf::from("latest.json"),
+        };
+
+        update_manifest_entries(&mut manifest, &args_new, entry_new);
+
+        // 验证：升级为主版本 1.3.0
+        assert_eq!(manifest.version, Version::parse("1.3.0").unwrap());
+        assert_eq!(manifest.notes.as_deref(), Some("全新 1.3.0"));
+        assert_eq!(manifest.pub_date.as_deref(), Some("2026-10-01T00:00:00Z"));
+        assert!(manifest.force_update);
+        assert!(manifest.packages.contains_key("x86_64-pc-windows-msvc"));
+        assert!(manifest.packages.contains_key("aarch64-apple-darwin"));
+    }
 }
