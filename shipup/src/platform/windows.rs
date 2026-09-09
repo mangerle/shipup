@@ -157,12 +157,111 @@ pub(crate) fn build_windows_installer_args(
     (program, args)
 }
 
+#[cfg(windows)]
+mod ffi {
+    use std::ffi::c_void;
+
+    pub const SW_SHOWNORMAL: i32 = 1;
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        pub fn ShellExecuteW(
+            hwnd: *mut c_void,
+            lpOperation: *const u16,
+            lpFile: *const u16,
+            lpParameters: *const u16,
+            lpDirectory: *const u16,
+            nShowCmd: i32,
+        ) -> *mut c_void;
+    }
+}
+
+/// 将字符串安全转换为以空字符（0u16）结尾的 UTF-16 宽字符序列
+fn to_wide_null(s: &str) -> Vec<u16> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    OsStr::new(s).encode_wide().chain(Some(0)).collect()
+}
+
+/// 格式化 Windows 命令行参数列表，针对包含空格或引号的参数执行标准转义包裹
+pub(crate) fn escape_windows_args(args: &[String]) -> String {
+    let mut out = String::new();
+    for (i, arg) in args.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if arg.is_empty() {
+            out.push_str("\"\"");
+        } else if arg.contains(' ') || arg.contains('\t') || arg.contains('"') {
+            out.push('"');
+            for c in arg.chars() {
+                if c == '"' {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out.push('"');
+        } else {
+            out.push_str(arg);
+        }
+    }
+    out
+}
+
+/// 通过 Windows 原生 ShellExecuteW 以 UAC 管理员提权拉起外部安装器
+fn spawn_elevated_installer(program: &str, args: &[String], installer_path: &Path) -> Result<()> {
+    log::info!("正在通过 Windows 原生 ShellExecuteW 以 UAC runas 提权拉起外部安装器");
+    let op_wide = to_wide_null("runas");
+    let program_wide = to_wide_null(program);
+
+    let params_str = escape_windows_args(args);
+    let params_wide = if params_str.is_empty() {
+        None
+    } else {
+        Some(to_wide_null(&params_str))
+    };
+
+    let dir_str = installer_path
+        .parent()
+        .and_then(|p| p.to_str())
+        .unwrap_or("");
+    let dir_wide = if dir_str.is_empty() {
+        None
+    } else {
+        Some(to_wide_null(dir_str))
+    };
+
+    let h_instance = unsafe {
+        ffi::ShellExecuteW(
+            std::ptr::null_mut(),
+            op_wide.as_ptr(),
+            program_wide.as_ptr(),
+            params_wide
+                .as_ref()
+                .map_or(std::ptr::null(), |p| p.as_ptr()),
+            dir_wide.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
+            ffi::SW_SHOWNORMAL,
+        )
+    };
+
+    let ret_code = h_instance as usize;
+    if ret_code <= 32 {
+        let last_err = std::io::Error::last_os_error();
+        return Err(UpdateError::InstallerSpawn(format!(
+            "以管理员提权拉起安装器失败，ShellExecuteW 错误码: {}，系统原因: {}",
+            ret_code, last_err
+        )));
+    }
+
+    Ok(())
+}
+
 /// 派生拉起外部安装器，并使子进程脱离当前进程树
 ///
 /// # 设计原理
 /// - **实现初衷**：注入 DETACHED_PROCESS 与 CREATE_NEW_PROCESS_GROUP 标志，切断父子进程控制台句柄继承。
-/// - **核心优势**：主程序在后续 `process::exit(0)` 退出后，安装器子进程能够顺畅运行并拥有完整文件重写能力。
-///   当 `options.require_elevation` 为 true 时，通过 PowerShell 触发 UAC 凭据对话框以 Administrator 提权执行。
+/// - **核心优势**：主程序退出后安装器可顺畅完成文件重写；当需要提权时，改用 Windows 原生 `ShellExecuteW("runas")`，
+///   消除 PowerShell 进程与 CLR 运行时的冷启动开销，摆脱执行策略限制，并支持精准捕获系统级 UAC 错误码。
 /// - **代价与局限**：Windows 安装器一旦派生，主程序无法持续监控其退出码，依赖安装器自闭环。
 ///
 /// # Errors
@@ -178,22 +277,7 @@ pub fn spawn_installer(installer_path: &Path, options: &InstallerOptions<'_>) ->
     let (program, args) = build_windows_installer_args(installer_path, options);
 
     if options.require_elevation {
-        log::info!("正在通过 PowerShell 以 UAC 管理员提权拉起安装器");
-        let arg_list = args.join(" ");
-        let mut ps_cmd = Command::new("powershell");
-        ps_cmd
-            .arg("-NoProfile")
-            .arg("-NonInteractive")
-            .arg("-Command")
-            .arg(format!(
-                "Start-Process -FilePath '{}' -ArgumentList '{}' -Verb RunAs",
-                program, arg_list
-            ));
-        ps_cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-        ps_cmd.spawn().map_err(|e| {
-            UpdateError::InstallerSpawn(format!("以管理员提权拉起安装器失败: {}", e))
-        })?;
-        return Ok(());
+        return spawn_elevated_installer(&program, &args, installer_path);
     }
 
     let mut cmd = Command::new(&program);
@@ -305,5 +389,29 @@ mod tests {
         let (prog, args) = build_windows_installer_args(path, &opt_passive);
         assert_eq!(prog, "C:\\temp\\setup.exe");
         assert_eq!(args, vec!["/passive", "/D=C:\\MyApp"]);
+    }
+
+    #[test]
+    fn test_escape_windows_args_handles_spaces_and_quotes() {
+        let args = vec![
+            "/S".to_string(),
+            "/D=C:\\Program Files\\My App".to_string(),
+            "plain".to_string(),
+            "".to_string(),
+            "key=\"val\"".to_string(),
+        ];
+        let escaped = escape_windows_args(&args);
+        assert_eq!(
+            escaped,
+            r#"/S "/D=C:\Program Files\My App" plain "" "key=\"val\"""#
+        );
+    }
+
+    #[test]
+    fn test_to_wide_null_encoding() {
+        let wide = to_wide_null("runas");
+        assert_eq!(wide.len(), 6);
+        assert_eq!(wide[5], 0u16);
+        assert_eq!(wide[0], 'r' as u16);
     }
 }
