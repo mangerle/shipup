@@ -2,7 +2,14 @@
 
 use crate::error::{Result, UpdateError};
 use std::fs::{self, File};
-use std::io::{self, Read};
+#[cfg(any(
+    feature = "archive-zip",
+    feature = "archive-tar",
+    feature = "archive-tar-zst",
+    feature = "archive-tar-xz"
+))]
+use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[cfg(any(
