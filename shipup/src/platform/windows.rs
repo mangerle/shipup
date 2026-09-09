@@ -414,4 +414,49 @@ mod tests {
         assert_eq!(wide[5], 0u16);
         assert_eq!(wide[0], 'r' as u16);
     }
+
+    #[test]
+    fn test_get_same_volume_temp_path() {
+        let temp_path = get_same_volume_temp_path().unwrap();
+        let file_name = temp_path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            file_name.ends_with(TEMP_SUFFIX),
+            "同卷临时文件必须以后缀 {} 结尾",
+            TEMP_SUFFIX
+        );
+        let parent = temp_path.parent().unwrap();
+        assert!(parent.exists(), "同卷临时文件父目录必须真实存在");
+    }
+
+    #[test]
+    fn test_build_windows_installer_args_msi_modes() {
+        let path = Path::new("C:\\temp\\installer.msi");
+        let empty_args: [String; 0] = [];
+
+        // 默认模式（无模式指定时缺省为 /passive）
+        let opt_default = InstallerOptions {
+            user_args: &empty_args,
+            install_mode: None,
+            require_elevation: false,
+        };
+        let (prog, args) = build_windows_installer_args(path, &opt_default);
+        assert_eq!(prog, "msiexec");
+        assert_eq!(
+            args,
+            vec!["/i", "C:\\temp\\installer.msi", "/passive", "/norestart"]
+        );
+
+        // Quiet 模式
+        let opt_quiet = InstallerOptions {
+            user_args: &empty_args,
+            install_mode: Some(InstallMode::Quiet),
+            require_elevation: false,
+        };
+        let (prog, args) = build_windows_installer_args(path, &opt_quiet);
+        assert_eq!(prog, "msiexec");
+        assert_eq!(
+            args,
+            vec!["/i", "C:\\temp\\installer.msi", "/qn", "/norestart"]
+        );
+    }
 }

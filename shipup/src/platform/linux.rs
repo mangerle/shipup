@@ -199,4 +199,38 @@ mod tests {
         let args_normal: Vec<&std::ffi::OsStr> = cmd_normal.get_args().collect();
         assert!(args_normal.is_empty());
     }
+
+    #[test]
+    fn test_build_linux_installer_command_generic_script() {
+        let script_path = Path::new("/tmp/install.sh");
+        let cmd = build_linux_installer_command(script_path, &["--prefix=/opt".to_string()], true);
+        assert_eq!(cmd.get_program(), "pkexec");
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args[0], script_path.as_os_str());
+        assert_eq!(args[1], "--prefix=/opt");
+    }
+
+    #[test]
+    fn test_linux_get_same_volume_temp_path() {
+        let temp_path = get_same_volume_temp_path().unwrap();
+        let file_name = temp_path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            file_name.ends_with(TEMP_SUFFIX),
+            "Linux 同卷临时文件必须以 TEMP_SUFFIX 结尾"
+        );
+    }
+
+    #[test]
+    fn test_linux_ensure_executable() {
+        let temp_file = env::temp_dir().join("shipup_test_exec_perm.bin");
+        fs::write(&temp_file, b"#!/bin/sh\necho ok").unwrap();
+
+        ensure_executable(&temp_file).unwrap();
+
+        let meta = fs::metadata(&temp_file).unwrap();
+        let mode = meta.permissions().mode();
+        assert_eq!(mode & 0o755, 0o755, "执行权限必须包含 0o755 掩码位");
+
+        let _ = fs::remove_file(&temp_file);
+    }
 }

@@ -239,4 +239,23 @@ mod tests {
         let cmd = build_macos_installer_command(dmg_path, &["-W".to_string()], false);
         assert_eq!(cmd.get_program(), "open");
     }
+
+    #[test]
+    fn test_build_macos_installer_command_generic_binary() {
+        let bin_path = Path::new("/Applications/MyApp.app/Contents/MacOS/updater");
+        let cmd = build_macos_installer_command(bin_path, &["--flag".to_string()], false);
+        assert_eq!(cmd.get_program(), bin_path.as_os_str());
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args[0], "--flag");
+    }
+
+    #[test]
+    fn test_macos_get_same_volume_temp_path() {
+        let temp_path = get_same_volume_temp_path().unwrap();
+        let file_name = temp_path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            file_name.ends_with(TEMP_SUFFIX),
+            "macOS 同卷临时文件必须以 TEMP_SUFFIX 结尾"
+        );
+    }
 }
