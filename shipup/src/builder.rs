@@ -5,6 +5,7 @@ use crate::manifest::current_target_triple;
 use crate::updater::Updater;
 use semver::Version;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,6 +50,8 @@ pub struct UpdaterConfig {
     pub require_signature: bool,
     /// 自定义版本比较器闭包（若未设置则按 SemVer 大于判断）
     pub version_comparator: Option<VersionComparator>,
+    /// 用户更新偏好持久化文件路径（若为 None 则使用默认同级目录）
+    pub preference_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for UpdaterConfig {
@@ -76,6 +79,7 @@ impl std::fmt::Debug for UpdaterConfig {
                 "has_custom_version_comparator",
                 &self.version_comparator.is_some(),
             )
+            .field("preference_path", &self.preference_path)
             .finish()
     }
 }
@@ -116,6 +120,7 @@ pub struct UpdaterBuilder {
     pub(crate) dangerous_insecure_transport_protocol: bool,
     pub(crate) require_signature: bool,
     pub(crate) version_comparator: Option<VersionComparator>,
+    pub(crate) preference_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for UpdaterBuilder {
@@ -143,6 +148,7 @@ impl std::fmt::Debug for UpdaterBuilder {
                 "has_custom_version_comparator",
                 &self.version_comparator.is_some(),
             )
+            .field("preference_path", &self.preference_path)
             .finish()
     }
 }
@@ -166,6 +172,7 @@ impl Default for UpdaterBuilder {
             dangerous_insecure_transport_protocol: false,
             require_signature: !cfg!(debug_assertions),
             version_comparator: None,
+            preference_path: None,
         }
     }
 }
@@ -317,6 +324,15 @@ impl UpdaterBuilder {
         self
     }
 
+    /// 设置用户更新偏好持久化文件路径（若不指定则默认存储在可执行文件同级目录）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：支持调用端将跳过版本与稍后提醒记录存储于自定义数据目录或沙箱数据卷。
+    pub fn preference_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.preference_path = Some(path.into());
+        self
+    }
+
     /// 构建 Updater 实例
     ///
     /// # Errors
@@ -361,6 +377,7 @@ impl UpdaterBuilder {
             dangerous_insecure_transport_protocol: self.dangerous_insecure_transport_protocol,
             require_signature: self.require_signature,
             version_comparator: self.version_comparator,
+            preference_path: self.preference_path,
         };
 
         Ok(Updater::new(config))

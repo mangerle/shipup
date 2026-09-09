@@ -11,6 +11,7 @@ use crate::manifest::{Manifest, PackageType, ResolveOptions, ResolvedRelease};
 use crate::platform::{
     InstallerOptions, cleanup_old_backups, get_temp_download_path, replace_binary, spawn_installer,
 };
+use crate::preference::{self, UpdatePreference};
 use crate::restart::{RestartContext, restart_with};
 use crate::signature::{verify_ed25519_file_any_key, verify_sha256_file};
 use crate::template::{TemplateContext, resolve_url_template};
@@ -18,9 +19,9 @@ use semver::Version;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(any(feature = "blocking", feature = "async"))]
@@ -55,6 +56,8 @@ struct UpdaterInner {
     allow_downgrade: bool,
     config: Arc<NetworkSecurityConfig>,
     version_comparator: Option<VersionComparator>,
+    preference: Mutex<UpdatePreference>,
+    preference_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for UpdaterInner {
@@ -70,6 +73,7 @@ impl std::fmt::Debug for UpdaterInner {
                 "has_custom_version_comparator",
                 &self.version_comparator.is_some(),
             )
+            .field("preference_path", &self.preference_path)
             .finish()
     }
 }
@@ -88,6 +92,71 @@ impl Updater {
     /// 获取配置的更新检查端点列表切片
     pub fn endpoints(&self) -> &[String] {
         &self.inner.endpoints
+    }
+
+    /// 标记跳过特定版本升级提醒并持久化
+    pub fn skip_version(&self, version: Version) -> Result<()> {
+        let mut pref = self
+            .inner
+            .preference
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pref.skip_version(version);
+        if let Some(ref path) = self.inner.preference_path {
+            pref.save_to_file(path)?;
+        }
+        Ok(())
+    }
+
+    /// 撤销对特定版本的跳过标记并持久化
+    pub fn unskip_version(&self, version: &Version) -> Result<()> {
+        let mut pref = self
+            .inner
+            .preference
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pref.unskip_version(version);
+        if let Some(ref path) = self.inner.preference_path {
+            pref.save_to_file(path)?;
+        }
+        Ok(())
+    }
+
+    /// 设置稍后提醒（在指定时间内静默忽略非强制更新提醒）并持久化
+    pub fn snooze(&self, duration: Duration) -> Result<()> {
+        let mut pref = self
+            .inner
+            .preference
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pref.snooze(duration);
+        if let Some(ref path) = self.inner.preference_path {
+            pref.save_to_file(path)?;
+        }
+        Ok(())
+    }
+
+    /// 清空所有用户偏好（跳过版本与稍后提醒）并持久化
+    pub fn clear_preferences(&self) -> Result<()> {
+        let mut pref = self
+            .inner
+            .preference
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pref.clear();
+        if let Some(ref path) = self.inner.preference_path {
+            pref.save_to_file(path)?;
+        }
+        Ok(())
+    }
+
+    /// 获取当前用户偏好配置的只读快照副本
+    pub fn preferences(&self) -> UpdatePreference {
+        self.inner
+            .preference
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub(crate) fn new(config: UpdaterConfig) -> Self {
@@ -118,6 +187,15 @@ impl Updater {
             cleanup_old_backups();
         }
 
+        let preference_path = config
+            .preference_path
+            .or_else(preference::default_preference_file_path);
+        let preference = if let Some(ref path) = preference_path {
+            UpdatePreference::load_from_file(path)
+        } else {
+            UpdatePreference::default()
+        };
+
         Self {
             inner: Arc::new(UpdaterInner {
                 current_version: config.current_version,
@@ -138,6 +216,8 @@ impl Updater {
                     require_signature: config.require_signature,
                 }),
                 version_comparator: config.version_comparator,
+                preference: Mutex::new(preference),
+                preference_path,
             }),
         }
     }
@@ -281,6 +361,28 @@ impl Updater {
                 self.inner.current_version
             );
             return Ok(None);
+        }
+
+        // 检查用户更新偏好设置（强制更新不受跳过与稍后提醒限制）
+        if !release.is_mandatory {
+            let pref = self
+                .inner
+                .preference
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            if pref.is_snoozed() {
+                log::info!(
+                    "当前处于稍后提醒静默期内，忽略本次更新提醒（版本: {}）",
+                    release.version
+                );
+                return Ok(None);
+            }
+
+            if pref.is_skipped(&release.version) {
+                log::info!("用户已设置跳过版本 {}，忽略本次更新提醒", release.version);
+                return Ok(None);
+            }
         }
 
         log::info!("发现可用更新版本: {}", release.version);
@@ -810,5 +912,71 @@ mod tests {
             .unwrap();
         let res2 = updater_major_only.evaluate_manifest(manifest_json).unwrap();
         assert!(res2.is_none());
+    }
+
+    #[test]
+    fn test_preference_skip_and_snooze_filtering() {
+        let manifest_json = r#"{
+            "version": "1.0.1",
+            "packages": {
+                "x86_64-pc-windows-msvc": {
+                    "url": "https://example.com/app-1.0.1.zip",
+                    "package_type": "archive",
+                    "checksum": "sha256:abc"
+                }
+            }
+        }"#;
+
+        let mandatory_manifest_json = r#"{
+            "version": "1.0.1",
+            "force_update": true,
+            "packages": {
+                "x86_64-pc-windows-msvc": {
+                    "url": "https://example.com/app-1.0.1.zip",
+                    "package_type": "archive",
+                    "checksum": "sha256:abc"
+                }
+            }
+        }"#;
+
+        let updater = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .target("x86_64-pc-windows-msvc")
+            .manifest_url("https://example.com/manifest.json")
+            .require_signature(false)
+            .build()
+            .unwrap();
+
+        // 1. 初始未设置偏好，可正常发现更新
+        assert!(updater.evaluate_manifest(manifest_json).unwrap().is_some());
+
+        // 2. 标记跳过 1.0.1 版本后，常规更新被过滤忽略
+        updater
+            .skip_version(Version::parse("1.0.1").unwrap())
+            .unwrap();
+        assert!(updater.evaluate_manifest(manifest_json).unwrap().is_none());
+
+        // 3. 强制更新 (force_update: true) 即使被跳过也必须不受限放行
+        assert!(
+            updater
+                .evaluate_manifest(mandatory_manifest_json)
+                .unwrap()
+                .is_some()
+        );
+
+        // 4. 撤销跳过标记之后，常规更新恢复
+        updater
+            .unskip_version(&Version::parse("1.0.1").unwrap())
+            .unwrap();
+        assert!(updater.evaluate_manifest(manifest_json).unwrap().is_some());
+
+        // 5. 设置稍后提醒（3600秒），在静默期内常规更新被过滤
+        updater.snooze(Duration::from_secs(3600)).unwrap();
+        assert!(updater.evaluate_manifest(manifest_json).unwrap().is_none());
+
+        // 6. 清空偏好后，更新再次恢复
+        updater.clear_preferences().unwrap();
+        assert!(updater.evaluate_manifest(manifest_json).unwrap().is_some());
     }
 }

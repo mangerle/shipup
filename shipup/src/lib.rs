@@ -20,6 +20,7 @@ pub mod event;
 pub mod manifest;
 pub(crate) mod platform;
 pub(crate) mod poller;
+pub mod preference;
 pub(crate) mod recovery;
 pub(crate) mod restart;
 pub mod signature;
@@ -39,6 +40,7 @@ pub use platform::{
     spawn_installer,
 };
 pub use poller::{AutoPollEvent, AutoPollOptions, AutoPollerHandle};
+pub use preference::UpdatePreference;
 pub use recovery::{
     HealthCheckStatus, check_and_recover_current, check_and_recover_once, confirm_update_success,
     confirm_update_success_in_dir,
