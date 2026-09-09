@@ -3,7 +3,7 @@
 // shipup 跨平台自更新系统 - Updater 与 Update 核心交互实体
 
 use crate::archive::{extract_archive, sync_extracted_payload};
-use crate::builder::{UpdaterBuilder, UpdaterConfig, VersionComparator};
+use crate::builder::{UpdaterBuilder, UpdaterConfig, VersionComparator, is_insecure_http_url};
 use crate::download::{self, DownloadOptions};
 use crate::error::{Result, UpdateError};
 use crate::event::UpdateEvent;
@@ -551,7 +551,7 @@ impl Update {
         F: FnMut(UpdateEvent),
     {
         if !self.config.dangerous_insecure_transport_protocol
-            && self.release.package.url.starts_with("http://")
+            && is_insecure_http_url(&self.release.package.url)
         {
             return Err(UpdateError::InsecureTransportProtocol(
                 self.release.package.url.clone(),
@@ -642,7 +642,7 @@ impl Update {
         F: FnMut(UpdateEvent) + Send,
     {
         if !self.config.dangerous_insecure_transport_protocol
-            && self.release.package.url.starts_with("http://")
+            && is_insecure_http_url(&self.release.package.url)
         {
             return Err(UpdateError::InsecureTransportProtocol(
                 self.release.package.url.clone(),

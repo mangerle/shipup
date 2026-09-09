@@ -389,7 +389,7 @@ impl UpdaterBuilder {
 
         if !self.dangerous_insecure_transport_protocol {
             for ep in &self.endpoints {
-                if ep.starts_with("http://") {
+                if is_insecure_http_url(ep) {
                     return Err(UpdateError::InsecureTransportProtocol(ep.clone()));
                 }
             }
@@ -420,6 +420,20 @@ impl UpdaterBuilder {
         };
 
         Ok(Updater::new(config))
+    }
+}
+
+/// 检查指定 URL 是否为不安全的明文 HTTP 协议传输（忽略协议 Scheme 大小写）
+///
+/// # 设计原理
+/// - **实现初衷**：根据 RFC 3986 规范，URL Scheme 大小写不敏感。防范利用大写 `HTTP://` 或混合大小写绕过明文拦截。
+/// - **核心优势**：在栈上提取前 7 字节执行 ASCII 大小写无关比对，零堆内存分配。
+pub(crate) fn is_insecure_http_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.len() >= 7 {
+        trimmed[..7].eq_ignore_ascii_case("http://")
+    } else {
+        false
     }
 }
 
@@ -503,6 +517,17 @@ mod tests {
             .build();
         assert!(matches!(
             insecure_err,
+            Err(UpdateError::InsecureTransportProtocol(_))
+        ));
+
+        // 验证大写 HTTP:// 协议头亦被严格拦截拒绝，防止大小写绕过
+        let upper_err = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .manifest_url("HTTP://insecure.example.com/manifest.json")
+            .build();
+        assert!(matches!(
+            upper_err,
             Err(UpdateError::InsecureTransportProtocol(_))
         ));
 
