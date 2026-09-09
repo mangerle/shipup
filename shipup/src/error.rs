@@ -1,7 +1,5 @@
 // shipup 跨平台自更新系统 - 统一强类型中文错误定义
 
-use base64::DecodeError;
-use semver::Error as SemverError;
 use std::io;
 use thiserror::Error;
 
@@ -77,15 +75,27 @@ pub enum UpdateError {
 
     /// SemVer 版本号格式错误
     #[error("版本号格式解析错误: {0}")]
-    SemVer(#[from] SemverError),
+    SemVer(String),
 
     /// Base64 编码解析错误
     #[error("Base64 解码错误: {0}")]
-    Base64(#[from] DecodeError),
+    Base64(String),
 
     /// 底层 IO 错误
     #[error("输入输出错误: {0}")]
     Io(#[from] io::Error),
+}
+
+impl From<semver::Error> for UpdateError {
+    fn from(err: semver::Error) -> Self {
+        UpdateError::SemVer(err.to_string())
+    }
+}
+
+impl From<base64::DecodeError> for UpdateError {
+    fn from(err: base64::DecodeError) -> Self {
+        UpdateError::Base64(err.to_string())
+    }
 }
 
 /// 统一更新结果类型别名

@@ -63,9 +63,7 @@ pub fn verify_sha256(data: &[u8], expected_checksum: &str) -> Result<()> {
 /// - 当公钥/签名长度不合法或数字签名验证未通过时返回 [`UpdateError::InvalidSignature`]。
 pub fn verify_ed25519(data: &[u8], base64_signature: &str, base64_public_key: &str) -> Result<()> {
     // 1. 解码并解析 32 字节公钥
-    let pub_key_bytes = BASE64
-        .decode(base64_public_key.trim())
-        .map_err(UpdateError::Base64)?;
+    let pub_key_bytes = BASE64.decode(base64_public_key.trim())?;
 
     let pub_key_array: [u8; 32] = pub_key_bytes
         .as_slice()
@@ -76,9 +74,7 @@ pub fn verify_ed25519(data: &[u8], base64_signature: &str, base64_public_key: &s
         VerifyingKey::from_bytes(&pub_key_array).map_err(|_| UpdateError::InvalidSignature)?;
 
     // 2. 解码并解析 64 字节签名
-    let sig_bytes = BASE64
-        .decode(base64_signature.trim())
-        .map_err(UpdateError::Base64)?;
+    let sig_bytes = BASE64.decode(base64_signature.trim())?;
 
     let sig_array: [u8; 64] = sig_bytes
         .as_slice()
