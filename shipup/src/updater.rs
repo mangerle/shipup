@@ -114,6 +114,16 @@ impl Updater {
         self.inner.fallback_manifest.as_ref()
     }
 
+    /// 获取当前客户端设备稳定唯一标识符（字符串副本）
+    pub fn client_id(&self) -> String {
+        let pref = self
+            .inner
+            .preference
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pref.client_id().unwrap_or_default().to_string()
+    }
+
     /// 标记跳过特定版本升级提醒并持久化到磁盘
     ///
     /// # 设计原理
@@ -236,11 +246,21 @@ impl Updater {
         let preference_path = config
             .preference_path
             .or_else(preference::default_preference_file_path);
-        let preference = if let Some(ref path) = preference_path {
+        let mut preference = if let Some(ref path) = preference_path {
             UpdatePreference::load_from_file(path)
         } else {
             UpdatePreference::default()
         };
+
+        if let Some(custom_id) = config.client_id {
+            preference.set_client_id(custom_id);
+        } else {
+            let _ = preference.get_or_create_client_id();
+        }
+
+        if let Some(ref path) = preference_path {
+            let _ = preference.save_to_file(path);
+        }
 
         Self {
             inner: Arc::new(UpdaterInner {
@@ -482,6 +502,34 @@ impl Updater {
                 log::info!("用户已设置跳过版本 {}，忽略本次更新提醒", release.version);
                 return Ok(None);
             }
+        }
+
+        // 灰度放量拦截：若配置了 rollout_percentage（0..=100）且非强制更新，进行客户端稳定哈希分桶评估
+        if !release.is_mandatory
+            && let Some(percentage) = release.rollout_percentage
+        {
+            let pref = self
+                .inner
+                .preference
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let client_id = pref.client_id().unwrap_or_default();
+            let bucket = compute_rollout_bucket(client_id, &release.version);
+            if bucket >= percentage {
+                log::info!(
+                    "新版本 {} 处于灰度放量中（灰度比例: {}%，客户端分桶: {}），未命中灰度，暂不提示更新",
+                    release.version,
+                    percentage,
+                    bucket
+                );
+                return Ok(None);
+            }
+            log::info!(
+                "新版本 {} 处于灰度放量中（灰度比例: {}%，客户端分桶: {}），已命中灰度放量",
+                release.version,
+                percentage,
+                bucket
+            );
         }
 
         log::info!("发现可用更新版本: {}", release.version);
@@ -1204,6 +1252,22 @@ async fn fetch_manifest_async(client: &reqwest::Client, endpoint: &str) -> Resul
         .map_err(|e| UpdateError::Network(format!("异步读取端点 '{}' 响应失败: {}", endpoint, e)))
 }
 
+/// 计算客户端设备针对特定发布版本的灰度分桶哈希值（范围 0..=99）
+///
+/// # 设计原理
+/// - **实现初衷**：确保同一台客户端对相同版本评估时分桶保持恒定，且不同发布版本间分桶呈雪崩离散均匀分布。
+/// - **核心优势**：采用 SHA-256 计算 `client_id:version` 哈希值并对 100 取模，杜绝伪随机数重置或分桶漂移。
+pub(crate) fn compute_rollout_bucket(client_id: &str, version: &Version) -> u8 {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(client_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(version.to_string().as_bytes());
+    let digest = hasher.finalize();
+    let sample = u16::from_be_bytes([digest[0], digest[1]]);
+    (sample % 100) as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1333,6 +1397,7 @@ mod tests {
                 require_elevation: false,
                 size: None,
             },
+            rollout_percentage: None,
         };
 
         let temp_path = PathBuf::from("C:\\temp\\app.exe.shipup.tmp");
@@ -1421,5 +1486,112 @@ mod tests {
         assert_eq!(update.unwrap().version(), &Version::parse("2.1.0").unwrap());
 
         let _ = fs::remove_file(&manifest_file);
+    }
+
+    #[test]
+    fn test_compute_rollout_bucket_bounds_and_determinism() {
+        let v = Version::parse("1.2.0").unwrap();
+        // 确定性：相同 client_id 与 version 结果必须恒定一致
+        let bucket1 = compute_rollout_bucket("client-node-01", &v);
+        let bucket2 = compute_rollout_bucket("client-node-01", &v);
+        assert_eq!(bucket1, bucket2);
+        assert!(bucket1 < 100);
+
+        // 离散性：不同 client_id 落在合理区间
+        for i in 0..50 {
+            let b = compute_rollout_bucket(&format!("device-{i}"), &v);
+            assert!(b < 100);
+        }
+    }
+
+    #[test]
+    fn test_rollout_percentage_filtering() {
+        let v2 = Version::parse("2.0.0").unwrap();
+        let test_client_id = "test-rollout-device";
+        let bucket = compute_rollout_bucket(test_client_id, &v2);
+
+        // 1. 若 rollout_percentage <= bucket，未命中灰度，evaluate 应当返回 None
+        let low_manifest_json = format!(
+            r#"{{
+                "version": "2.0.0",
+                "rollout_percentage": {percentage},
+                "packages": {{
+                    "x86_64-pc-windows-msvc": {{
+                        "url": "https://example.com/app-2.0.0.zip",
+                        "package_type": "archive"
+                    }}
+                }}
+            }}"#,
+            percentage = bucket
+        );
+
+        let updater_blocked = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .target("x86_64-pc-windows-msvc")
+            .client_id(test_client_id)
+            .manifest_url("https://example.com/manifest.json")
+            .build()
+            .unwrap();
+
+        assert!(
+            updater_blocked
+                .evaluate_manifest(&low_manifest_json)
+                .unwrap()
+                .is_none()
+        );
+
+        // 2. 若 rollout_percentage > bucket，命中灰度，evaluate 返回更新
+        let high_manifest_json = format!(
+            r#"{{
+                "version": "2.0.0",
+                "rollout_percentage": {percentage},
+                "packages": {{
+                    "x86_64-pc-windows-msvc": {{
+                        "url": "https://example.com/app-2.0.0.zip",
+                        "package_type": "archive"
+                    }}
+                }}
+            }}"#,
+            percentage = bucket.saturating_add(1)
+        );
+
+        let updater_allowed = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .target("x86_64-pc-windows-msvc")
+            .client_id(test_client_id)
+            .manifest_url("https://example.com/manifest.json")
+            .build()
+            .unwrap();
+
+        assert!(
+            updater_allowed
+                .evaluate_manifest(&high_manifest_json)
+                .unwrap()
+                .is_some()
+        );
+
+        // 3. 若 force_update = true，即使未命中灰度比例也必须放行
+        let mandatory_manifest_json = format!(
+            r#"{{
+                "version": "2.0.0",
+                "force_update": true,
+                "rollout_percentage": {percentage},
+                "packages": {{
+                    "x86_64-pc-windows-msvc": {{
+                        "url": "https://example.com/app-2.0.0.zip",
+                        "package_type": "archive"
+                    }}
+                }}
+            }}"#,
+            percentage = 0
+        );
+        assert!(
+            updater_blocked
+                .evaluate_manifest(&mandatory_manifest_json)
+                .unwrap()
+                .is_some()
+        );
     }
 }

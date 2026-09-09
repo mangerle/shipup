@@ -103,6 +103,10 @@ struct ReleaseArgs {
     #[arg(long, default_value_t = false)]
     require_elevation: bool,
 
+    /// 灰度放量比例（0..=100，若不指定则全量发布）
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
+    rollout_percentage: Option<u8>,
+
     /// Manifest JSON 输出或合并文件路径
     #[arg(short, long, default_value = "latest.json")]
     manifest: PathBuf,
@@ -324,6 +328,7 @@ fn update_manifest_entries(
                 pub_date: Some(entry.pub_date.clone()),
                 notes: args.notes.clone(),
                 packages: HashMap::new(),
+                rollout_percentage: args.rollout_percentage,
             });
 
         if entry.version > ch_entry.version {
@@ -338,6 +343,9 @@ fn update_manifest_entries(
             if let Some(ref n) = args.notes {
                 ch_entry.notes = Some(n.clone());
             }
+            if args.rollout_percentage.is_some() {
+                ch_entry.rollout_percentage = args.rollout_percentage;
+            }
         } else if entry.version == ch_entry.version {
             if ch_entry.pub_date.is_none() {
                 ch_entry.pub_date = Some(entry.pub_date);
@@ -350,6 +358,9 @@ fn update_manifest_entries(
             }
             if let Some(ref n) = args.notes {
                 ch_entry.notes = Some(n.clone());
+            }
+            if args.rollout_percentage.is_some() {
+                ch_entry.rollout_percentage = args.rollout_percentage;
             }
         } else {
             log::warn!(
@@ -375,6 +386,9 @@ fn update_manifest_entries(
             if let Some(ref n) = args.notes {
                 manifest.notes = Some(n.clone());
             }
+            if args.rollout_percentage.is_some() {
+                manifest.rollout_percentage = args.rollout_percentage;
+            }
         } else if entry.version == manifest.version {
             if manifest.pub_date.is_none() {
                 manifest.pub_date = Some(entry.pub_date);
@@ -387,6 +401,9 @@ fn update_manifest_entries(
             }
             if let Some(ref n) = args.notes {
                 manifest.notes = Some(n.clone());
+            }
+            if args.rollout_percentage.is_some() {
+                manifest.rollout_percentage = args.rollout_percentage;
             }
         } else {
             log::warn!(
@@ -502,6 +519,7 @@ fn load_or_init_manifest(
             packages: HashMap::new(),
             channels: HashMap::new(),
             signature: None,
+            rollout_percentage: args.rollout_percentage,
         })
     }
 }
@@ -577,6 +595,7 @@ mod tests {
             packages: HashMap::new(),
             channels: HashMap::new(),
             signature: Some("old_signature".to_string()),
+            rollout_percentage: None,
         };
 
         // 1. 尝试合并低版本 1.1.0（例如补发旧平台包）
@@ -613,6 +632,7 @@ mod tests {
             executable_path: None,
             channel: None,
             require_elevation: false,
+            rollout_percentage: None,
             manifest: PathBuf::from("latest.json"),
         };
 
@@ -624,7 +644,7 @@ mod tests {
         assert!(manifest.packages.contains_key("x86_64-pc-windows-msvc"));
         assert_eq!(manifest.signature, None); // 签名已被安全失效重置
 
-        // 2. 合并更高版本 1.3.0
+        // 2. 合并更高版本 1.3.0 并附带 30% 灰度放量
         let entry_new = ManifestReleaseEntry {
             version: Version::parse("1.3.0").unwrap(),
             min_supported_version: None,
@@ -658,15 +678,17 @@ mod tests {
             executable_path: None,
             channel: None,
             require_elevation: false,
+            rollout_percentage: Some(30),
             manifest: PathBuf::from("latest.json"),
         };
 
         update_manifest_entries(&mut manifest, &args_new, entry_new);
 
-        // 验证：升级为主版本 1.3.0
+        // 验证：升级为主版本 1.3.0，灰度比例设置为 30%
         assert_eq!(manifest.version, Version::parse("1.3.0").unwrap());
         assert_eq!(manifest.notes.as_deref(), Some("全新 1.3.0"));
         assert_eq!(manifest.pub_date.as_deref(), Some("2026-10-01T00:00:00Z"));
+        assert_eq!(manifest.rollout_percentage, Some(30));
         assert!(manifest.force_update);
         assert!(manifest.packages.contains_key("x86_64-pc-windows-msvc"));
         assert!(manifest.packages.contains_key("aarch64-apple-darwin"));

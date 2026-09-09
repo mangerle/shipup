@@ -59,6 +59,8 @@ pub struct UpdaterConfig {
     pub allow_file_protocol: bool,
     /// 内嵌 Fallback Manifest 离线容灾兜底元数据
     pub fallback_manifest: Option<Manifest>,
+    /// 客户端设备稳定唯一标识（用于灰度放量哈希分桶）
+    pub client_id: Option<String>,
 }
 
 impl std::fmt::Debug for UpdaterConfig {
@@ -131,6 +133,7 @@ pub struct UpdaterBuilder {
     pub(crate) max_bytes_per_sec: Option<u64>,
     pub(crate) allow_file_protocol: bool,
     pub(crate) fallback_manifest: Option<Manifest>,
+    pub(crate) client_id: Option<String>,
 }
 
 impl std::fmt::Debug for UpdaterBuilder {
@@ -162,6 +165,7 @@ impl std::fmt::Debug for UpdaterBuilder {
             .field("max_bytes_per_sec", &self.max_bytes_per_sec)
             .field("allow_file_protocol", &self.allow_file_protocol)
             .field("has_fallback_manifest", &self.fallback_manifest.is_some())
+            .field("client_id", &self.client_id)
             .finish()
     }
 }
@@ -189,6 +193,7 @@ impl Default for UpdaterBuilder {
             max_bytes_per_sec: None,
             allow_file_protocol: false,
             fallback_manifest: None,
+            client_id: None,
         }
     }
 }
@@ -419,6 +424,16 @@ impl UpdaterBuilder {
         Ok(self)
     }
 
+    /// 设置客户端设备稳定唯一标识（用于灰度放量哈希分桶）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：允许调用方将自定义的设备 ID、用户唯一标识或硬件指纹传入更新器。
+    /// - **兜底策略**：若未显式调用此方法设置，更新器将自动从偏好文件读取或生成随机稳定 ID 并持久化。
+    pub fn client_id(mut self, id: impl Into<String>) -> Self {
+        self.client_id = Some(id.into());
+        self
+    }
+
     /// 构建 Updater 实例并完成前置安全门禁与合法性校验
     ///
     /// # 校验内容
@@ -478,6 +493,7 @@ impl UpdaterBuilder {
             max_bytes_per_sec: self.max_bytes_per_sec,
             allow_file_protocol: self.allow_file_protocol,
             fallback_manifest: self.fallback_manifest,
+            client_id: self.client_id,
         };
 
         Ok(Updater::new(config))

@@ -140,6 +140,10 @@ pub struct ChannelInfo {
     /// 针对不同平台的发布包字典
     #[serde(default)]
     pub packages: HashMap<String, PackageInfo>,
+
+    /// 灰度放量比例（0..=100，若未配置则默认全量放行）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_percentage: Option<u8>,
 }
 
 /// Manifest 根数据规范模型
@@ -180,6 +184,10 @@ pub struct Manifest {
     /// Manifest 元数据自身的数字签名（Base64 编码，可选）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+
+    /// 默认主通道灰度放量比例（0..=100，若未配置则默认全量放行）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_percentage: Option<u8>,
 }
 
 /// 解析路由后最终用于执行更新的结构体
@@ -202,6 +210,8 @@ pub struct ResolvedRelease {
     pub notes: Option<String>,
     /// 匹配到的目标平台安装包配置
     pub package: PackageInfo,
+    /// 灰度放量比例（0..=100）
+    pub rollout_percentage: Option<u8>,
 }
 
 /// Manifest 解析与通道路由选项结构体
@@ -288,6 +298,8 @@ impl Manifest {
                     .as_ref()
                     .is_some_and(|min_ver| current_version < min_ver);
 
+            let rollout_percentage = channel_info.rollout_percentage.or(self.rollout_percentage);
+
             return Ok(ResolvedRelease {
                 version: channel_info.version.clone(),
                 min_supported_version: channel_info.min_supported_version.clone(),
@@ -295,6 +307,7 @@ impl Manifest {
                 pub_date: channel_info.pub_date.clone(),
                 notes: channel_info.notes.clone(),
                 package: package.clone(),
+                rollout_percentage,
             });
         }
 
@@ -315,6 +328,7 @@ impl Manifest {
             pub_date: self.pub_date.clone(),
             notes: self.notes.clone(),
             package: package.clone(),
+            rollout_percentage: self.rollout_percentage,
         })
     }
 }
@@ -511,6 +525,7 @@ mod tests {
                 pub_date: None,
                 notes: None,
                 packages: beta_packages,
+                rollout_percentage: None,
             },
         );
 
@@ -523,6 +538,7 @@ mod tests {
             packages,
             channels,
             signature: None,
+            rollout_percentage: None,
         };
 
         let current_ver = Version::parse("1.0.0").unwrap();
@@ -619,6 +635,7 @@ mod tests {
             packages: HashMap::new(),
             channels: HashMap::new(),
             signature: None,
+            rollout_percentage: None,
         };
 
         // 计算规范字节并进行签名

@@ -53,6 +53,7 @@ fn test_manifest_serialization_and_routing() {
             pub_date: None,
             notes: Some("测试 Beta 通道".to_string()),
             packages: beta_packages,
+            rollout_percentage: None,
         },
     );
 
@@ -65,6 +66,7 @@ fn test_manifest_serialization_and_routing() {
         packages,
         channels,
         signature: None,
+        rollout_percentage: None,
     };
 
     // 序列化为 JSON

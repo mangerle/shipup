@@ -22,6 +22,9 @@ pub struct UpdatePreference {
     /// 稍后提醒截止时间戳（Unix 时间戳秒数）
     #[serde(default)]
     pub snooze_until: Option<u64>,
+    /// 客户端设备持久化稳定唯一标识（用于灰度放量哈希分桶）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
 }
 
 impl UpdatePreference {
@@ -124,6 +127,45 @@ impl UpdatePreference {
         self.skipped_versions.clear();
         self.snooze_until = None;
     }
+
+    /// 获取客户端设备唯一标识快照（若存在）
+    pub fn client_id(&self) -> Option<&str> {
+        self.client_id.as_deref()
+    }
+
+    /// 获取已有的客户端设备唯一标识，若尚未存在则自动生成并缓存
+    pub fn get_or_create_client_id(&mut self) -> &str {
+        if self.client_id.is_none() {
+            self.client_id = Some(generate_random_client_id());
+        }
+        self.client_id.as_deref().unwrap_or_default()
+    }
+
+    /// 手动设置客户端设备稳定唯一标识符
+    pub fn set_client_id(&mut self, id: impl Into<String>) {
+        self.client_id = Some(id.into());
+    }
+}
+
+/// 基于系统时间与随机熵源生成 16 字节随机十六进制客户端设备标识
+fn generate_random_client_id() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    hasher.update(now.as_nanos().to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    let boxed = Box::new(0u8);
+    let ptr_val = (&*boxed as *const u8 as usize).to_le_bytes();
+    hasher.update(ptr_val);
+    let hash = hasher.finalize();
+    let mut hex = String::with_capacity(32);
+    for b in &hash[..16] {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 /// 获取当前系统的 Unix 时间戳（秒数）
@@ -260,6 +302,31 @@ mod tests {
 
         let loaded = UpdatePreference::load_from_file(&file_path);
         assert_eq!(pref, loaded);
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_preference_client_id_generation_and_persistence() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("shipup_client_id_test_{}", std::process::id()));
+        let file_path = temp_dir.join("test_pref.json");
+
+        let mut pref = UpdatePreference::default();
+        assert!(pref.client_id().is_none());
+
+        let id1 = pref.get_or_create_client_id().to_string();
+        assert!(!id1.is_empty());
+        assert_eq!(pref.get_or_create_client_id(), id1);
+
+        pref.save_to_file(&file_path).unwrap();
+        let loaded = UpdatePreference::load_from_file(&file_path);
+        assert_eq!(loaded.client_id(), Some(id1.as_str()));
+
+        // 手动覆盖 client_id
+        let mut custom_pref = UpdatePreference::default();
+        custom_pref.set_client_id("device-alpha-1234");
+        assert_eq!(custom_pref.client_id(), Some("device-alpha-1234"));
 
         let _ = fs::remove_dir_all(temp_dir);
     }
