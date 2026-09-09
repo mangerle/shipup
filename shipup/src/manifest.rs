@@ -302,7 +302,7 @@ fn normalize_target(target: &str) -> String {
             ""
         };
 
-        if lower.contains("x86-64") || lower.contains("x64") || lower.contains("x86_64") {
+        if lower.contains("x86-64") || lower.contains("x64") {
             return format!("windows-x86-64{}", env_suffix);
         }
         if lower.contains("aarch64") || lower.contains("arm64") {
@@ -312,7 +312,7 @@ fn normalize_target(target: &str) -> String {
         if lower.contains("aarch64") || lower.contains("arm64") {
             return "macos-arm64".to_string();
         }
-        if lower.contains("x86-64") || lower.contains("x64") || lower.contains("x86_64") {
+        if lower.contains("x86-64") || lower.contains("x64") {
             return "macos-x86-64".to_string();
         }
     } else if lower.contains("linux") {
@@ -324,7 +324,7 @@ fn normalize_target(target: &str) -> String {
             ""
         };
 
-        if lower.contains("x86-64") || lower.contains("x64") || lower.contains("x86_64") {
+        if lower.contains("x86-64") || lower.contains("x64") {
             return format!("linux-x86-64{}", libc_suffix);
         }
         if lower.contains("aarch64") || lower.contains("arm64") {
