@@ -408,9 +408,10 @@ async fn download_file_async_attempt<F>(
 where
     F: FnMut(UpdateEvent) + Send,
 {
-    let existing_len = fs::metadata(options.target_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let existing_len = match tokio::fs::metadata(options.target_path).await {
+        Ok(m) => m.len(),
+        Err(_) => 0,
+    };
 
     let mut request = client.get(options.url);
     if existing_len > 0 {
@@ -431,7 +432,7 @@ where
     let status = response.status();
     if status == StatusCode::RANGE_NOT_SATISFIABLE {
         log::warn!("Range 范围无效（416），清除损坏或超长临时文件后重新全量下载");
-        let _ = fs::remove_file(options.target_path);
+        let _ = tokio::fs::remove_file(options.target_path).await;
         return Err(UpdateError::HttpStatus {
             status_code: 416,
             message: "HTTP 416 Range Not Satisfiable".to_string(),
@@ -446,20 +447,21 @@ where
     }
 
     if let Some(parent) = options.target_path.parent() {
-        fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
 
     let (file, initial_downloaded, total_bytes) = if status == StatusCode::PARTIAL_CONTENT {
         let remaining = response.content_length();
         let total = remaining.map(|r| existing_len.saturating_add(r));
-        let f = fs::OpenOptions::new()
+        let f = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(options.target_path)?;
+            .open(options.target_path)
+            .await?;
         (f, existing_len, total)
     } else {
         let total = response.content_length();
-        let f = File::create(options.target_path)?;
+        let f = tokio::fs::File::create(options.target_path).await?;
         (f, 0, total)
     };
 
@@ -484,7 +486,7 @@ where
 #[cfg(feature = "async")]
 async fn pipe_async_stream<F>(
     response: reqwest::Response,
-    mut file: File,
+    mut file: tokio::fs::File,
     initial_downloaded: u64,
     total_bytes: Option<u64>,
     options: &DownloadOptions<'_>,
@@ -494,6 +496,7 @@ where
     F: FnMut(UpdateEvent) + Send,
 {
     use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
     let mut downloaded_bytes: u64 = initial_downloaded;
     let mut tracker = DownloadProgressTracker::new(total_bytes);
     let mut stream = response.bytes_stream();
@@ -511,7 +514,7 @@ where
             Err(e) => return Err(UpdateError::Network(format!("下载数据流中断: {}", e))),
         };
 
-        if let Err(e) = file.write_all(&chunk) {
+        if let Err(e) = file.write_all(&chunk).await {
             return Err(UpdateError::Io(e));
         }
 
@@ -527,7 +530,7 @@ where
         });
     }
 
-    file.flush()?;
+    file.flush().await?;
     Ok(())
 }
 

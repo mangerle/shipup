@@ -373,7 +373,28 @@ impl Update {
         };
 
         download::download_file_async(&client, &options, &mut callback).await?;
-        self.verify_and_apply(&temp_download_path, callback)
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let this = self.clone();
+        let target_temp_path = temp_download_path.clone();
+
+        let blocking_handle = tokio::task::spawn_blocking(move || {
+            this.verify_and_apply(&target_temp_path, |event| {
+                let _ = tx.send(event);
+            })
+        });
+
+        while let Some(event) = rx.recv().await {
+            callback(event);
+        }
+
+        match blocking_handle.await {
+            Ok(res) => res,
+            Err(join_err) => Err(UpdateError::SelfReplace(format!(
+                "后台安装验证任务异常中止: {}",
+                join_err
+            ))),
+        }
     }
 
     fn verify_and_apply<F>(&self, temp_path: &Path, mut callback: F) -> Result<()>
