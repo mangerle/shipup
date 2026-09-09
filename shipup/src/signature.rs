@@ -91,15 +91,15 @@ pub fn verify_ed25519(data: &[u8], base64_signature: &str, base64_public_key: &s
     Ok(())
 }
 
-/// 基于流式分块读取文件并校验 SHA-256 完整性哈希值
+/// 基于流式分块读取文件并计算其 SHA-256 的 32 字节二进制摘要
 ///
 /// # 设计原理
-/// - **实现初衷**：彻底杜绝大文件（几百兆至数吉字节安装包）一次性读入内存造成的瞬时内存暴涨与 OOM。
-/// - **核心优势**：固定 64KB 缓冲区循环迭代哈希计算，无论目标文件多大，内存消耗始终恒定。
+/// - **实现初衷**：为任意体积文件的数字签名校验提供标准化输入，彻底消除大包全量读入内存的开销。
+/// - **核心优势**：固定 64KB 缓冲区循环迭代，内存占用恒定且无论文件多大都不会触发 OOM。
 ///
 /// # Errors
-/// 当底层文件读取失败或计算哈希值与期望哈希不一致时，分别返回 [`UpdateError::Io`] 或 [`UpdateError::ChecksumMismatch`]。
-pub fn verify_sha256_file(file_path: &Path, expected_checksum: &str) -> Result<()> {
+/// 当底层文件打开或读取失败时返回 [`UpdateError::Io`]。
+pub fn compute_file_sha256_digest(file_path: &Path) -> Result<[u8; 32]> {
     let mut file = File::open(file_path)?;
     let mut buffer = [0u8; HASH_BUFFER_SIZE];
     let mut hasher = Sha256::new();
@@ -112,14 +112,27 @@ pub fn verify_sha256_file(file_path: &Path, expected_checksum: &str) -> Result<(
         hasher.update(&buffer[..n]);
     }
 
+    Ok(hasher.finalize().into())
+}
+
+/// 基于流式分块读取文件并校验 SHA-256 完整性哈希值
+///
+/// # 设计原理
+/// - **实现初衷**：彻底杜绝大文件（几百兆至数吉字节安装包）一次性读入内存造成的瞬时内存暴涨与 OOM。
+/// - **核心优势**：固定 64KB 缓冲区循环迭代哈希计算，无论目标文件多大，内存消耗始终恒定。
+///
+/// # Errors
+/// 当底层文件读取失败或计算哈希值与期望哈希不一致时，分别返回 [`UpdateError::Io`] 或 [`UpdateError::ChecksumMismatch`]。
+pub fn verify_sha256_file(file_path: &Path, expected_checksum: &str) -> Result<()> {
+    let digest = compute_file_sha256_digest(file_path)?;
+
     let expected_hex = expected_checksum
         .strip_prefix("sha256:")
         .unwrap_or(expected_checksum)
         .trim();
 
-    let hash = hasher.finalize();
-    let mut actual_hex = String::with_capacity(hash.len() * 2);
-    for b in hash {
+    let mut actual_hex = String::with_capacity(64);
+    for b in digest {
         use std::fmt::Write;
         let _ = write!(actual_hex, "{b:02x}");
     }
@@ -182,34 +195,38 @@ pub const MAX_SIGNATURE_PAYLOAD_SIZE: u64 = 512 * 1024 * 1024;
 ///
 /// # 设计原理
 /// - **实现初衷**：将下载完成的临时物理文件与配置的公钥环进行整体真实性校验，只要通过任一公钥验证即放行。
-/// - **核心优势**：读取前检查元数据文件大小，限制单次最大读取为 512MB，并预分配精准容量，彻底消除大包无界内存分配造成的 OOM 崩溃。
-/// - **代价与局限**：若目标包体超过 512MB，必须依赖流式分块 SHA-256 进行完整性保障。
+/// - **核心优势**：
+///   - 优先采用基于 32 字节 SHA-256 摘要流式验签，内存占用恒定为 64KB，彻底解除 512MB 体积上限并防范 OOM。
+///   - 对历史未采用摘要签名的小文件（<= 512MB）提供向后兼容全文验签支持。
+/// - **代价与局限**：向前兼容路径对未采用摘要签名的文件仍受 512MB 内存上限保护。
 ///
 /// # Errors
-/// 当底层文件读取失败、文件体积超限或所有候选公钥均验证失败时返回对应错误。
+/// 当底层文件读取失败或所有候选公钥均验证失败时返回对应错误。
 pub fn verify_ed25519_file_any_key(
     file_path: &Path,
     base64_signature: &str,
     base64_public_keys: &[impl AsRef<str>],
 ) -> Result<()> {
-    let metadata = std::fs::metadata(file_path)?;
-    if metadata.len() > MAX_SIGNATURE_PAYLOAD_SIZE {
-        return Err(UpdateError::Io(std::io::Error::new(
-            std::io::ErrorKind::FileTooLarge,
-            format!(
-                "目标文件大小 ({} 字节) 超出 Ed25519 签名直接读取内存安全上限 ({} 字节)",
-                metadata.len(),
-                MAX_SIGNATURE_PAYLOAD_SIZE
-            ),
-        )));
+    // 1. 优先尝试 TUF/Sigstore 规范的标准摘要验签（流式计算 32 字节哈希）
+    let digest = compute_file_sha256_digest(file_path)?;
+    if verify_ed25519_any_key(&digest, base64_signature, base64_public_keys).is_ok() {
+        return Ok(());
     }
 
-    let file_len = metadata.len() as usize;
-    let mut file = File::open(file_path)?;
-    let mut data = Vec::with_capacity(file_len);
-    file.read_to_end(&mut data)?;
+    // 2. 向前兼容回退：若摘要验签未通过，尝试对全文字节进行兼容验证（限制 <= 512MB 安全上限）
+    let metadata = std::fs::metadata(file_path)?;
+    if metadata.len() <= MAX_SIGNATURE_PAYLOAD_SIZE {
+        let file_len = metadata.len() as usize;
+        let mut file = File::open(file_path)?;
+        let mut data = Vec::with_capacity(file_len);
+        file.read_to_end(&mut data)?;
 
-    verify_ed25519_any_key(&data, base64_signature, base64_public_keys)
+        if verify_ed25519_any_key(&data, base64_signature, base64_public_keys).is_ok() {
+            return Ok(());
+        }
+    }
+
+    Err(UpdateError::InvalidSignature)
 }
 
 #[cfg(test)]
@@ -323,5 +340,38 @@ mod tests {
             verify_ed25519_any_key(payload, &new_sig, &empty_keys),
             Err(UpdateError::MissingPublicKey)
         ));
+    }
+
+    #[test]
+    fn test_ed25519_file_digest_and_full_payload_verification() {
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!("shipup_digest_test_{}.bin", std::process::id()));
+        let content = b"large payload simulation block for digest signature verification";
+        let mut f = File::create(&temp_file).unwrap();
+        f.write_all(content).unwrap();
+        drop(f);
+
+        let seed = [7u8; 32];
+        let signing = SigningKey::from_bytes(&seed);
+        let pubkey = BASE64.encode(signing.verifying_key().to_bytes());
+
+        // 1. 基于 SHA-256 摘要签名并测试验签成功
+        let digest = compute_file_sha256_digest(&temp_file).unwrap();
+        let digest_sig = BASE64.encode(signing.sign(&digest).to_bytes());
+        assert!(verify_ed25519_file(&temp_file, &digest_sig, &pubkey).is_ok());
+
+        // 2. 基于文件全文签名并测试向后兼容验签成功
+        let full_sig = BASE64.encode(signing.sign(content).to_bytes());
+        assert!(verify_ed25519_file(&temp_file, &full_sig, &pubkey).is_ok());
+
+        // 3. 篡改文件后两种签名验签均失败
+        let mut f_tampered = File::create(&temp_file).unwrap();
+        f_tampered.write_all(b"tampered content bytes").unwrap();
+        drop(f_tampered);
+
+        assert!(verify_ed25519_file(&temp_file, &digest_sig, &pubkey).is_err());
+        assert!(verify_ed25519_file(&temp_file, &full_sig, &pubkey).is_err());
+
+        let _ = std::fs::remove_file(&temp_file);
     }
 }

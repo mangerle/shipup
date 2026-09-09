@@ -254,9 +254,6 @@ fn handle_keygen(out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 最大支持 Ed25519 内存签名的发布包体积上限（256MB）
-const MAX_SIGNING_PAYLOAD_SIZE: u64 = 256 * 1024 * 1024;
-
 /// 获取当前系统 UTC 时间的 RFC 3339 格式字符串（例如 "2026-09-09T12:00:00Z"）
 ///
 /// # 设计原理
@@ -331,11 +328,6 @@ fn compute_payload_integrity(
 ) -> Result<(String, Option<String>)> {
     let file = fs::File::open(package_path)
         .with_context(|| format!("打开发布包文件失败: {}", package_path.display()))?;
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("获取发布包元数据失败: {}", package_path.display()))?;
-    let file_size = metadata.len();
-
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -359,16 +351,6 @@ fn compute_payload_integrity(
     let checksum = format!("sha256:{hex}");
 
     let signature = if let Some(kp) = key_path {
-        if file_size > MAX_SIGNING_PAYLOAD_SIZE {
-            anyhow::bail!(
-                "发布包文件体积 ({} 字节) 超过 Ed25519 单次内存签名安全上限 ({} 字节)",
-                file_size,
-                MAX_SIGNING_PAYLOAD_SIZE
-            );
-        }
-
-        let package_bytes = fs::read(package_path)
-            .with_context(|| format!("读取待签名发布包失败: {}", package_path.display()))?;
         let key_str = fs::read_to_string(kp)
             .with_context(|| format!("读取私钥文件失败: {}", kp.display()))?;
         let key_bytes = BASE64
@@ -381,7 +363,8 @@ fn compute_payload_integrity(
             )
         })?;
         let signing_key = SigningKey::from_bytes(&key_array);
-        let sig = signing_key.sign(&package_bytes);
+        // 对包体 32 字节 SHA-256 摘要进行 Ed25519 签名，消除文件读取内存占用与体积上限
+        let sig = signing_key.sign(&hash);
         Some(BASE64.encode(sig.to_bytes()))
     } else {
         None
@@ -889,29 +872,8 @@ fn handle_verify(args: &VerifyArgs) -> Result<()> {
 
     let sig_status = match (public_key_b64, pkg_info.signature.as_deref()) {
         (Some(ref pk_b64), Some(sig_b64)) => {
-            let pk_bytes = BASE64.decode(pk_b64).context("解码 Base64 格式公钥失败")?;
-            let pk_arr: [u8; 32] = pk_bytes.as_slice().try_into().map_err(|_| {
-                anyhow!("公钥长度不正确，期望 32 字节，实际 {} 字节", pk_bytes.len())
-            })?;
-            let sig_bytes = BASE64
-                .decode(sig_b64)
-                .context("解码 Manifest 中的 Base64 签名失败")?;
-            let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| {
-                anyhow!(
-                    "签名长度不正确，期望 64 字节，实际 {} 字节",
-                    sig_bytes.len()
-                )
-            })?;
-
-            let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_arr)
-                .map_err(|e| anyhow!("无效的 Ed25519 公钥格式: {}", e))?;
-            let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
-
-            let payload_bytes = fs::read(&args.package)
-                .with_context(|| format!("读取发布包以验签失败: {}", args.package.display()))?;
-            verifying_key
-                .verify_strict(&payload_bytes, &signature)
-                .map_err(|_| anyhow!("Ed25519 数字签名校验未通过：发布包已被篡改或公钥不匹配"))?;
+            shipup::signature::verify_ed25519_file(&args.package, sig_b64, pk_b64)
+                .map_err(|e| anyhow!("Ed25519 数字签名校验未通过: {}", e))?;
 
             "已验证通过 (合法数字签名)"
         }
