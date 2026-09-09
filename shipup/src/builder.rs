@@ -192,7 +192,7 @@ impl Default for UpdaterBuilder {
             allow_downgrade: false,
             auto_recover_on_init: false,
             dangerous_insecure_transport_protocol: false,
-            require_signature: !cfg!(debug_assertions),
+            require_signature: true,
             version_comparator: None,
             preference_path: None,
             max_bytes_per_sec: None,
@@ -329,11 +329,12 @@ impl UpdaterBuilder {
         self
     }
 
-    /// 设置是否强制要求更新包携带数字签名（Release 模式下默认开启）
+    /// 设置是否强制要求更新包携带数字签名（默认恒为 true，消除 Profile 环境漂移）
     ///
     /// # 设计原理
-    /// - **实现初衷**：将验签模型由默认 Fail-Open 升级为 Fail-Close，防止开发者疏漏公钥导致恶意安装包直接执行。
-    /// - **安全契约**：若启用该选项，构建更新器时若未配置公钥，或清单中包未包含签名，更新流程将被阻断。
+    /// - **实现初衷**：统一安全基线，无论 Debug 还是 Release 模式下均默认开启强制签名校验，杜绝环境漂移引入安全漏洞。
+    /// - **安全警示**：若显式设置为 `false`，当更新包缺少签名时将放弃数字身份防伪校验，仅依赖 SHA-256 完整性。
+    ///   除受控本地调试场景外，严禁在生产环境关闭该保护。
     pub fn require_signature(mut self, require: bool) -> Self {
         self.require_signature = require;
         self
@@ -595,6 +596,7 @@ mod tests {
                 .current_version("1.0.0")
                 .unwrap()
                 .manifest_url("https://example.com/manifest.json")
+                .require_signature(false)
                 .build();
             assert!(res.is_ok());
         }
@@ -607,6 +609,7 @@ mod tests {
             .current_version("1.0.0")
             .unwrap()
             .manifest_url("http://insecure.example.com/manifest.json")
+            .require_signature(false)
             .build();
         assert!(matches!(
             insecure_err,
@@ -618,6 +621,7 @@ mod tests {
             .current_version("1.0.0")
             .unwrap()
             .manifest_url("HTTP://insecure.example.com/manifest.json")
+            .require_signature(false)
             .build();
         assert!(matches!(
             upper_err,
@@ -630,31 +634,39 @@ mod tests {
             .unwrap()
             .manifest_url("http://insecure.example.com/manifest.json")
             .dangerous_insecure_transport_protocol(true)
+            .require_signature(false)
             .build();
         assert!(insecure_allowed.is_ok());
     }
 
     #[test]
     fn test_require_signature_validation() {
-        // 1. 强制要求验签模式下，未配置公钥将返回 MissingPublicKey
+        // 1. 默认即为强制验签模式，未配置公钥直接返回 MissingPublicKey（无需手动调用 require_signature）
         let missing_key_err = UpdaterBuilder::new()
             .current_version("1.0.0")
             .unwrap()
             .manifest_url("https://example.com/manifest.json")
-            .require_signature(true)
             .build();
         assert!(matches!(
             missing_key_err,
             Err(UpdateError::MissingPublicKey)
         ));
 
-        // 2. 传入公钥后通过校验构建成功
+        // 2. 显式关闭 require_signature(false) 后，允许无公钥构建
+        let disabled_sig_builder = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .manifest_url("https://example.com/manifest.json")
+            .require_signature(false)
+            .build();
+        assert!(disabled_sig_builder.is_ok());
+
+        // 3. 传入公钥后默认通过校验构建成功
         let valid_builder = UpdaterBuilder::new()
             .current_version("1.0.0")
             .unwrap()
             .manifest_url("https://example.com/manifest.json")
             .public_key("dGVzdC1wdWJsaWMta2V5")
-            .require_signature(true)
             .build();
         assert!(valid_builder.is_ok());
     }
@@ -674,6 +686,7 @@ mod tests {
             .unwrap()
             .endpoint("https://primary-cdn.example.com/manifest.json")
             .endpoint("https://backup-cdn.example.com/manifest.json")
+            .require_signature(false)
             .build()
             .unwrap();
 
@@ -695,6 +708,7 @@ mod tests {
             .current_version("1.0.0")
             .unwrap()
             .manifest_url("file:///tmp/manifest.json")
+            .require_signature(false)
             .build();
         assert!(matches!(err, Err(UpdateError::FileProtocolNotAllowed(_))));
 
@@ -704,6 +718,7 @@ mod tests {
             .unwrap()
             .manifest_url("file:///tmp/manifest.json")
             .allow_file_protocol(true)
+            .require_signature(false)
             .build();
         assert!(ok.is_ok());
     }
@@ -723,6 +738,7 @@ mod tests {
             .manifest_url("https://example.com/manifest.json")
             .fallback_manifest_json(manifest_json)
             .unwrap()
+            .require_signature(false)
             .build()
             .unwrap();
 

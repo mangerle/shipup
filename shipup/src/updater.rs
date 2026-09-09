@@ -1535,6 +1535,7 @@ mod tests {
             .max_retries(0)
             .fallback_manifest_json(manifest_json)
             .unwrap()
+            .require_signature(false)
             .build()
             .unwrap();
 
@@ -1575,6 +1576,7 @@ mod tests {
             .target("x86_64-pc-windows-msvc")
             .manifest_url(&file_url)
             .allow_file_protocol(true)
+            .require_signature(false)
             .build()
             .unwrap();
 
@@ -1603,6 +1605,10 @@ mod tests {
 
     #[test]
     fn test_rollout_percentage_filtering() {
+        let temp_pref =
+            std::env::temp_dir().join(format!("test_pref_rollout_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&temp_pref);
+
         let v2 = Version::parse("2.0.0").unwrap();
         let test_client_id = "test-rollout-device";
         let bucket = compute_rollout_bucket(test_client_id, &v2);
@@ -1628,6 +1634,8 @@ mod tests {
             .target("x86_64-pc-windows-msvc")
             .client_id(test_client_id)
             .manifest_url("https://example.com/manifest.json")
+            .preference_path(&temp_pref)
+            .require_signature(false)
             .build()
             .unwrap();
 
@@ -1659,6 +1667,8 @@ mod tests {
             .target("x86_64-pc-windows-msvc")
             .client_id(test_client_id)
             .manifest_url("https://example.com/manifest.json")
+            .preference_path(&temp_pref)
+            .require_signature(false)
             .build()
             .unwrap();
 
@@ -1668,6 +1678,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        let _ = std::fs::remove_file(&temp_pref);
 
         // 3. 若 force_update = true，即使未命中灰度比例也必须放行
         let mandatory_manifest_json = format!(

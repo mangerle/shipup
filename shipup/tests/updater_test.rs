@@ -171,6 +171,7 @@ fn test_updater_builder_configuration() {
         .channel("beta")
         .header("Authorization", "Bearer token-abc")
         .proxy("http://127.0.0.1:8888")
+        .public_key("dGVzdA==")
         .allow_downgrade(true);
 
     let updater = builder.build().expect("构建 Updater 失败");
