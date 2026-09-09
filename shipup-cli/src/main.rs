@@ -98,6 +98,7 @@ struct ReleaseArgs {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
     let cli = Cli::parse();
 
     match cli.command {
@@ -131,10 +132,10 @@ fn handle_keygen(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(&key_path, &private_key_b64)?;
     fs::write(&pub_path, &public_key_b64)?;
 
-    println!("Ed25519 密钥对已成功生成：");
-    println!("  私钥文件（请妥善保密）: {}", key_path.display());
-    println!("  公钥文件（配置于客户端）: {}", pub_path.display());
-    println!("  公钥 Base64 内容: {}", public_key_b64);
+    log::info!("Ed25519 密钥对已成功生成");
+    log::info!("  私钥文件（请妥善保密）: {}", key_path.display());
+    log::info!("  公钥文件（配置于客户端）: {}", pub_path.display());
+    log::info!("  公钥 Base64 内容: {}", public_key_b64);
 
     Ok(())
 }
@@ -258,7 +259,7 @@ fn handle_release(args: &ReleaseArgs) -> Result<(), Box<dyn std::error::Error>> 
     );
 
     save_manifest_file(&args.manifest, &manifest)?;
-    println!(
+    log::info!(
         "发布信息已成功合并并写入 Manifest：{}",
         args.manifest.display()
     );
