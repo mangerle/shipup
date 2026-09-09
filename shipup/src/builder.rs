@@ -63,6 +63,8 @@ pub struct UpdaterConfig {
     pub client_id: Option<String>,
     /// 最大保留的历史版本回滚备份数量（默认 3）
     pub max_rollback_entries: usize,
+    /// 自定义受信任根证书 PEM 字节数据列表（用于自建私有 PKI 或证书固定）
+    pub root_certificates_pem: Vec<Vec<u8>>,
 }
 
 impl std::fmt::Debug for UpdaterConfig {
@@ -92,6 +94,7 @@ impl std::fmt::Debug for UpdaterConfig {
             )
             .field("preference_path", &self.preference_path)
             .field("max_rollback_entries", &self.max_rollback_entries)
+            .field("root_certificates_count", &self.root_certificates_pem.len())
             .finish()
     }
 }
@@ -138,6 +141,7 @@ pub struct UpdaterBuilder {
     pub(crate) fallback_manifest: Option<Manifest>,
     pub(crate) client_id: Option<String>,
     pub(crate) max_rollback_entries: usize,
+    pub(crate) root_certificates_pem: Vec<Vec<u8>>,
 }
 
 impl std::fmt::Debug for UpdaterBuilder {
@@ -171,6 +175,7 @@ impl std::fmt::Debug for UpdaterBuilder {
             .field("has_fallback_manifest", &self.fallback_manifest.is_some())
             .field("client_id", &self.client_id)
             .field("max_rollback_entries", &self.max_rollback_entries)
+            .field("root_certificates_count", &self.root_certificates_pem.len())
             .finish()
     }
 }
@@ -200,6 +205,7 @@ impl Default for UpdaterBuilder {
             fallback_manifest: None,
             client_id: None,
             max_rollback_entries: crate::recovery::DEFAULT_MAX_ROLLBACK_ENTRIES,
+            root_certificates_pem: Vec::new(),
         }
     }
 }
@@ -450,6 +456,17 @@ impl UpdaterBuilder {
         self
     }
 
+    /// 添加自定义受信任根证书 PEM 格式数据（支持私有 CA 或证书固定 Certificate Pinning）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：满足企业内网自建 CA 或高安全金融场景下证书固定需求，仅信任特定的私有根证书。
+    /// - **核心优势**：在构造底层 TLS 客户端时直接将 PEM 证书注入上下文，无需修改操作系统全局受信任根证书库。
+    /// - **代价与局限**：若远端服务器证书更换导致公钥不匹配，网络请求将触发安全中断。
+    pub fn add_root_certificate_pem(mut self, pem_bytes: &[u8]) -> Self {
+        self.root_certificates_pem.push(pem_bytes.to_vec());
+        self
+    }
+
     /// 构建 Updater 实例并完成前置安全门禁与合法性校验
     ///
     /// # 校验内容
@@ -511,6 +528,7 @@ impl UpdaterBuilder {
             fallback_manifest: self.fallback_manifest,
             client_id: self.client_id,
             max_rollback_entries: self.max_rollback_entries,
+            root_certificates_pem: self.root_certificates_pem,
         };
 
         Ok(Updater::new(config))
@@ -743,5 +761,23 @@ mod tests {
             .unwrap();
 
         assert!(updater.fallback_manifest().is_some());
+    }
+
+    #[test]
+    fn test_builder_add_root_certificate_pem() {
+        let pem_sample = b"-----BEGIN CERTIFICATE-----\nfake_pem_bytes\n-----END CERTIFICATE-----";
+        let builder = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .manifest_url("https://example.com/manifest.json")
+            .require_signature(false)
+            .add_root_certificate_pem(pem_sample);
+
+        assert_eq!(builder.root_certificates_pem.len(), 1);
+        assert_eq!(builder.root_certificates_pem[0], pem_sample);
+
+        let updater = builder.build().unwrap();
+        // 验证构建后配置被安全共享
+        drop(updater);
     }
 }

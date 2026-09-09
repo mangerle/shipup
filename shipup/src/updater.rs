@@ -49,6 +49,7 @@ pub(crate) struct NetworkSecurityConfig {
     pub max_bytes_per_sec: Option<u64>,
     pub allow_file_protocol: bool,
     pub max_rollback_entries: usize,
+    pub root_certificates_pem: Vec<Vec<u8>>,
 }
 
 /// 更新器内部共享核心状态实体
@@ -338,6 +339,7 @@ impl Updater {
                     max_bytes_per_sec: config.max_bytes_per_sec,
                     allow_file_protocol: config.allow_file_protocol,
                     max_rollback_entries: config.max_rollback_entries,
+                    root_certificates_pem: config.root_certificates_pem,
                 }),
                 version_comparator: config.version_comparator,
                 preference: Mutex::new(preference),
@@ -362,6 +364,7 @@ impl Updater {
             self.inner.config.user_agent.as_deref(),
             &self.inner.config.headers,
             self.inner.config.proxy.as_deref(),
+            &self.inner.config.root_certificates_pem,
         )?;
 
         let template_ctx = TemplateContext {
@@ -435,6 +438,7 @@ impl Updater {
             self.inner.config.user_agent.as_deref(),
             &self.inner.config.headers,
             self.inner.config.proxy.as_deref(),
+            &self.inner.config.root_certificates_pem,
         )?;
 
         let template_ctx = TemplateContext {
@@ -767,6 +771,7 @@ impl Update {
             self.config.user_agent.as_deref(),
             &self.config.headers,
             self.config.proxy.as_deref(),
+            &self.config.root_certificates_pem,
         )?;
 
         let temp_download_path =
@@ -875,6 +880,7 @@ impl Update {
             self.config.user_agent.as_deref(),
             &self.config.headers,
             self.config.proxy.as_deref(),
+            &self.config.root_certificates_pem,
         )?;
 
         let temp_download_path =
@@ -1282,8 +1288,18 @@ fn build_blocking_http_client(
     user_agent: Option<&str>,
     headers: &HashMap<String, String>,
     proxy: Option<&str>,
+    root_certificates_pem: &[Vec<u8>],
 ) -> Result<reqwest::blocking::Client> {
-    let mut builder = reqwest::blocking::Client::builder().timeout(timeout);
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .min_tls_version(reqwest::tls::Version::TLS_1_2);
+
+    for pem_bytes in root_certificates_pem {
+        let cert = reqwest::Certificate::from_pem(pem_bytes)
+            .map_err(|e| UpdateError::Network(format!("加载自定义受信任根证书失败: {}", e)))?;
+        builder = builder.add_root_certificate(cert);
+    }
+
     if let Some(ua) = user_agent {
         builder = builder.user_agent(ua);
     }
@@ -1304,8 +1320,18 @@ fn build_async_http_client(
     user_agent: Option<&str>,
     headers: &HashMap<String, String>,
     proxy: Option<&str>,
+    root_certificates_pem: &[Vec<u8>],
 ) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().timeout(timeout);
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .min_tls_version(reqwest::tls::Version::TLS_1_2);
+
+    for pem_bytes in root_certificates_pem {
+        let cert = reqwest::Certificate::from_pem(pem_bytes)
+            .map_err(|e| UpdateError::Network(format!("加载自定义受信任根证书失败: {}", e)))?;
+        builder = builder.add_root_certificate(cert);
+    }
+
     if let Some(ua) = user_agent {
         builder = builder.user_agent(ua);
     }
@@ -1859,6 +1885,7 @@ mod tests {
                 max_bytes_per_sec: None,
                 allow_file_protocol: true,
                 max_rollback_entries: 3,
+                root_certificates_pem: Vec::new(),
             }),
         };
 
@@ -1912,6 +1939,7 @@ mod tests {
                 max_bytes_per_sec: None,
                 allow_file_protocol: true,
                 max_rollback_entries: 3,
+                root_certificates_pem: Vec::new(),
             }),
         };
 
@@ -1921,5 +1949,47 @@ mod tests {
         assert!(!temp_bin.exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[cfg(feature = "blocking")]
+    #[test]
+    fn test_build_blocking_http_client_with_invalid_certificate_rejected() {
+        let invalid_pem = vec![
+            b"-----BEGIN CERTIFICATE-----\ninvalid_corrupt_base64\n-----END CERTIFICATE-----"
+                .to_vec(),
+        ];
+        let res = build_blocking_http_client(
+            Duration::from_secs(5),
+            None,
+            &HashMap::new(),
+            None,
+            &invalid_pem,
+        );
+        assert!(res.is_err());
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn test_build_async_http_client_with_invalid_certificate_rejected() {
+        let invalid_pem = vec![
+            b"-----BEGIN CERTIFICATE-----\ninvalid_corrupt_base64\n-----END CERTIFICATE-----"
+                .to_vec(),
+        ];
+        let res = build_async_http_client(
+            Duration::from_secs(5),
+            None,
+            &HashMap::new(),
+            None,
+            &invalid_pem,
+        );
+        assert!(res.is_err());
+    }
+
+    #[cfg(feature = "blocking")]
+    #[test]
+    fn test_build_blocking_http_client_defaults() {
+        let res =
+            build_blocking_http_client(Duration::from_secs(5), None, &HashMap::new(), None, &[]);
+        assert!(res.is_ok());
     }
 }
