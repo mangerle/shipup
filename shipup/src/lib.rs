@@ -39,6 +39,10 @@ pub use platform::{
     InstallerOptions, cleanup_old_backups, get_same_volume_temp_path, get_temp_download_path,
     spawn_installer,
 };
+#[cfg(feature = "async")]
+pub use poller::spawn_polling_task;
+#[cfg(feature = "blocking")]
+pub use poller::spawn_polling_thread;
 pub use poller::{AutoPollEvent, AutoPollOptions, AutoPollerHandle};
 pub use preference::UpdatePreference;
 pub use recovery::{
