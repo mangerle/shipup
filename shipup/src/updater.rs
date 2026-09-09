@@ -982,9 +982,11 @@ impl Update {
             }
         }
 
-        if self.config.require_signature {
+        // 数字签名校验：只要开启了 require_signature 或配置了验签公钥列表，就必须强制执行签名防伪核验
+        if self.config.require_signature || !self.config.public_keys.is_empty() {
             callback(UpdateEvent::VerifyingSignature);
             if self.config.public_keys.is_empty() {
+                let _ = fs::remove_file(temp_path);
                 return Err(UpdateError::MissingPublicKey);
             }
             let sig = self.release.package.signature.as_deref().ok_or_else(|| {
@@ -994,22 +996,6 @@ impl Update {
             if let Err(e) = verify_ed25519_file_any_key(temp_path, sig, &self.config.public_keys) {
                 let _ = fs::remove_file(temp_path);
                 return Err(e);
-            }
-        } else if !self.config.public_keys.is_empty() {
-            callback(UpdateEvent::VerifyingSignature);
-            match self.release.package.signature {
-                Some(ref sig) => {
-                    if let Err(e) =
-                        verify_ed25519_file_any_key(temp_path, sig, &self.config.public_keys)
-                    {
-                        let _ = fs::remove_file(temp_path);
-                        return Err(e);
-                    }
-                }
-                None => {
-                    let _ = fs::remove_file(temp_path);
-                    return Err(UpdateError::MissingSignature);
-                }
             }
         }
 
@@ -1827,5 +1813,113 @@ mod tests {
         ));
 
         let _ = std::fs::remove_file(&temp_pref);
+    }
+
+    #[test]
+    fn test_verify_downloaded_payload_rejects_missing_signature_with_keys() {
+        use base64::Engine;
+        let temp_dir = std::env::temp_dir().join(format!("test_a6_sig_{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let temp_bin = temp_dir.join("payload.bin");
+        fs::write(&temp_bin, b"sample binary payload").unwrap();
+
+        let dummy_key = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+
+        let update = Update {
+            current_version: Version::parse("1.0.0").unwrap(),
+            release: ResolvedRelease {
+                version: Version::parse("2.0.0").unwrap(),
+                min_supported_version: None,
+                notes: None,
+                pub_date: None,
+                is_mandatory: false,
+                rollout_percentage: None,
+                package: crate::manifest::PackageInfo {
+                    url: "https://example.com/payload.bin".to_string(),
+                    signature: None, // 未提供数字签名
+                    checksum: None,
+                    package_type: PackageType::Binary,
+                    install_mode: None,
+                    install_args: vec![],
+                    executable_path: None,
+                    require_elevation: false,
+                    size: None,
+                },
+            },
+            config: Arc::new(NetworkSecurityConfig {
+                public_keys: vec![dummy_key],
+                timeout: Duration::from_secs(5),
+                user_agent: None,
+                headers: HashMap::new(),
+                proxy: None,
+                max_retries: 0,
+                retry_delay: Duration::from_millis(100),
+                dangerous_insecure_transport_protocol: false,
+                require_signature: false, // 即使显式设置了 false，因配置了公钥，也绝不允许未签名放行！
+                max_bytes_per_sec: None,
+                allow_file_protocol: true,
+                max_rollback_entries: 3,
+            }),
+        };
+
+        let mut events = Vec::new();
+        let res = update.verify_downloaded_payload(&temp_bin, &mut |ev| events.push(ev));
+        assert!(matches!(res, Err(UpdateError::MissingSignature)));
+        // 验证失败后物理临时文件已被确定性清理
+        assert!(!temp_bin.exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_verify_downloaded_payload_missing_public_key_cleans_file() {
+        let temp_dir = std::env::temp_dir().join(format!("test_a6_pk_{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let temp_bin = temp_dir.join("payload.bin");
+        fs::write(&temp_bin, b"sample binary payload").unwrap();
+
+        let update = Update {
+            current_version: Version::parse("1.0.0").unwrap(),
+            release: ResolvedRelease {
+                version: Version::parse("2.0.0").unwrap(),
+                min_supported_version: None,
+                notes: None,
+                pub_date: None,
+                is_mandatory: false,
+                rollout_percentage: None,
+                package: crate::manifest::PackageInfo {
+                    url: "https://example.com/payload.bin".to_string(),
+                    signature: Some("dummy_sig".to_string()),
+                    checksum: None,
+                    package_type: PackageType::Binary,
+                    install_mode: None,
+                    install_args: vec![],
+                    executable_path: None,
+                    require_elevation: false,
+                    size: None,
+                },
+            },
+            config: Arc::new(NetworkSecurityConfig {
+                public_keys: vec![], // 未配置公钥
+                timeout: Duration::from_secs(5),
+                user_agent: None,
+                headers: HashMap::new(),
+                proxy: None,
+                max_retries: 0,
+                retry_delay: Duration::from_millis(100),
+                dangerous_insecure_transport_protocol: false,
+                require_signature: true, // 强制验签但无公钥
+                max_bytes_per_sec: None,
+                allow_file_protocol: true,
+                max_rollback_entries: 3,
+            }),
+        };
+
+        let mut events = Vec::new();
+        let res = update.verify_downloaded_payload(&temp_bin, &mut |ev| events.push(ev));
+        assert!(matches!(res, Err(UpdateError::MissingPublicKey)));
+        assert!(!temp_bin.exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
