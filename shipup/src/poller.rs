@@ -1,9 +1,7 @@
 // shipup 跨平台自更新系统 - 后台周期性静默轮询与暂存调度器
 
 use crate::error::UpdateError;
-#[cfg(feature = "async")]
-use crate::updater::Updater;
-use crate::updater::{DownloadedUpdate, Update};
+use crate::updater::{DownloadedUpdate, Update, Updater};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -92,7 +90,6 @@ pub struct AutoPollerHandle {
 }
 
 impl AutoPollerHandle {
-    #[cfg(feature = "async")]
     pub(crate) fn new(stop_flag: Arc<AtomicBool>, download_cancel_flag: Arc<AtomicBool>) -> Self {
         Self {
             stop_flag,

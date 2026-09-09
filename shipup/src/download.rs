@@ -4,9 +4,12 @@
 
 use crate::error::{Result, UpdateError};
 use crate::event::UpdateEvent;
-use std::fs::{self, File};
+use std::fs;
+#[cfg(feature = "blocking")]
+use std::fs::File;
 #[cfg(feature = "blocking")]
 use std::io::Read;
+#[cfg(feature = "blocking")]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

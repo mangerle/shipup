@@ -1,20 +1,7 @@
 // shipup 跨平台自更新系统 - 归档解压缩沙箱与 Zip Slip 防护
 
 use crate::error::{Result, UpdateError};
-use std::fs;
-#[cfg(any(
-    feature = "archive-zip",
-    feature = "archive-tar",
-    feature = "archive-tar-zst",
-    feature = "archive-tar-xz"
-))]
-use std::fs::File;
-#[cfg(any(
-    feature = "archive-zip",
-    feature = "archive-tar",
-    feature = "archive-tar-zst",
-    feature = "archive-tar-xz"
-))]
+use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
