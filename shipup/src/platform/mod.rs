@@ -164,8 +164,8 @@ pub fn get_same_volume_temp_path() -> Result<PathBuf> {
 /// 计算目标下载 URL 的简短确定性十六进制哈希指纹（前 12 位）
 ///
 /// # 设计原理
-/// - **实现初衷**：以确定性哈希替代易变的操作系统进程 PID，确保跨进程会话能够定位到同一文件。
-/// - **核心优势**：恢复本地缓存命中率与断点续传可用性，同时避免多更新包在同一目录下发生文件名碰撞。
+/// - **实现初衷**：以确定性哈希区分不同的下载资源，避免多更新包在同一目录下发生文件名碰撞。
+/// - **核心优势**：轻量快速，仅截取 SHA-256 前 6 字节（12 个十六进制字符）。
 pub(crate) fn compute_url_hash_token(url: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -179,8 +179,70 @@ pub(crate) fn compute_url_hash_token(url: &str) -> String {
     hex
 }
 
+/// 生成密码学安全随机十六进制字符串（8 字节随机熵，16 位十六进制字符）
+///
+/// # 设计原理
+/// - **实现初衷**：为临时下载目录或文件注入不可预测的高熵随机性，消除在全局共享临时目录下被提前预测与预占投毒的安全风险。
+/// - **核心优势**：直接调用操作系统级 CSPRNG，具备 64 位不可预测随机熵空间。
+/// - **代价与局限**：在极端操作系统熵池耗尽情况下可能引发 I/O 错误。
+pub(crate) fn generate_secure_random_hex() -> Result<String> {
+    let mut buf = [0u8; 8];
+    getrandom::fill(&mut buf)
+        .map_err(|e| std::io::Error::other(format!("获取安全随机数失败: {e}")))?;
+    let mut hex = String::with_capacity(16);
+    for b in buf {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    Ok(hex)
+}
+
+/// 在指定基准目录下创建具备私有访问控制权限的专属隔离目录（Unix 权限严格限制为 0o700）
+///
+/// # 设计原理
+/// - **实现初衷**：在多用户共享临时目录（如 `/tmp`）下，仅凭随机文件名仍可能面临目录遍历或竞态符号链接注入风险。
+///   通过在独立子目录上显式赋予 `0o700`（仅所有者具备读、写、执行权限），从操作系统内核层面彻底阻断其他非特权用户的探测、抢占与注入。
+/// - **核心优势**：即使本地恶意用户知晓文件名，也因无权访问父隔离目录而无法创建符号链接或投毒文件；跨平台安全优雅降级。
+/// - **代价与局限**：创建目录依赖父级基准目录的写权限。
+///
+/// # Errors
+/// 当底层操作系统拒绝访问或创建目录失败时返回 [`crate::error::UpdateError::Io`]。
+pub(crate) fn create_secure_temp_dir(base_dir: &Path, dir_name: &str) -> Result<PathBuf> {
+    let secure_dir = base_dir.join(dir_name);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        builder.mode(0o700);
+        builder.create(&secure_dir)?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&secure_dir)?;
+    }
+
+    Ok(secure_dir)
+}
+
+/// 根据更新包模式确定最佳的安全临时下载文件路径
+///
+/// # 设计原理
+/// - **实现初衷**：
+///   - 对于 `PackageType::Installer`，安装器是由独立子进程运行的完整安装介质，无需与宿主程序处于同卷。
+///     落盘至操作系统临时目录时，强制创建带有高熵随机命名的专属子目录，并在 Unix 下赋予 `0o700` 私有权限，彻底杜绝共享 `/tmp` 下的预测与抢占投毒。
+///   - 对于 `PackageType::Binary` 和 `PackageType::Archive`，为了规避跨文件系统重命名引发的 `EXDEV` 错误，
+///     强制落盘至当前可执行文件同卷父目录，并追加安全随机十六进制后缀与 `.shipup.tmp` 标识，兼顾同卷原子替换与防抢占安全。
+/// - **核心优势**：消除了共享临时目录下的预占投毒与符号链接利用风险，同时保持同卷原子替换与过期垃圾回收契约。
+///
+/// # Errors
+/// 当路径探测失败或系统临时目录不可用时返回错误。
 pub fn get_temp_download_path(package_type: PackageType, url: &str) -> Result<PathBuf> {
     let token = compute_url_hash_token(url);
+    let random_hex = generate_secure_random_hex()?;
+
     if package_type == PackageType::Installer {
         let temp_dir = std::env::temp_dir();
         let url_path = Path::new(url.split('?').next().unwrap_or(url));
@@ -198,8 +260,10 @@ pub fn get_temp_download_path(package_type: PackageType, url: &str) -> Result<Pa
                 "bin"
             }
         });
-        let file_name = format!("shipup_installer_{}.{}", token, ext);
-        return Ok(temp_dir.join(file_name));
+        let dir_name = format!("shipup_installer_{}_{}", token, random_hex);
+        let secure_dir = create_secure_temp_dir(&temp_dir, &dir_name)?;
+        let file_name = format!("installer.{}", ext);
+        return Ok(secure_dir.join(file_name));
     }
 
     if let Ok(current_exe) = std::env::current_exe()
@@ -209,9 +273,78 @@ pub fn get_temp_download_path(package_type: PackageType, url: &str) -> Result<Pa
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("app");
-        let file_name = format!("{}.{}.shipup.tmp", exe_name, token);
+        let file_name = format!("{}.{}.{}.shipup.tmp", exe_name, token, random_hex);
         return Ok(parent.join(file_name));
     }
 
-    get_same_volume_temp_path()
+    let fallback = get_same_volume_temp_path()?;
+    let parent = fallback.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = format!("app.{}.{}.shipup.tmp", token, random_hex);
+    Ok(parent.join(file_name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_secure_random_hex_uniqueness_and_length() {
+        let hex1 = generate_secure_random_hex().unwrap();
+        let hex2 = generate_secure_random_hex().unwrap();
+
+        assert_eq!(hex1.len(), 16);
+        assert_eq!(hex2.len(), 16);
+        assert_ne!(hex1, hex2, "多次生成的安全随机数应具备高熵唯一性");
+    }
+
+    #[test]
+    fn test_create_secure_temp_dir_permissions() {
+        let temp_base = std::env::temp_dir();
+        let dir_name = format!("shipup_test_sec_{}", generate_secure_random_hex().unwrap());
+        let secure_dir = create_secure_temp_dir(&temp_base, &dir_name).unwrap();
+
+        assert!(secure_dir.is_dir());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(&secure_dir).unwrap();
+            let mode = metadata.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "Unix 下专属临时子目录权限必须严格为 0700");
+        }
+
+        let _ = std::fs::remove_dir(&secure_dir);
+    }
+
+    #[test]
+    fn test_get_temp_download_path_installer_isolation() {
+        let url = "https://example.com/packages/setup.exe?auth=token";
+        let path1 = get_temp_download_path(PackageType::Installer, url).unwrap();
+        let path2 = get_temp_download_path(PackageType::Installer, url).unwrap();
+
+        assert_ne!(path1, path2, "每次下载必须生成独立的随机安全隔离路径");
+        assert_eq!(path1.extension().and_then(|s| s.to_str()), Some("exe"));
+
+        let parent1 = path1.parent().unwrap();
+        assert!(parent1.is_dir(), "安装器父隔离目录必须已安全创建");
+
+        let _ = std::fs::remove_dir(parent1);
+        if let Some(parent2) = path2.parent() {
+            let _ = std::fs::remove_dir(parent2);
+        }
+    }
+
+    #[test]
+    fn test_get_temp_download_path_binary_randomness() {
+        let url = "https://example.com/binaries/myapp";
+        let path1 = get_temp_download_path(PackageType::Binary, url).unwrap();
+        let path2 = get_temp_download_path(PackageType::Binary, url).unwrap();
+
+        assert_ne!(path1, path2, "二进制临时替换路径必须包含随机熵防抢占");
+        let file_name1 = path1.file_name().and_then(|s| s.to_str()).unwrap();
+        assert!(
+            file_name1.ends_with(".shipup.tmp"),
+            "临时二进制文件必须遵循 .shipup.tmp 命名规范以便垃圾回收"
+        );
+    }
 }
