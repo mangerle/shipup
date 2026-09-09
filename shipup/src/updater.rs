@@ -376,6 +376,16 @@ impl Updater {
     /// 解析并评估 Manifest 版本信息
     fn evaluate_manifest(&self, manifest_json: &str) -> Result<Option<Update>> {
         let manifest = Manifest::from_json_str(manifest_json)?;
+
+        if !self.inner.config.public_keys.is_empty() {
+            if let Some(ref _sig) = manifest.signature {
+                manifest.verify_signature(&self.inner.config.public_keys)?;
+                log::info!("更新源 Manifest 清单自身数字签名防伪验证通过");
+            } else if self.inner.config.require_signature {
+                log::debug!("当前 Manifest 未附带根级数字签名，将严格依赖后续安装包体级数字签名");
+            }
+        }
+
         let options = ResolveOptions {
             channel: self.inner.channel.as_deref(),
             target: &self.inner.target,
@@ -973,13 +983,12 @@ fn prepare_backup_before_replace() -> Result<Option<PathBuf>> {
 }
 
 fn record_state_if_possible(target_version: &Version, backup_path: Option<&Path>) {
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(target_dir) = current_exe.parent()
+    if let Some(target_dir) = crate::preference::resolve_safe_data_dir()
         && let Some(backup) = backup_path
         && backup.exists()
     {
         let _ =
-            crate::recovery::record_update_state(target_dir, &target_version.to_string(), backup);
+            crate::recovery::record_update_state(&target_dir, &target_version.to_string(), backup);
     }
 }
 

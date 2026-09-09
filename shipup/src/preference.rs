@@ -134,11 +134,82 @@ pub(crate) fn current_unix_timestamp() -> u64 {
         .as_secs()
 }
 
+/// 探测适合写入用户偏好与自愈状态的安全目录
+///
+/// # 设计原理
+/// - **实现初衷**：在 Windows `C:\Program Files` 或 Linux `/usr/bin` 等受限安装路径下，程序同级目录对标准用户只读。
+/// - **核心优势**：优先在程序同级写入以保持便携免安装应用的内聚性；遇到权限受限时，自动优雅降级至操作系统本地用户数据目录（如 `%LOCALAPPDATA%`），绝不崩溃或静默丢失配置。
+pub(crate) fn resolve_safe_data_dir() -> Option<PathBuf> {
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        // 探测父目录是否拥有写入权限
+        let test_probe = parent.join(format!(".shipup_probe_{}", std::process::id()));
+        if std::fs::write(&test_probe, b"").is_ok() {
+            let _ = std::fs::remove_file(&test_probe);
+            return Some(parent.to_path_buf());
+        }
+    }
+
+    get_user_app_data_dir()
+}
+
+fn get_user_app_data_dir() -> Option<PathBuf> {
+    let app_name = std::env::current_exe()
+        .ok()
+        .and_then(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "shipup_app".to_string());
+
+    #[cfg(windows)]
+    {
+        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+            let dir = PathBuf::from(local_appdata).join(&app_name);
+            let _ = std::fs::create_dir_all(&dir);
+            return Some(dir);
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let dir = PathBuf::from(appdata).join(&app_name);
+            let _ = std::fs::create_dir_all(&dir);
+            return Some(dir);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            let dir = PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join(&app_name);
+            let _ = std::fs::create_dir_all(&dir);
+            return Some(dir);
+        }
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        if let Ok(xdg_config) = std::env::var("XDG_CONFIG_HOME") {
+            let dir = PathBuf::from(xdg_config).join(&app_name);
+            let _ = std::fs::create_dir_all(&dir);
+            return Some(dir);
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let dir = PathBuf::from(home).join(".config").join(&app_name);
+            let _ = std::fs::create_dir_all(&dir);
+            return Some(dir);
+        }
+    }
+
+    None
+}
+
 /// 探测获取默认的用户偏好持久化文件路径
 pub(crate) fn default_preference_file_path() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|dir| dir.join(".shipup_preference.json")))
+    resolve_safe_data_dir().map(|dir| dir.join(".shipup_preference.json"))
 }
 
 #[cfg(test)]

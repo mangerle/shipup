@@ -337,6 +337,7 @@ fn load_or_init_manifest(
             notes: args.notes.clone(),
             packages: HashMap::new(),
             channels: HashMap::new(),
+            signature: None,
         })
     }
 }

@@ -62,6 +62,7 @@ fn test_manifest_serialization_and_routing() {
         notes: Some("常规版本更新".to_string()),
         packages,
         channels,
+        signature: None,
     };
 
     // 序列化为 JSON

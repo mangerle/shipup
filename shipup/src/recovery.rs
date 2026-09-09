@@ -276,10 +276,8 @@ pub fn confirm_update_success_in_dir(state_dir: &Path) -> Result<bool> {
 /// - **实现初衷**：在更新器初始化或常规清理流程前进行探针检查，防止误删处于健康观察期的旧版本备份。
 /// - **核心优势**：纯物理路径探测，零解析开销。
 pub fn has_pending_recovery_state() -> bool {
-    if let Ok(current_exe) = env::current_exe()
-        && let Some(parent) = current_exe.parent()
-    {
-        return parent.join(UPDATE_STATE_FILENAME).exists();
+    if let Some(dir) = crate::preference::resolve_safe_data_dir() {
+        return dir.join(UPDATE_STATE_FILENAME).exists();
     }
     false
 }
@@ -292,9 +290,8 @@ pub fn has_pending_recovery_state() -> bool {
 /// # Errors
 /// 当获取当前运行可执行文件路径失败时返回对应错误。
 pub fn confirm_update_success() -> Result<bool> {
-    let current_exe = env::current_exe()?;
-    if let Some(parent) = current_exe.parent() {
-        confirm_update_success_in_dir(parent)
+    if let Some(state_dir) = crate::preference::resolve_safe_data_dir() {
+        confirm_update_success_in_dir(&state_dir)
     } else {
         Ok(false)
     }
@@ -309,8 +306,13 @@ pub fn confirm_update_success() -> Result<bool> {
 /// 当回滚覆盖底层失败时返回 [`UpdateError::SelfReplace`]。
 pub fn check_and_recover_current(max_allowed_crashes: u32) -> Result<HealthCheckStatus> {
     let current_exe = env::current_exe()?;
-    let state_dir = current_exe.parent().unwrap_or_else(|| Path::new("."));
-    check_and_recover(state_dir, &current_exe, max_allowed_crashes)
+    let state_dir = crate::preference::resolve_safe_data_dir().unwrap_or_else(|| {
+        current_exe
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    });
+    check_and_recover(&state_dir, &current_exe, max_allowed_crashes)
 }
 
 static RECOVERY_ONCE_GUARD: AtomicBool = AtomicBool::new(false);

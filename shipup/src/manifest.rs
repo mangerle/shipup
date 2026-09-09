@@ -172,6 +172,10 @@ pub struct Manifest {
     /// 多通道扩展块字典（如 "beta", "alpha", "nightly"）
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub channels: HashMap<String, ChannelInfo>,
+
+    /// Manifest 元数据自身的数字签名（Base64 编码，可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 /// 解析路由后最终用于执行更新的结构体
@@ -223,6 +227,30 @@ impl Manifest {
     pub fn from_json_str(content: &str) -> Result<Self> {
         serde_json::from_str(content)
             .map_err(|e| UpdateError::ManifestParse(format!("JSON 结构解析失败: {}", e)))
+    }
+
+    /// 提取 Manifest 规范化字节数据（排除 signature 字段本身），供生成与校验数字签名使用
+    ///
+    /// # Errors
+    /// 当 JSON 序列化失败时返回 [`UpdateError::ManifestParse`]。
+    pub fn compute_canonical_bytes(&self) -> Result<Vec<u8>> {
+        let mut cloned = self.clone();
+        cloned.signature = None;
+        serde_json::to_vec(&cloned)
+            .map_err(|e| UpdateError::ManifestParse(format!("序列化规范化清单失败: {}", e)))
+    }
+
+    /// 使用配置的候选公钥环校验 Manifest 本身的完整性与数字签名
+    ///
+    /// # Errors
+    /// 当缺少签名字段或所有公钥均验签失败时返回错误。
+    pub fn verify_signature(&self, public_keys: &[impl AsRef<str>]) -> Result<()> {
+        let sig = self
+            .signature
+            .as_deref()
+            .ok_or(UpdateError::MissingSignature)?;
+        let canonical_bytes = self.compute_canonical_bytes()?;
+        crate::signature::verify_ed25519_any_key(&canonical_bytes, sig, public_keys)
     }
 
     /// 根据路由选项进行通道选择与平台 Target 匹配
@@ -488,6 +516,7 @@ mod tests {
             notes: None,
             packages,
             channels,
+            signature: None,
         };
 
         let current_ver = Version::parse("1.0.0").unwrap();
@@ -561,5 +590,41 @@ mod tests {
         let basic_json = r#"{"url":"https://example.com/setup.msi","package_type":"installer","install_mode":"basicUi"}"#;
         let basic_pkg: PackageInfo = serde_json::from_str(basic_json).unwrap();
         assert_eq!(basic_pkg.install_mode, Some(InstallMode::BasicUi));
+    }
+
+    #[test]
+    fn test_manifest_self_signature_verification() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let mut signing_seed = [0u8; 32];
+        getrandom::fill(&mut signing_seed).unwrap();
+        let signing_key = SigningKey::from_bytes(&signing_seed);
+        let verifying_key = signing_key.verifying_key();
+        let pubkey_b64 = BASE64.encode(verifying_key.to_bytes());
+
+        let mut manifest = Manifest {
+            version: Version::parse("3.0.0").unwrap(),
+            min_supported_version: None,
+            force_update: false,
+            pub_date: None,
+            notes: Some("清单签名测试".to_string()),
+            packages: HashMap::new(),
+            channels: HashMap::new(),
+            signature: None,
+        };
+
+        // 计算规范字节并进行签名
+        let canonical_bytes = manifest.compute_canonical_bytes().unwrap();
+        let sig = signing_key.sign(&canonical_bytes);
+        manifest.signature = Some(BASE64.encode(sig.to_bytes()));
+
+        // 验证签名通过
+        assert!(manifest.verify_signature(&[pubkey_b64]).is_ok());
+
+        // 篡改清单版本号后验签失败
+        manifest.version = Version::parse("3.0.1").unwrap();
+        assert!(manifest.verify_signature(&["invalid_key"]).is_err());
     }
 }
