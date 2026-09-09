@@ -49,7 +49,7 @@ struct ReleaseArgs {
     target: String,
 
     /// 更新包物理文件路径（例如 ./dist/myapp-1.2.0-setup.exe）
-    #[arg(long)]
+    #[arg(long, visible_alias = "package-path")]
     package: PathBuf,
 
     /// 更新包类型（binary / archive / installer）
@@ -61,7 +61,7 @@ struct ReleaseArgs {
     url: String,
 
     /// Ed25519 私钥文件路径（若不提供则跳过数字签名）
-    #[arg(short, long)]
+    #[arg(short, long, visible_alias = "key-path")]
     key: Option<PathBuf>,
 
     /// 版本更新日志说明内容

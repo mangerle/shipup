@@ -109,9 +109,9 @@ shipup-cli keygen -o ./keys
 shipup-cli release \
   --version 1.1.0 \
   --target x86_64-pc-windows-msvc \
-  --package-path ./target/release/app.exe \
+  --package ./target/release/app.exe \
   --url https://updates.example.com/downloads/app-1.1.0.exe \
-  --key-path ./keys/ed25519.key \
+  --key ./keys/ed25519.key \
   --package-type binary \
   --manifest ./dist/latest.json
 ```
