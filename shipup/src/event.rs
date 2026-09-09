@@ -46,4 +46,25 @@ pub enum UpdateEvent {
 
     /// 更新全部安装替换完成，已进入就绪重启状态
     ReadyToRestart,
+
+    /// 网络请求或下载失败重试中
+    Retrying {
+        /// 当前重试轮次序号（从 1 开始）
+        attempt: u32,
+        /// 配置的最大允许重试次数
+        max_retries: u32,
+        /// 本次重试前的退避等待时长
+        delay: Duration,
+        /// 导致触发重试的具体错误原因描述
+        error: String,
+    },
+
+    /// 更新生命周期遭遇不可恢复的错误而中断
+    Failed {
+        /// 失败原因描述
+        reason: String,
+    },
+
+    /// 更新生命周期已全部圆满完成（包含校验、安装与状态确认）
+    Completed,
 }

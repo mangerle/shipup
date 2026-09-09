@@ -586,8 +586,16 @@ impl Update {
             expected_checksum: self.release.package.checksum.as_deref(),
         };
 
-        download::download_file_blocking(&client, &options, &mut callback)?;
-        self.verify_downloaded_payload(&temp_download_path, &mut callback)?;
+        if let Err(e) = (|| -> Result<()> {
+            download::download_file_blocking(&client, &options, &mut callback)?;
+            self.verify_downloaded_payload(&temp_download_path, &mut callback)?;
+            Ok(())
+        })() {
+            callback(UpdateEvent::Failed {
+                reason: e.to_string(),
+            });
+            return Err(e);
+        }
 
         Ok(DownloadedUpdate {
             current_version: self.current_version.clone(),
@@ -677,30 +685,42 @@ impl Update {
             expected_checksum: self.release.package.checksum.as_deref(),
         };
 
-        download::download_file_async(&client, &options, &mut callback).await?;
+        let download_and_verify_result: Result<()> = async {
+            download::download_file_async(&client, &options, &mut callback).await?;
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let this = self.clone();
-        let target_temp_path = temp_download_path.clone();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let this = self.clone();
+            let target_temp_path = temp_download_path.clone();
 
-        let blocking_handle = tokio::task::spawn_blocking(move || {
-            this.verify_downloaded_payload(&target_temp_path, &mut |event| {
-                let _ = tx.send(event);
-            })
-        });
+            let blocking_handle = tokio::task::spawn_blocking(move || {
+                this.verify_downloaded_payload(&target_temp_path, &mut |event| {
+                    let _ = tx.send(event);
+                })
+            });
 
-        while let Some(event) = rx.recv().await {
-            callback(event);
-        }
-
-        match blocking_handle.await {
-            Ok(res) => res?,
-            Err(join_err) => {
-                return Err(UpdateError::SelfReplace(format!(
-                    "后台签名校验任务异常中止: {}",
-                    join_err
-                )));
+            while let Some(event) = rx.recv().await {
+                callback(event);
             }
+
+            match blocking_handle.await {
+                Ok(res) => res?,
+                Err(join_err) => {
+                    return Err(UpdateError::SelfReplace(format!(
+                        "后台签名校验任务异常中止: {}",
+                        join_err
+                    )));
+                }
+            }
+
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = download_and_verify_result {
+            callback(UpdateEvent::Failed {
+                reason: e.to_string(),
+            });
+            return Err(e);
         }
 
         Ok(DownloadedUpdate {
@@ -865,7 +885,18 @@ impl DownloadedUpdate {
     where
         F: FnMut(UpdateEvent),
     {
-        apply_downloaded_payload(&self.release, &self.downloaded_path, &mut callback)
+        match apply_downloaded_payload(&self.release, &self.downloaded_path, &mut callback) {
+            Ok(()) => {
+                callback(UpdateEvent::Completed);
+                Ok(())
+            }
+            Err(e) => {
+                callback(UpdateEvent::Failed {
+                    reason: e.to_string(),
+                });
+                Err(e)
+            }
+        }
     }
 }
 

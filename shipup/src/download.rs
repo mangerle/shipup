@@ -224,6 +224,12 @@ where
                     attempts,
                     options.max_retries
                 );
+                event_callback(UpdateEvent::Retrying {
+                    attempt: attempts,
+                    max_retries: options.max_retries,
+                    delay: backoff,
+                    error: e.to_string(),
+                });
                 std::thread::sleep(backoff);
             }
         }
@@ -409,6 +415,12 @@ where
                     attempts,
                     options.max_retries
                 );
+                event_callback(UpdateEvent::Retrying {
+                    attempt: attempts,
+                    max_retries: options.max_retries,
+                    delay: backoff,
+                    error: e.to_string(),
+                });
                 tokio::time::sleep(backoff).await;
             }
         }
@@ -679,5 +691,36 @@ mod tests {
         }
 
         let _ = fs::remove_file(&test_file);
+    }
+
+    #[test]
+    fn test_update_event_variants_retrying_failed_completed() {
+        let retrying_ev = UpdateEvent::Retrying {
+            attempt: 1,
+            max_retries: 3,
+            delay: Duration::from_millis(500),
+            error: "连接超时".to_string(),
+        };
+        let failed_ev = UpdateEvent::Failed {
+            reason: "哈希校验失败".to_string(),
+        };
+        let completed_ev = UpdateEvent::Completed;
+
+        assert_eq!(
+            retrying_ev,
+            UpdateEvent::Retrying {
+                attempt: 1,
+                max_retries: 3,
+                delay: Duration::from_millis(500),
+                error: "连接超时".to_string(),
+            }
+        );
+        assert_eq!(
+            failed_ev,
+            UpdateEvent::Failed {
+                reason: "哈希校验失败".to_string()
+            }
+        );
+        assert_eq!(completed_ev, UpdateEvent::Completed);
     }
 }
