@@ -115,4 +115,15 @@ jobs:
       - name: 执行代码覆盖率测试并导出 LCOV 报告
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
 
+  deny:
+    name: 依赖许可证与安全合规审计 (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 运行 cargo-deny 合规门禁扫描
+        uses: EmbarkStudios/cargo-deny-action@v2
+
+
 
