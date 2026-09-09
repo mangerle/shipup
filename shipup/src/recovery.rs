@@ -14,6 +14,9 @@ pub const UPDATE_STATE_FILENAME: &str = ".shipup.state";
 /// 默认容忍的最大崩溃启动尝试次数
 pub const DEFAULT_MAX_CRASH_ATTEMPTS: u32 = 2;
 
+/// 启动崩溃判定时间窗口（秒），两次启动间隔超过此窗口即视为上次已平稳运行
+pub const CRASH_WINDOW_THRESHOLD_SECS: u64 = 30;
+
 /// 更新过程状态标记实体
 ///
 /// # 设计原理
@@ -30,6 +33,9 @@ pub struct UpdateState {
     pub updated_at: u64,
     /// 启动尝试崩溃计数器
     pub launch_attempts: u32,
+    /// 上次尝试启动的 Unix 秒时间戳
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at: Option<u64>,
 }
 
 /// 启动健康检查与自愈判定结果
@@ -73,6 +79,7 @@ pub fn record_update_state(
         backup_path: backup_path.to_path_buf(),
         updated_at,
         launch_attempts: 0,
+        last_attempt_at: None,
     };
 
     let json = serde_json::to_string_pretty(&state)
@@ -123,6 +130,25 @@ pub fn check_and_recover(
         }
     };
 
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if let Some(last_at) = state.last_attempt_at {
+        let elapsed = now_secs.saturating_sub(last_at);
+        if elapsed >= CRASH_WINDOW_THRESHOLD_SECS {
+            log::info!(
+                "新版本距上次启动已平稳度过健康观察期 ({} 秒 >= {} 秒)，自动完成升级确认",
+                elapsed,
+                CRASH_WINDOW_THRESHOLD_SECS
+            );
+            let _ = confirm_update_success_in_dir(state_dir);
+            return Ok(HealthCheckStatus::Normal);
+        }
+    }
+
+    state.last_attempt_at = Some(now_secs);
     state.launch_attempts = state.launch_attempts.saturating_add(1);
 
     if state.launch_attempts > max_allowed_crashes {
@@ -375,6 +401,43 @@ mod tests {
         assert!(!dummy_backup.exists());
         // 状态标记已被自动清理
         assert!(!temp_dir.join(UPDATE_STATE_FILENAME).exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_healthy_interval_clears_recovery_state() {
+        let temp_dir = env::temp_dir().join(format!("shipup_healthy_test_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let dummy_backup = temp_dir.join("app.shipup.old");
+        fs::write(&dummy_backup, b"old-binary").unwrap();
+        let dummy_exe = temp_dir.join("app.exe");
+        fs::write(&dummy_exe, b"new-binary").unwrap();
+
+        let state_file = temp_dir.join(UPDATE_STATE_FILENAME);
+        let past_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(60); // 模拟 60 秒前启动过
+
+        let state = UpdateState {
+            target_version: "2.1.0".to_string(),
+            backup_path: dummy_backup.clone(),
+            updated_at: past_time * 1000,
+            launch_attempts: 1,
+            last_attempt_at: Some(past_time),
+        };
+        fs::write(&state_file, serde_json::to_string(&state).unwrap()).unwrap();
+
+        // 执行检查：由于距上次启动已过去 60 秒（>= 30 秒阈值），判定平稳运行，自动确认成功
+        let status = check_and_recover(&temp_dir, &dummy_exe, 2).unwrap();
+        assert_eq!(status, HealthCheckStatus::Normal);
+
+        // 状态标记与历史备份均被自动清理
+        assert!(!state_file.exists());
+        assert!(!dummy_backup.exists());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
