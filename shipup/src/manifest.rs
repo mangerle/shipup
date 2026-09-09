@@ -3,7 +3,7 @@
 use crate::error::{Result, UpdateError};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -139,7 +139,7 @@ pub struct ChannelInfo {
 
     /// 针对不同平台的发布包字典
     #[serde(default)]
-    pub packages: HashMap<String, PackageInfo>,
+    pub packages: BTreeMap<String, PackageInfo>,
 
     /// 灰度放量比例（0..=100，若未配置则默认全量放行）
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,7 +150,7 @@ pub struct ChannelInfo {
 ///
 /// # 设计原理
 /// - **实现初衷**：作为更新源与客户端通信的唯一元数据契约，统一承载版本比对、通道路由与平台发布包分发。
-/// - **核心优势**：单文件支持全平台多通道部署，兼容性高且支持离线测试验证。
+/// - **核心优势**：单文件支持全平台多通道部署，兼容性高且支持离线测试验证；采用 BTreeMap 确保序列化字节跨进程确定性。
 /// - **代价与局限**：所有平台包汇总于同一文件，当支持平台极端庞大时文件体积稍有膨胀（通常仍 < 10KB）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -173,13 +173,13 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 
-    /// 针对不同平台的发布包字典
+    /// 针对不同平台的发布包字典（使用 BTreeMap 保证序列化顺序确定性）
     #[serde(default)]
-    pub packages: HashMap<String, PackageInfo>,
+    pub packages: BTreeMap<String, PackageInfo>,
 
-    /// 多通道扩展块字典（如 "beta", "alpha", "nightly"）
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub channels: HashMap<String, ChannelInfo>,
+    /// 多通道扩展块字典（如 "beta", "alpha", "nightly"，使用 BTreeMap 保证序列化顺序确定性）
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub channels: BTreeMap<String, ChannelInfo>,
 
     /// Manifest 元数据自身的数字签名（Base64 编码，可选）
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -335,7 +335,7 @@ impl Manifest {
 
 /// 在平台包字典中匹配目标 Triple 或别名
 fn match_package<'a>(
-    packages: &'a HashMap<String, PackageInfo>,
+    packages: &'a BTreeMap<String, PackageInfo>,
     target: &str,
 ) -> Option<&'a PackageInfo> {
     // 首先完全精确匹配
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_channel_resolution_strictness() {
-        let mut packages = HashMap::new();
+        let mut packages = BTreeMap::new();
         packages.insert(
             "x86_64-pc-windows-msvc".to_string(),
             PackageInfo {
@@ -499,8 +499,8 @@ mod tests {
             },
         );
 
-        let mut channels = HashMap::new();
-        let mut beta_packages = HashMap::new();
+        let mut channels = BTreeMap::new();
+        let mut beta_packages = BTreeMap::new();
         beta_packages.insert(
             "x86_64-unknown-linux-gnu".to_string(),
             PackageInfo {
@@ -632,8 +632,8 @@ mod tests {
             force_update: false,
             pub_date: None,
             notes: Some("清单签名测试".to_string()),
-            packages: HashMap::new(),
-            channels: HashMap::new(),
+            packages: BTreeMap::new(),
+            channels: BTreeMap::new(),
             signature: None,
             rollout_percentage: None,
         };
@@ -649,5 +649,74 @@ mod tests {
         // 篡改清单版本号后验签失败
         manifest.version = Version::parse("3.0.1").unwrap();
         assert!(manifest.verify_signature(&["invalid_key"]).is_err());
+    }
+
+    #[test]
+    fn test_cross_instance_manifest_canonical_determinism_and_verification() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let mut signing_seed = [0u8; 32];
+        getrandom::fill(&mut signing_seed).unwrap();
+        let signing_key = SigningKey::from_bytes(&signing_seed);
+        let verifying_key = signing_key.verifying_key();
+        let pubkey_b64 = BASE64.encode(verifying_key.to_bytes());
+
+        // 模拟包含多个乱序平台与通道的 JSON 清单文本
+        let manifest_json = r#"{
+            "version": "1.5.0",
+            "force_update": false,
+            "packages": {
+                "x86_64-pc-windows-msvc": {
+                    "url": "https://example.com/app-win-x64.exe",
+                    "package_type": "binary"
+                },
+                "aarch64-unknown-linux-gnu": {
+                    "url": "https://example.com/app-linux-arm64.tar.gz",
+                    "package_type": "archive"
+                },
+                "x86_64-apple-darwin": {
+                    "url": "https://example.com/app-mac-x64.zip",
+                    "package_type": "archive"
+                },
+                "aarch64-apple-darwin": {
+                    "url": "https://example.com/app-mac-arm64.zip",
+                    "package_type": "archive"
+                }
+            },
+            "channels": {
+                "beta": {
+                    "version": "1.6.0-beta.1",
+                    "force_update": false,
+                    "packages": {
+                        "x86_64-pc-windows-msvc": {
+                            "url": "https://example.com/app-beta.exe",
+                            "package_type": "binary"
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        // 跨实例反序列化实例 A 与实例 B
+        let instance_a: Manifest = serde_json::from_str(manifest_json).unwrap();
+        let mut instance_b: Manifest = serde_json::from_str(manifest_json).unwrap();
+
+        // 断言规范化字节序列跨实例具备绝对确定性
+        let bytes_a = instance_a.compute_canonical_bytes().unwrap();
+        let bytes_b = instance_b.compute_canonical_bytes().unwrap();
+        assert_eq!(bytes_a, bytes_b, "不同实例生成的规范化字节序列必须完全一致");
+
+        // 由实例 A 的字节生成数字签名
+        let sig = signing_key.sign(&bytes_a);
+        let sig_b64 = BASE64.encode(sig.to_bytes());
+
+        // 将签名赋予新实例 B，验证其实例跨越反序列化仍可成功验签
+        instance_b.signature = Some(sig_b64);
+        assert!(
+            instance_b.verify_signature(&[pubkey_b64]).is_ok(),
+            "跨实例反序列化后验签必须成功通过"
+        );
     }
 }

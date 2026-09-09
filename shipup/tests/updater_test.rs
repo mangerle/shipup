@@ -7,11 +7,11 @@ use semver::Version;
 use shipup::Updater;
 use shipup::manifest::{ChannelInfo, Manifest, PackageInfo, PackageType};
 use shipup::signature::{verify_ed25519, verify_sha256};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 #[test]
 fn test_manifest_serialization_and_routing() {
-    let mut packages = HashMap::new();
+    let mut packages = BTreeMap::new();
     packages.insert(
         "x86_64-pc-windows-msvc".to_string(),
         PackageInfo {
@@ -27,8 +27,8 @@ fn test_manifest_serialization_and_routing() {
         },
     );
 
-    let mut channels = HashMap::new();
-    let mut beta_packages = HashMap::new();
+    let mut channels = BTreeMap::new();
+    let mut beta_packages = BTreeMap::new();
     beta_packages.insert(
         "x86_64-pc-windows-msvc".to_string(),
         PackageInfo {

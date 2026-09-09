@@ -8,7 +8,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use semver::Version;
 use sha2::{Digest, Sha256};
 use shipup::{ChannelInfo, InstallMode, Manifest, PackageInfo, PackageType};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -420,7 +420,7 @@ fn update_manifest_entries(
                 force_update: args.force_update,
                 pub_date: Some(entry.pub_date.clone()),
                 notes: args.notes.clone(),
-                packages: HashMap::new(),
+                packages: BTreeMap::new(),
                 rollout_percentage: args.rollout_percentage,
             });
 
@@ -686,8 +686,8 @@ fn handle_batch_release(config_path: &Path, default_manifest_path: &Path) -> Res
             force_update: batch_config.force_update,
             pub_date: Some(pub_date.clone()),
             notes: batch_config.notes.clone(),
-            packages: HashMap::new(),
-            channels: HashMap::new(),
+            packages: BTreeMap::new(),
+            channels: BTreeMap::new(),
             signature: None,
             rollout_percentage: batch_config.rollout_percentage,
         }
@@ -1050,8 +1050,8 @@ fn load_or_init_manifest(
             force_update: args.force_update,
             pub_date: Some(entry.pub_date.clone()),
             notes: args.notes.clone(),
-            packages: HashMap::new(),
-            channels: HashMap::new(),
+            packages: BTreeMap::new(),
+            channels: BTreeMap::new(),
             signature: None,
             rollout_percentage: args.rollout_percentage,
         })
@@ -1126,8 +1126,8 @@ mod tests {
             force_update: false,
             pub_date: Some("2026-09-01T00:00:00Z".to_string()),
             notes: Some("版本 1.2.0".to_string()),
-            packages: HashMap::new(),
-            channels: HashMap::new(),
+            packages: BTreeMap::new(),
+            channels: BTreeMap::new(),
             signature: Some("old_signature".to_string()),
             rollout_percentage: None,
         };

@@ -1427,11 +1427,16 @@ mod tests {
             }
         }"#;
 
+        let temp_pref =
+            std::env::temp_dir().join(format!("test_pref_snooze_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&temp_pref);
+
         let updater = UpdaterBuilder::new()
             .current_version("1.0.0")
             .unwrap()
             .target("x86_64-pc-windows-msvc")
             .manifest_url("https://example.com/manifest.json")
+            .preference_path(&temp_pref)
             .require_signature(false)
             .build()
             .unwrap();
@@ -1466,6 +1471,7 @@ mod tests {
         // 6. 清空偏好后，更新再次恢复
         updater.clear_preferences().unwrap();
         assert!(updater.evaluate_manifest(manifest_json).unwrap().is_some());
+        let _ = std::fs::remove_file(&temp_pref);
     }
 
     #[test]
