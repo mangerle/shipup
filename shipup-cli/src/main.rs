@@ -1,5 +1,6 @@
 // shipup-cli 跨平台自更新系统 - 发布端打包与签名命令行工具
 
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand};
@@ -97,7 +98,7 @@ struct ReleaseArgs {
     manifest: PathBuf,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
@@ -114,12 +115,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// 执行密钥对生成
-fn handle_keygen(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_keygen(out_dir: &Path) -> Result<()> {
     log::info!("开始生成 Ed25519 密钥对，输出目录: {}", out_dir.display());
-    fs::create_dir_all(out_dir)?;
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("创建密钥输出目录失败: {}", out_dir.display()))?;
 
     let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed)?;
+    getrandom::fill(&mut seed).context("获取安全随机数种子失败")?;
     let signing_key = SigningKey::from_bytes(&seed);
     let verifying_key = signing_key.verifying_key();
 
@@ -129,8 +131,10 @@ fn handle_keygen(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let key_path = out_dir.join("ed25519.key");
     let pub_path = out_dir.join("ed25519.pub");
 
-    fs::write(&key_path, &private_key_b64)?;
-    fs::write(&pub_path, &public_key_b64)?;
+    fs::write(&key_path, &private_key_b64)
+        .with_context(|| format!("写入私钥文件失败: {}", key_path.display()))?;
+    fs::write(&pub_path, &public_key_b64)
+        .with_context(|| format!("写入公钥文件失败: {}", pub_path.display()))?;
 
     log::info!("Ed25519 密钥对已成功生成");
     log::info!("  私钥文件（请妥善保密）: {}", key_path.display());
@@ -144,8 +148,9 @@ fn handle_keygen(out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn compute_payload_integrity(
     package_path: &Path,
     key_path: Option<&Path>,
-) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
-    let package_bytes = fs::read(package_path)?;
+) -> Result<(String, Option<String>)> {
+    let package_bytes = fs::read(package_path)
+        .with_context(|| format!("读取发布包文件失败: {}", package_path.display()))?;
 
     let mut hasher = Sha256::new();
     hasher.update(&package_bytes);
@@ -158,12 +163,15 @@ fn compute_payload_integrity(
     let checksum = format!("sha256:{hex}");
 
     let signature = if let Some(kp) = key_path {
-        let key_str = fs::read_to_string(kp)?;
-        let key_bytes = BASE64.decode(key_str.trim())?;
+        let key_str = fs::read_to_string(kp)
+            .with_context(|| format!("读取私钥文件失败: {}", kp.display()))?;
+        let key_bytes = BASE64
+            .decode(key_str.trim())
+            .with_context(|| format!("解码 Base64 私钥失败: {}", kp.display()))?;
         let key_array: [u8; 32] = key_bytes
             .as_slice()
             .try_into()
-            .map_err(|_| "私钥格式不正确，期望 32 字节")?;
+            .map_err(|_| anyhow!("私钥字节长度不正确: 期望 32 字节，实际为 {} 字节", key_bytes.len()))?;
         let signing_key = SigningKey::from_bytes(&key_array);
         let sig = signing_key.sign(&package_bytes);
         Some(BASE64.encode(sig.to_bytes()))
@@ -227,12 +235,14 @@ fn update_manifest_entries(
 }
 
 /// 执行发布包签名与 Manifest 合并
-fn handle_release(args: &ReleaseArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let version = Version::parse(&args.version)?;
-    let parsed_pkg_type = PackageType::from_str(&args.package_type)?;
+fn handle_release(args: &ReleaseArgs) -> Result<()> {
+    let version = Version::parse(&args.version)
+        .with_context(|| format!("解析目标版本号 '{}' 失败，请确保符合 SemVer 规范", args.version))?;
+    let parsed_pkg_type = PackageType::from_str(&args.package_type)
+        .with_context(|| format!("解析更新包类型 '{}' 失败，可选: binary, archive, installer", args.package_type))?;
 
     let min_supported_version = match args.min_supported_version {
-        Some(ref v) => Some(Version::parse(v)?),
+        Some(ref v) => Some(Version::parse(v).with_context(|| format!("解析最低支持版本号 '{}' 失败", v))?),
         None => None,
     };
 
@@ -270,10 +280,12 @@ fn load_or_init_manifest(
     manifest_path: &Path,
     args: &ReleaseArgs,
     entry: &ManifestReleaseEntry,
-) -> Result<Manifest, Box<dyn std::error::Error>> {
+) -> Result<Manifest> {
     if manifest_path.exists() {
-        let content = fs::read_to_string(manifest_path)?;
-        Ok(serde_json::from_str::<Manifest>(&content)?)
+        let content = fs::read_to_string(manifest_path)
+            .with_context(|| format!("读取已有 Manifest 文件失败: {}", manifest_path.display()))?;
+        serde_json::from_str::<Manifest>(&content)
+            .with_context(|| format!("反序列化 Manifest JSON 失败: {}", manifest_path.display()))
     } else {
         Ok(Manifest {
             version: entry.version.clone(),
@@ -288,16 +300,16 @@ fn load_or_init_manifest(
 }
 
 /// 将格式化后的 Manifest JSON 写入磁盘目标路径
-fn save_manifest_file(
-    manifest_path: &Path,
-    manifest: &Manifest,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let json_output = serde_json::to_string_pretty(manifest)?;
+fn save_manifest_file(manifest_path: &Path, manifest: &Manifest) -> Result<()> {
+    let json_output = serde_json::to_string_pretty(manifest)
+        .context("序列化 Manifest 为格式化 JSON 失败")?;
     if let Some(parent) = manifest_path.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建 Manifest 输出父目录失败: {}", parent.display()))?;
     }
-    fs::write(manifest_path, json_output)?;
+    fs::write(manifest_path, json_output)
+        .with_context(|| format!("写入 Manifest 文件失败: {}", manifest_path.display()))?;
     Ok(())
 }
