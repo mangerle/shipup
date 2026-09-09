@@ -81,36 +81,38 @@ impl AutoPollOptions {
 /// 后台轮询控制器句柄
 ///
 /// # 设计原理
-/// - **实现初衷**：为宿主提供对常驻后台任务的取消控制能力。
-/// - **核心优势**：基于原子布尔标志位，具备 `Drop` 自动析构安全；无死锁风险。
+/// - **实现初衷**：为宿主提供对常驻后台巡检与单次下载的精准取消控制能力。
+/// - **核心优势**：基于独立原子布尔标志位解耦调度器与单次下载生命周期；句柄支持自由传递与丢弃，绝不在句柄析构时误杀常驻任务。
 #[derive(Debug, Clone)]
 pub struct AutoPollerHandle {
     stop_flag: Arc<AtomicBool>,
+    download_cancel_flag: Arc<AtomicBool>,
 }
 
 impl AutoPollerHandle {
-    pub(crate) fn new(stop_flag: Arc<AtomicBool>) -> Self {
-        Self { stop_flag }
+    pub(crate) fn new(stop_flag: Arc<AtomicBool>, download_cancel_flag: Arc<AtomicBool>) -> Self {
+        Self {
+            stop_flag,
+            download_cancel_flag,
+        }
     }
 
-    /// 停止后台轮询任务
+    /// 停止后台轮询任务与所有在途下载
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::Relaxed);
+        self.download_cancel_flag.store(true, Ordering::Relaxed);
         log::info!("已请求中止后台自更新轮询工作器");
+    }
+
+    /// 仅取消当前正在执行的单次静默下载，不终止周期性轮询调度
+    pub fn cancel_current_download(&self) {
+        self.download_cancel_flag.store(true, Ordering::Relaxed);
+        log::info!("已请求取消当前正在进行的静默下载任务");
     }
 
     /// 检查后台任务是否已被请求停止
     pub fn is_stopped(&self) -> bool {
         self.stop_flag.load(Ordering::Relaxed)
-    }
-}
-
-impl Drop for AutoPollerHandle {
-    fn drop(&mut self) {
-        // 当持有者释放全部引用且仅剩自身时，保障退出
-        if Arc::strong_count(&self.stop_flag) <= 2 {
-            self.stop_flag.store(true, Ordering::Relaxed);
-        }
     }
 }
 
@@ -141,6 +143,8 @@ where
 {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop_flag);
+    let download_cancel_flag = Arc::new(AtomicBool::new(false));
+    let worker_download_cancel = Arc::clone(&download_cancel_flag);
 
     std::thread::Builder::new()
         .name("shipup-poller".to_string())
@@ -161,14 +165,14 @@ where
                         Ok(Some(update)) => {
                             if options.silent_download {
                                 callback(AutoPollEvent::Downloading(update.clone()));
-                                let cancel_token = Some(Arc::clone(&worker_stop));
+                                worker_download_cancel.store(false, Ordering::Relaxed);
+                                let cancel_token = Some(Arc::clone(&worker_download_cancel));
                                 match update.download_with_cancellation(cancel_token, |_| {}) {
                                     Ok(downloaded) => {
                                         callback(AutoPollEvent::UpdateReady(downloaded))
                                     }
                                     Err(UpdateError::Cancelled) => {
-                                        log::info!("后台静默下载更新包已被主动取消");
-                                        break;
+                                        log::info!("后台静默下载更新包已被取消，保持周期轮询调度");
                                     }
                                     Err(e) => callback(AutoPollEvent::Error(e)),
                                 }
@@ -195,7 +199,7 @@ where
             log::info!("后台自更新轮询工作线程已优雅退出");
         })?;
 
-    Ok(AutoPollerHandle::new(stop_flag))
+    Ok(AutoPollerHandle::new(stop_flag, download_cancel_flag))
 }
 
 #[cfg(feature = "async")]
@@ -222,6 +226,8 @@ where
 {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop_flag);
+    let download_cancel_flag = Arc::new(AtomicBool::new(false));
+    let worker_download_cancel = Arc::clone(&download_cancel_flag);
 
     tokio::spawn(async move {
         log::info!("后台异步轮询任务已启动，检测间隔: {:?}", options.interval);
@@ -237,15 +243,15 @@ where
                     Ok(Some(update)) => {
                         if options.silent_download {
                             callback(AutoPollEvent::Downloading(update.clone()));
-                            let cancel_token = Some(Arc::clone(&worker_stop));
+                            worker_download_cancel.store(false, Ordering::Relaxed);
+                            let cancel_token = Some(Arc::clone(&worker_download_cancel));
                             match update
                                 .download_with_cancellation_async(cancel_token, |_| {})
                                 .await
                             {
                                 Ok(downloaded) => callback(AutoPollEvent::UpdateReady(downloaded)),
                                 Err(UpdateError::Cancelled) => {
-                                    log::info!("后台异步静默下载更新包已被主动取消");
-                                    break;
+                                    log::info!("后台异步静默下载更新包已被取消，保持周期轮询调度");
                                 }
                                 Err(e) => callback(AutoPollEvent::Error(e)),
                             }
@@ -271,7 +277,7 @@ where
         log::info!("后台异步自更新轮询任务已优雅退出");
     });
 
-    AutoPollerHandle::new(stop_flag)
+    AutoPollerHandle::new(stop_flag, download_cancel_flag)
 }
 
 #[cfg(test)]
@@ -293,9 +299,14 @@ mod tests {
     #[test]
     fn test_poller_handle_stop_flag() {
         let flag = Arc::new(AtomicBool::new(false));
-        let handle = AutoPollerHandle::new(Arc::clone(&flag));
+        let cancel_dl = Arc::new(AtomicBool::new(false));
+        let handle = AutoPollerHandle::new(Arc::clone(&flag), Arc::clone(&cancel_dl));
 
         assert!(!handle.is_stopped());
+        handle.cancel_current_download();
+        assert!(cancel_dl.load(Ordering::Relaxed));
+        assert!(!handle.is_stopped()); // 仅取消单次下载不终止整个轮询工作器
+
         handle.stop();
         assert!(handle.is_stopped());
         assert!(flag.load(Ordering::Relaxed));
