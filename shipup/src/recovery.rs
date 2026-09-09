@@ -151,12 +151,12 @@ fn execute_rollback(state: &UpdateState, current_exe: &Path, state_file: &Path) 
         );
 
         let is_running_exe = env::current_exe()
-            .map(|running| {
-                match (running.canonicalize(), current_exe.canonicalize()) {
+            .map(
+                |running| match (running.canonicalize(), current_exe.canonicalize()) {
                     (Ok(p1), Ok(p2)) => p1 == p2,
                     _ => running == current_exe,
-                }
-            })
+                },
+            )
             .unwrap_or(false);
 
         if is_running_exe {
@@ -169,7 +169,10 @@ fn execute_rollback(state: &UpdateState, current_exe: &Path, state_file: &Path) 
                 let _ = fs::remove_file(current_exe);
             }
             if let Err(e) = fs::copy(&state.backup_path, current_exe) {
-                return Err(UpdateError::SelfReplace(format!("还原备份文件到目标可执行文件失败: {}", e)));
+                return Err(UpdateError::SelfReplace(format!(
+                    "还原备份文件到目标可执行文件失败: {}",
+                    e
+                )));
             }
         }
         let _ = fs::remove_file(&state.backup_path);

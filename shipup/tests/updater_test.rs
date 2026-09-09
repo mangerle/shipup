@@ -255,7 +255,8 @@ fn test_invalid_signature_and_checksum_mismatch() {
 
     let payload = b"legitimate application data";
     // 篡改校验值
-    let invalid_checksum = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    let invalid_checksum =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
     let chk_res = verify_sha256(payload, invalid_checksum);
     assert!(matches!(chk_res, Err(UpdateError::ChecksumMismatch { .. })));
 

@@ -117,7 +117,10 @@ impl Updater {
     /// # Errors
     /// 当网络请求失败、HTTP 响应非 2xx 或 JSON 反序列化失败时返回对应错误。
     pub fn check(&self) -> Result<Option<Update>> {
-        log::info!("正在发起同步更新检查，远端地址: {}", self.inner.manifest_url);
+        log::info!(
+            "正在发起同步更新检查，远端地址: {}",
+            self.inner.manifest_url
+        );
         let client = build_blocking_http_client(
             self.inner.config.timeout,
             self.inner.config.user_agent.as_deref(),
@@ -154,7 +157,10 @@ impl Updater {
     /// # Errors
     /// 当异步网络请求失败或 Manifest 解析错误时返回相应错误。
     pub async fn check_async(&self) -> Result<Option<Update>> {
-        log::info!("正在发起异步更新检查，远端地址: {}", self.inner.manifest_url);
+        log::info!(
+            "正在发起异步更新检查，远端地址: {}",
+            self.inner.manifest_url
+        );
         let client = build_async_http_client(
             self.inner.config.timeout,
             self.inner.config.user_agent.as_deref(),
@@ -551,12 +557,10 @@ fn parse_header_map(headers: &HashMap<String, String>) -> Result<Option<HeaderMa
     }
     let mut header_map = HeaderMap::with_capacity(headers.len());
     for (k, v) in headers {
-        let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
-            UpdateError::Network(format!("无效的 HTTP 请求头名称 '{}': {}", k, e))
-        })?;
-        let val = HeaderValue::from_str(v).map_err(|e| {
-            UpdateError::Network(format!("无效的 HTTP 请求头数值 '{}': {}", v, e))
-        })?;
+        let name = HeaderName::from_bytes(k.as_bytes())
+            .map_err(|e| UpdateError::Network(format!("无效的 HTTP 请求头名称 '{}': {}", k, e)))?;
+        let val = HeaderValue::from_str(v)
+            .map_err(|e| UpdateError::Network(format!("无效的 HTTP 请求头数值 '{}': {}", v, e)))?;
         header_map.insert(name, val);
     }
     Ok(Some(header_map))

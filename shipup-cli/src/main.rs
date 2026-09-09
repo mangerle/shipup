@@ -168,10 +168,12 @@ fn compute_payload_integrity(
         let key_bytes = BASE64
             .decode(key_str.trim())
             .with_context(|| format!("解码 Base64 私钥失败: {}", kp.display()))?;
-        let key_array: [u8; 32] = key_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("私钥字节长度不正确: 期望 32 字节，实际为 {} 字节", key_bytes.len()))?;
+        let key_array: [u8; 32] = key_bytes.as_slice().try_into().map_err(|_| {
+            anyhow!(
+                "私钥字节长度不正确: 期望 32 字节，实际为 {} 字节",
+                key_bytes.len()
+            )
+        })?;
         let signing_key = SigningKey::from_bytes(&key_array);
         let sig = signing_key.sign(&package_bytes);
         Some(BASE64.encode(sig.to_bytes()))
@@ -218,7 +220,9 @@ fn update_manifest_entries(
         if let Some(ref n) = args.notes {
             ch_entry.notes = Some(n.clone());
         }
-        ch_entry.packages.insert(args.target.clone(), entry.package_info);
+        ch_entry
+            .packages
+            .insert(args.target.clone(), entry.package_info);
     } else {
         manifest.version = entry.version;
         if entry.min_supported_version.is_some() {
@@ -230,19 +234,31 @@ fn update_manifest_entries(
         if let Some(ref n) = args.notes {
             manifest.notes = Some(n.clone());
         }
-        manifest.packages.insert(args.target.clone(), entry.package_info);
+        manifest
+            .packages
+            .insert(args.target.clone(), entry.package_info);
     }
 }
 
 /// 执行发布包签名与 Manifest 合并
 fn handle_release(args: &ReleaseArgs) -> Result<()> {
-    let version = Version::parse(&args.version)
-        .with_context(|| format!("解析目标版本号 '{}' 失败，请确保符合 SemVer 规范", args.version))?;
-    let parsed_pkg_type = PackageType::from_str(&args.package_type)
-        .with_context(|| format!("解析更新包类型 '{}' 失败，可选: binary, archive, installer", args.package_type))?;
+    let version = Version::parse(&args.version).with_context(|| {
+        format!(
+            "解析目标版本号 '{}' 失败，请确保符合 SemVer 规范",
+            args.version
+        )
+    })?;
+    let parsed_pkg_type = PackageType::from_str(&args.package_type).with_context(|| {
+        format!(
+            "解析更新包类型 '{}' 失败，可选: binary, archive, installer",
+            args.package_type
+        )
+    })?;
 
     let min_supported_version = match args.min_supported_version {
-        Some(ref v) => Some(Version::parse(v).with_context(|| format!("解析最低支持版本号 '{}' 失败", v))?),
+        Some(ref v) => {
+            Some(Version::parse(v).with_context(|| format!("解析最低支持版本号 '{}' 失败", v))?)
+        }
         None => None,
     };
 
@@ -301,8 +317,8 @@ fn load_or_init_manifest(
 
 /// 将格式化后的 Manifest JSON 写入磁盘目标路径
 fn save_manifest_file(manifest_path: &Path, manifest: &Manifest) -> Result<()> {
-    let json_output = serde_json::to_string_pretty(manifest)
-        .context("序列化 Manifest 为格式化 JSON 失败")?;
+    let json_output =
+        serde_json::to_string_pretty(manifest).context("序列化 Manifest 为格式化 JSON 失败")?;
     if let Some(parent) = manifest_path.parent()
         && !parent.as_os_str().is_empty()
     {
