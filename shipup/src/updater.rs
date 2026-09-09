@@ -49,7 +49,7 @@ pub(crate) struct NetworkSecurityConfig {
 #[derive(Debug)]
 struct UpdaterInner {
     current_version: Version,
-    manifest_url: String,
+    endpoints: Vec<String>,
     channel: Option<String>,
     target: String,
     allow_downgrade: bool,
@@ -65,6 +65,11 @@ impl Updater {
     /// 获取 UpdaterBuilder 构建器入口
     pub fn builder() -> UpdaterBuilder {
         UpdaterBuilder::new()
+    }
+
+    /// 获取配置的更新检查端点列表切片
+    pub fn endpoints(&self) -> &[String] {
+        &self.inner.endpoints
     }
 
     pub(crate) fn new(config: UpdaterConfig) -> Self {
@@ -98,7 +103,7 @@ impl Updater {
         Self {
             inner: Arc::new(UpdaterInner {
                 current_version: config.current_version,
-                manifest_url: config.manifest_url,
+                endpoints: config.endpoints,
                 channel: config.channel,
                 target: config.target,
                 allow_downgrade: config.allow_downgrade,
@@ -119,18 +124,15 @@ impl Updater {
     }
 
     #[cfg(feature = "blocking")]
-    /// 同步阻塞检查是否有可用更新
+    /// 同步阻塞检查是否有可用更新（支持多端点自动故障转移）
     ///
     /// # 设计原理
-    /// - **实现初衷**：在单次调用中完成 HTTP 请求与 Manifest 评估，适合在后台线程直接运行。
+    /// - **实现初衷**：在单次调用中按优先级轮询所有端点，单个端点故障自动降级切换至下一个端点。
+    /// - **核心优势**：提升 CDN 与更新源的高可用性，单点宕机不会导致客户端更新中断。
     ///
     /// # Errors
-    /// 当网络请求失败、HTTP 响应非 2xx 或 JSON 反序列化失败时返回对应错误。
+    /// 当所有配置的更新端点均无法连通或解析失败时返回最终错误。
     pub fn check(&self) -> Result<Option<Update>> {
-        log::info!(
-            "正在发起同步更新检查，远端地址: {}",
-            self.inner.manifest_url
-        );
         let client = build_blocking_http_client(
             self.inner.config.timeout,
             self.inner.config.user_agent.as_deref(),
@@ -138,39 +140,49 @@ impl Updater {
             self.inner.config.proxy.as_deref(),
         )?;
 
-        let response = client
-            .get(&self.inner.manifest_url)
-            .send()
-            .map_err(|e| UpdateError::Network(format!("获取 Manifest 失败: {}", e)))?;
+        let mut last_error = None;
+        for (idx, endpoint) in self.inner.endpoints.iter().enumerate() {
+            log::info!(
+                "发起更新检查端点 [{}/{}]: {}",
+                idx + 1,
+                self.inner.endpoints.len(),
+                endpoint
+            );
 
-        let status = response.status();
-        if !status.is_success() {
-            return Err(UpdateError::HttpStatus {
-                status_code: status.as_u16(),
-                message: format!("请求 Manifest 返回异常状态码: {}", status),
-            });
+            match fetch_manifest_blocking(&client, endpoint) {
+                Ok(body) => match self.evaluate_manifest(&body) {
+                    Ok(res) => return Ok(res),
+                    Err(e) => {
+                        log::warn!(
+                            "端点 '{}' 返回的 Manifest 解析失败: {}, 尝试下一备用端点",
+                            endpoint,
+                            e
+                        );
+                        last_error = Some(e);
+                    }
+                },
+                Err(e) => {
+                    log::warn!("请求端点 '{}' 失败: {}, 尝试下一备用端点", endpoint, e);
+                    last_error = Some(e);
+                }
+            }
         }
 
-        let body = response
-            .text()
-            .map_err(|e| UpdateError::Network(format!("读取 Manifest 响应失败: {}", e)))?;
-
-        self.evaluate_manifest(&body)
+        Err(last_error.unwrap_or_else(|| {
+            UpdateError::Network("所有配置的更新源端点均无法连接访问".to_string())
+        }))
     }
 
     #[cfg(feature = "async")]
-    /// 异步检查是否有可用更新
+    /// 异步检查是否有可用更新（支持多端点自动故障转移）
     ///
     /// # 设计原理
     /// - **实现初衷**：契合 Tokio 异步运行时，无需派生额外线程即可非阻塞拉取远端 Manifest。
+    /// - **核心优势**：遇到单点故障自动异步降级切换，无死锁与跨 await 持锁风险。
     ///
     /// # Errors
-    /// 当异步网络请求失败或 Manifest 解析错误时返回相应错误。
+    /// 当所有配置的端点均异步失败时返回最终错误。
     pub async fn check_async(&self) -> Result<Option<Update>> {
-        log::info!(
-            "正在发起异步更新检查，远端地址: {}",
-            self.inner.manifest_url
-        );
         let client = build_async_http_client(
             self.inner.config.timeout,
             self.inner.config.user_agent.as_deref(),
@@ -178,26 +190,37 @@ impl Updater {
             self.inner.config.proxy.as_deref(),
         )?;
 
-        let response = client
-            .get(&self.inner.manifest_url)
-            .send()
-            .await
-            .map_err(|e| UpdateError::Network(format!("异步获取 Manifest 失败: {}", e)))?;
+        let mut last_error = None;
+        for (idx, endpoint) in self.inner.endpoints.iter().enumerate() {
+            log::info!(
+                "发起异步更新检查端点 [{}/{}]: {}",
+                idx + 1,
+                self.inner.endpoints.len(),
+                endpoint
+            );
 
-        let status = response.status();
-        if !status.is_success() {
-            return Err(UpdateError::HttpStatus {
-                status_code: status.as_u16(),
-                message: format!("请求 Manifest 返回异常状态码: {}", status),
-            });
+            match fetch_manifest_async(&client, endpoint).await {
+                Ok(body) => match self.evaluate_manifest(&body) {
+                    Ok(res) => return Ok(res),
+                    Err(e) => {
+                        log::warn!(
+                            "端点 '{}' 返回的 Manifest 解析失败: {}, 尝试下一备用端点",
+                            endpoint,
+                            e
+                        );
+                        last_error = Some(e);
+                    }
+                },
+                Err(e) => {
+                    log::warn!("异步请求端点 '{}' 失败: {}, 尝试下一备用端点", endpoint, e);
+                    last_error = Some(e);
+                }
+            }
         }
 
-        let body = response
-            .text()
-            .await
-            .map_err(|e| UpdateError::Network(format!("异步读取 Manifest 响应失败: {}", e)))?;
-
-        self.evaluate_manifest(&body)
+        Err(last_error.unwrap_or_else(|| {
+            UpdateError::Network("所有配置的更新源端点均无法连接访问".to_string())
+        }))
     }
 
     /// 解析并评估 Manifest 版本信息
@@ -662,4 +685,44 @@ fn build_async_http_client(
     builder
         .build()
         .map_err(|e| UpdateError::Network(format!("初始化异步 HTTP 客户端失败: {}", e)))
+}
+
+#[cfg(feature = "blocking")]
+fn fetch_manifest_blocking(client: &reqwest::blocking::Client, endpoint: &str) -> Result<String> {
+    let response = client
+        .get(endpoint)
+        .send()
+        .map_err(|e| UpdateError::Network(format!("连接更新端点 '{}' 失败: {}", endpoint, e)))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(UpdateError::HttpStatus {
+            status_code: status.as_u16(),
+            message: format!("端点 '{}' 返回异常 HTTP 状态码: {}", endpoint, status),
+        });
+    }
+
+    response
+        .text()
+        .map_err(|e| UpdateError::Network(format!("读取端点 '{}' 响应失败: {}", endpoint, e)))
+}
+
+#[cfg(feature = "async")]
+async fn fetch_manifest_async(client: &reqwest::Client, endpoint: &str) -> Result<String> {
+    let response = client.get(endpoint).send().await.map_err(|e| {
+        UpdateError::Network(format!("异步连接更新端点 '{}' 失败: {}", endpoint, e))
+    })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(UpdateError::HttpStatus {
+            status_code: status.as_u16(),
+            message: format!("端点 '{}' 返回异常 HTTP 状态码: {}", endpoint, status),
+        });
+    }
+
+    response
+        .text()
+        .await
+        .map_err(|e| UpdateError::Network(format!("异步读取端点 '{}' 响应失败: {}", endpoint, e)))
 }

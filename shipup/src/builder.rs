@@ -15,8 +15,8 @@ use std::time::Duration;
 pub struct UpdaterConfig {
     /// 宿主应用当前运行版本号
     pub current_version: Version,
-    /// Manifest 元数据远端下载地址
-    pub manifest_url: String,
+    /// Manifest 元数据远端下载端点列表（支持多源容灾与自动故障转移）
+    pub endpoints: Vec<String>,
     /// 目标发布通道
     pub channel: Option<String>,
     /// Ed25519 验签公钥列表（Base64 编码，支持多公钥共存与平滑轮换）
@@ -50,6 +50,11 @@ impl UpdaterConfig {
     pub fn public_key(&self) -> Option<&str> {
         self.public_keys.first().map(|s| s.as_str())
     }
+
+    /// 获取首选主端点下载地址（向后兼容接口）
+    pub fn manifest_url(&self) -> Option<&str> {
+        self.endpoints.first().map(|s| s.as_str())
+    }
 }
 
 /// 更新器链式构建器
@@ -57,11 +62,11 @@ impl UpdaterConfig {
 /// # 设计原理
 /// - **实现初衷**：采用标准建造者模式（Builder Pattern）渐进式配置自更新策略，提供兼具易用性与类型安全的配置入口。
 /// - **核心优势**：默认提供合理的防降级策略（`false`）、默认超时（15s）及自动平台 Target 探测。
-/// - **代价与局限**：终结方法 `build()` 需校验必选参数（`current_version` 与 `manifest_url`）是否已正确提供。
+/// - **代价与局限**：终结方法 `build()` 需校验必选参数（`current_version` 与 `endpoints`）是否已正确提供。
 #[derive(Debug, Clone)]
 pub struct UpdaterBuilder {
     pub(crate) current_version: Option<Version>,
-    pub(crate) manifest_url: Option<String>,
+    pub(crate) endpoints: Vec<String>,
     pub(crate) channel: Option<String>,
     pub(crate) public_keys: Vec<String>,
     pub(crate) timeout: Duration,
@@ -81,7 +86,7 @@ impl Default for UpdaterBuilder {
     fn default() -> Self {
         Self {
             current_version: None,
-            manifest_url: None,
+            endpoints: Vec::new(),
             channel: None,
             public_keys: Vec::new(),
             timeout: Duration::from_secs(15),
@@ -112,9 +117,21 @@ impl UpdaterBuilder {
         Ok(self)
     }
 
-    /// 设置 Manifest 元数据 JSON 的下载地址
+    /// 设置 Manifest 元数据 JSON 的下载地址（向后兼容的主端点方法）
     pub fn manifest_url(mut self, url: impl Into<String>) -> Self {
-        self.manifest_url = Some(url.into());
+        self.endpoints.push(url.into());
+        self
+    }
+
+    /// 添加单个更新检查端点（可多次调用以配置多端点冗余与故障转移）
+    pub fn endpoint(mut self, url: impl Into<String>) -> Self {
+        self.endpoints.push(url.into());
+        self
+    }
+
+    /// 批量添加更新检查端点列表（按顺序尝试，支持主备容灾降级）
+    pub fn endpoints(mut self, urls: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.endpoints.extend(urls.into_iter().map(Into::into));
         self
     }
 
@@ -230,12 +247,18 @@ impl UpdaterBuilder {
             UpdateError::ManifestParse("构建 Updater 必须提供 current_version".to_string())
         })?;
 
-        let manifest_url = self.manifest_url.ok_or_else(|| {
-            UpdateError::ManifestParse("构建 Updater 必须提供 manifest_url".to_string())
-        })?;
+        if self.endpoints.is_empty() {
+            return Err(UpdateError::ManifestParse(
+                "构建 Updater 必须提供至少一个更新端点 (manifest_url 或 endpoints)".to_string(),
+            ));
+        }
 
-        if !self.dangerous_insecure_transport_protocol && manifest_url.starts_with("http://") {
-            return Err(UpdateError::InsecureTransportProtocol(manifest_url));
+        if !self.dangerous_insecure_transport_protocol {
+            for ep in &self.endpoints {
+                if ep.starts_with("http://") {
+                    return Err(UpdateError::InsecureTransportProtocol(ep.clone()));
+                }
+            }
         }
 
         if self.require_signature && self.public_keys.is_empty() {
@@ -244,7 +267,7 @@ impl UpdaterBuilder {
 
         let config = UpdaterConfig {
             current_version,
-            manifest_url,
+            endpoints: self.endpoints,
             channel: self.channel,
             public_keys: self.public_keys,
             timeout: self.timeout,
@@ -380,5 +403,34 @@ mod tests {
             .require_signature(true)
             .build();
         assert!(valid_builder.is_ok());
+    }
+
+    #[test]
+    fn test_multi_endpoints_configuration() {
+        // 1. 未提供任何端点时构建报错
+        let no_endpoints = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .build();
+        assert!(matches!(no_endpoints, Err(UpdateError::ManifestParse(_))));
+
+        // 2. 配置主端点与备用端点成功
+        let updater = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .endpoint("https://primary-cdn.example.com/manifest.json")
+            .endpoint("https://backup-cdn.example.com/manifest.json")
+            .build()
+            .unwrap();
+
+        assert_eq!(updater.endpoints().len(), 2);
+        assert_eq!(
+            updater.endpoints()[0],
+            "https://primary-cdn.example.com/manifest.json"
+        );
+        assert_eq!(
+            updater.endpoints()[1],
+            "https://backup-cdn.example.com/manifest.json"
+        );
     }
 }
