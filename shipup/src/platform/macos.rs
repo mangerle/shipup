@@ -8,19 +8,29 @@ use std::process::Command;
 pub const TEMP_SUFFIX: &str = ".shipup.tmp";
 pub const OLD_BACKUP_SUFFIX: &str = ".shipup.old";
 
-/// 清理以往更新遗留的 .shipup.old 备份 Bundle 或文件
+/// 清理以往更新遗留的主程序自身的 .shipup.old 备份 Bundle 或文件
 pub fn cleanup_old_backup_bundles() {
     if let Some(current_bundle) = find_current_app_bundle()
         && let Some(parent) = current_bundle.parent()
-        && let Ok(entries) = fs::read_dir(parent)
     {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && name.ends_with(OLD_BACKUP_SUFFIX)
-            {
-                let _ = fs::remove_dir_all(&path).or_else(|_| fs::remove_file(&path));
-            }
+        let bundle_name = current_bundle
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("app.app");
+        let my_backup = parent.join(format!("{}{}", bundle_name, OLD_BACKUP_SUFFIX));
+        if my_backup.exists() {
+            let _ = fs::remove_dir_all(&my_backup).or_else(|_| fs::remove_file(&my_backup));
+        }
+    } else if let Ok(current_exe) = env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        let exe_name = current_exe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("app");
+        let my_backup = parent.join(format!("{}{}", exe_name, OLD_BACKUP_SUFFIX));
+        if my_backup.exists() {
+            let _ = fs::remove_file(&my_backup);
         }
     }
 }

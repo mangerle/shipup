@@ -18,27 +18,51 @@ pub const OLD_BACKUP_SUFFIX: &str = ".shipup.old";
 const DETACHED_PROCESS: u32 = 0x00000008;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 
-/// 清理当前主程序同目录下遗留的 *.shipup.old 旧版本文件
+/// 孤儿临时下载切片的最长保留过期时长（24 小时）
+const ORPHAN_TEMP_EXPIRATION_SECS: u64 = 24 * 3600;
+
+/// 清理当前主程序自身遗留的历史 *.shipup.old 备份文件与过期孤儿临时切片
 ///
 /// # 设计原理
-/// - **实现初衷**：在 Windows 平台上，由于操作系统强制加锁运行中的可执行文件，替换时旧文件被重命名为 `.shipup.old`。
-///   旧进程退出后该文件锁已解除，因此由新启动的进程在初始化阶段静默删除旧副本。
-/// - **核心优势**：自动无感闭环，不需要额外的清理批处理脚本或临时服务。
-/// - **代价与局限**：若由于权限受限未能删除，将在下一次启动时继续重试。
+/// - **实现初衷**：替换完成且新版本稳定后，定向销毁自身旧二进制；对历史残留临时切片引入 24 小时修改时间保护。
+/// - **核心优势**：定向清理自身备份，绝不误删同目录其他进程正在下载中的临时文件或并发实例。
+/// - **代价与局限**：24 小时内的未完成下载切片将被保留供断点续传，直到超时后自动回收。
 pub fn cleanup_old_backup_files() {
     if let Ok(current_exe) = env::current_exe()
         && let Some(parent) = current_exe.parent()
-        && let Ok(entries) = fs::read_dir(parent)
     {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
-                && (file_name.ends_with(OLD_BACKUP_SUFFIX) || file_name.ends_with(TEMP_SUFFIX))
-            {
-                if let Err(e) = fs::remove_file(&path) {
-                    log::debug!("清理遗留旧副本文件失败 ({}): {}", path.display(), e);
-                } else {
-                    log::debug!("成功清理遗留旧副本文件: {}", path.display());
+        let exe_name = current_exe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("app");
+
+        // 1. 定向清理主程序自身对应的历史备份文件
+        let my_backup = parent.join(format!("{}{}", exe_name, OLD_BACKUP_SUFFIX));
+        if my_backup.exists() {
+            if let Err(e) = fs::remove_file(&my_backup) {
+                log::debug!("清理当前程序历史备份失败 ({}): {}", my_backup.display(), e);
+            } else {
+                log::debug!("成功清理当前程序历史备份: {}", my_backup.display());
+            }
+        }
+
+        // 2. 仅清理修改时间超过 24 小时的孤儿临时切片，避免误删正在下载的文件
+        if let Ok(entries) = fs::read_dir(parent) {
+            let now = std::time::SystemTime::now();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+                    && file_name.ends_with(TEMP_SUFFIX)
+                    && let Ok(metadata) = entry.metadata()
+                    && let Ok(modified) = metadata.modified()
+                    && let Ok(age) = now.duration_since(modified)
+                    && age.as_secs() > ORPHAN_TEMP_EXPIRATION_SECS
+                {
+                    if let Err(e) = fs::remove_file(&path) {
+                        log::debug!("清理过期孤儿临时切片失败 ({}): {}", path.display(), e);
+                    } else {
+                        log::debug!("成功清理过期孤儿临时切片: {}", path.display());
+                    }
                 }
             }
         }

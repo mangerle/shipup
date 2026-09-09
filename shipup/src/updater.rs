@@ -216,11 +216,11 @@ impl Updater {
                         cleanup_old_backups();
                     }
                 }
-            } else {
+            } else if !crate::recovery::has_pending_recovery_state() {
                 cleanup_old_backups();
             }
-        } else {
-            // 默认构造器保持纯净无副作用，仅清理历史备份锁残留
+        } else if !crate::recovery::has_pending_recovery_state() {
+            // 默认构造器保持纯净无副作用，仅在无未确认更新状态时清理历史残留旧副本
             cleanup_old_backups();
         }
 

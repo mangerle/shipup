@@ -244,6 +244,20 @@ pub fn confirm_update_success_in_dir(state_dir: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// 检查当前运行环境是否存在待确认的更新自愈状态标记
+///
+/// # 设计原理
+/// - **实现初衷**：在更新器初始化或常规清理流程前进行探针检查，防止误删处于健康观察期的旧版本备份。
+/// - **核心优势**：纯物理路径探测，零解析开销。
+pub fn has_pending_recovery_state() -> bool {
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        return parent.join(UPDATE_STATE_FILENAME).exists();
+    }
+    false
+}
+
 /// 检查并确认当前应用升级成功（在应用完成启动并平稳运行后调用）
 ///
 /// # 设计原理
