@@ -467,27 +467,31 @@ impl Update {
     }
 
     #[cfg(feature = "blocking")]
-    /// 同步下载并完成更新安装
+    /// 同步执行更新包下载与完整性验签，暂存至临时目录并返回待安装实体（不修改任何本地文件）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：解耦更新生命周期中的“网络下载/验签”与“物理替换/安装”两阶段，支持后台静默预载。
+    /// - **核心优势**：下载与验签完成后不产生任何正在运行进程的文件覆盖破坏，由调用方自主决定何时安装。
     ///
     /// # Errors
-    /// 下载、验签、解压或安装失败时返回对应错误。
-    pub fn download_and_install<F>(&self, callback: F) -> Result<()>
+    /// 当下载失败、哈希不匹配或数字签名校验失败时返回对应错误。
+    pub fn download<F>(&self, callback: F) -> Result<DownloadedUpdate>
     where
         F: FnMut(UpdateEvent),
     {
-        self.download_and_install_with_cancellation(None, callback)
+        self.download_with_cancellation(None, callback)
     }
 
     #[cfg(feature = "blocking")]
-    /// 支持主动取消标记的同步下载与安装
+    /// 支持主动取消标记的同步下载与验签（不修改任何本地运行文件）
     ///
     /// # Errors
-    /// 当流程被主动取消或安装失败时返回对应错误。
-    pub fn download_and_install_with_cancellation<F>(
+    /// 当流程被主动取消或校验失败时返回对应错误。
+    pub fn download_with_cancellation<F>(
         &self,
         cancel_flag: Option<Arc<AtomicBool>>,
         mut callback: F,
-    ) -> Result<()>
+    ) -> Result<DownloadedUpdate>
     where
         F: FnMut(UpdateEvent),
     {
@@ -518,32 +522,67 @@ impl Update {
         };
 
         download::download_file_blocking(&client, &options, &mut callback)?;
-        self.verify_and_apply(&temp_download_path, callback)
+        self.verify_downloaded_payload(&temp_download_path, &mut callback)?;
+
+        Ok(DownloadedUpdate {
+            current_version: self.current_version.clone(),
+            release: self.release.clone(),
+            downloaded_path: temp_download_path,
+        })
     }
 
-    #[cfg(feature = "async")]
-    /// 异步下载并完成更新安装
+    #[cfg(feature = "blocking")]
+    /// 同步下载并完成更新安装（复合便捷方法）
     ///
     /// # Errors
-    /// 当异步流程失败时返回对应错误。
-    pub async fn download_and_install_async<F>(&self, callback: F) -> Result<()>
+    /// 下载、验签、解压或安装失败时返回对应错误。
+    pub fn download_and_install<F>(&self, mut callback: F) -> Result<()>
     where
-        F: FnMut(UpdateEvent) + Send,
+        F: FnMut(UpdateEvent),
     {
-        self.download_and_install_with_cancellation_async(None, callback)
-            .await
+        let downloaded = self.download_with_cancellation(None, &mut callback)?;
+        downloaded.install(callback)
     }
 
-    #[cfg(feature = "async")]
-    /// 支持主动取消标记的异步下载与安装
+    #[cfg(feature = "blocking")]
+    /// 支持主动取消标记的同步下载与安装（复合便捷方法）
     ///
     /// # Errors
-    /// 当流程被取消或安装失败时返回对应错误。
-    pub async fn download_and_install_with_cancellation_async<F>(
+    /// 当流程被主动取消或安装失败时返回对应错误。
+    pub fn download_and_install_with_cancellation<F>(
         &self,
         cancel_flag: Option<Arc<AtomicBool>>,
         mut callback: F,
     ) -> Result<()>
+    where
+        F: FnMut(UpdateEvent),
+    {
+        let downloaded = self.download_with_cancellation(cancel_flag, &mut callback)?;
+        downloaded.install(callback)
+    }
+
+    #[cfg(feature = "async")]
+    /// 异步执行更新包下载与完整性验签，暂存至临时目录并返回待安装实体（不修改任何本地文件）
+    ///
+    /// # Errors
+    /// 当异步下载失败、校验错误时返回对应错误。
+    pub async fn download_async<F>(&self, callback: F) -> Result<DownloadedUpdate>
+    where
+        F: FnMut(UpdateEvent) + Send,
+    {
+        self.download_with_cancellation_async(None, callback).await
+    }
+
+    #[cfg(feature = "async")]
+    /// 支持主动取消标记的异步下载与验签（不修改任何本地运行文件）
+    ///
+    /// # Errors
+    /// 当异步流程被取消或签名校验失败时返回对应错误。
+    pub async fn download_with_cancellation_async<F>(
+        &self,
+        cancel_flag: Option<Arc<AtomicBool>>,
+        mut callback: F,
+    ) -> Result<DownloadedUpdate>
     where
         F: FnMut(UpdateEvent) + Send,
     {
@@ -580,7 +619,7 @@ impl Update {
         let target_temp_path = temp_download_path.clone();
 
         let blocking_handle = tokio::task::spawn_blocking(move || {
-            this.verify_and_apply(&target_temp_path, |event| {
+            this.verify_downloaded_payload(&target_temp_path, &mut |event| {
                 let _ = tx.send(event);
             })
         });
@@ -590,21 +629,54 @@ impl Update {
         }
 
         match blocking_handle.await {
-            Ok(res) => res,
-            Err(join_err) => Err(UpdateError::SelfReplace(format!(
-                "后台安装验证任务异常中止: {}",
-                join_err
-            ))),
+            Ok(res) => res?,
+            Err(join_err) => {
+                return Err(UpdateError::SelfReplace(format!(
+                    "后台签名校验任务异常中止: {}",
+                    join_err
+                )));
+            }
         }
+
+        Ok(DownloadedUpdate {
+            current_version: self.current_version.clone(),
+            release: self.release.clone(),
+            downloaded_path: temp_download_path,
+        })
     }
 
-    fn verify_and_apply<F>(&self, temp_path: &Path, mut callback: F) -> Result<()>
+    #[cfg(feature = "async")]
+    /// 异步下载并完成更新安装（复合便捷方法）
+    ///
+    /// # Errors
+    /// 当异步流程失败时返回对应错误。
+    pub async fn download_and_install_async<F>(&self, mut callback: F) -> Result<()>
     where
-        F: FnMut(UpdateEvent),
+        F: FnMut(UpdateEvent) + Send,
     {
-        self.verify_downloaded_payload(temp_path, &mut callback)?;
-        self.apply_downloaded_payload(temp_path, &mut callback)?;
-        Ok(())
+        let downloaded = self
+            .download_with_cancellation_async(None, &mut callback)
+            .await?;
+        downloaded.install(callback)
+    }
+
+    #[cfg(feature = "async")]
+    /// 支持主动取消标记的异步下载与安装（复合便捷方法）
+    ///
+    /// # Errors
+    /// 当流程被取消或安装失败时返回对应错误。
+    pub async fn download_and_install_with_cancellation_async<F>(
+        &self,
+        cancel_flag: Option<Arc<AtomicBool>>,
+        mut callback: F,
+    ) -> Result<()>
+    where
+        F: FnMut(UpdateEvent) + Send,
+    {
+        let downloaded = self
+            .download_with_cancellation_async(cancel_flag, &mut callback)
+            .await?;
+        downloaded.install(callback)
     }
 
     fn verify_downloaded_payload<F>(&self, temp_path: &Path, callback: &mut F) -> Result<()>
@@ -653,91 +725,6 @@ impl Update {
         Ok(())
     }
 
-    fn apply_downloaded_payload<F>(&self, temp_path: &Path, callback: &mut F) -> Result<()>
-    where
-        F: FnMut(UpdateEvent),
-    {
-        match self.release.package.package_type {
-            PackageType::Binary => {
-                callback(UpdateEvent::Installing);
-                replace_binary(temp_path)?;
-                let _ = fs::remove_file(temp_path);
-                self.record_state_if_possible();
-                callback(UpdateEvent::ReadyToRestart);
-            }
-            PackageType::Archive => {
-                callback(UpdateEvent::ExtractingArchive);
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                let sandbox_name = format!("shipup_sandbox_{}_{}", std::process::id(), timestamp);
-                let sandbox_dir = temp_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(sandbox_name);
-
-                let apply_result = (|| -> Result<()> {
-                    let extracted_binary = extract_archive(
-                        temp_path,
-                        &sandbox_dir,
-                        self.release.package.executable_path.as_deref(),
-                    )?;
-
-                    callback(UpdateEvent::Installing);
-
-                    // 同步解压目录中除主程序外的全部伴随依赖（动态库、静态资源等）到宿主应用目录
-                    let current_exe = std::env::current_exe()?;
-                    if let Some(target_dir) = current_exe.parent() {
-                        let payload_dir = extracted_binary.parent().unwrap_or(&sandbox_dir);
-                        sync_extracted_payload(payload_dir, target_dir, &extracted_binary)?;
-                    }
-
-                    replace_binary(&extracted_binary)?;
-                    Ok(())
-                })();
-
-                let _ = fs::remove_dir_all(&sandbox_dir);
-                let _ = fs::remove_file(temp_path);
-                apply_result?;
-
-                self.record_state_if_possible();
-                callback(UpdateEvent::ReadyToRestart);
-            }
-            PackageType::Installer => {
-                callback(UpdateEvent::Installing);
-                let installer_options = InstallerOptions {
-                    user_args: &self.release.package.install_args,
-                    install_mode: self.release.package.install_mode,
-                    require_elevation: self.release.package.require_elevation,
-                };
-                spawn_installer(temp_path, &installer_options)?;
-                callback(UpdateEvent::ReadyToRestart);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn record_state_if_possible(&self) {
-        if let Ok(current_exe) = std::env::current_exe()
-            && let Some(target_dir) = current_exe.parent()
-        {
-            let backup_path = target_dir.join(format!(
-                "{}.shipup.old",
-                current_exe
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-            ));
-            let _ = crate::recovery::record_update_state(
-                target_dir,
-                &self.release.version.to_string(),
-                &backup_path,
-            );
-        }
-    }
-
     /// 优雅重启宿主程序，并在进程退出前执行清理闭包
     ///
     /// # Errors
@@ -755,6 +742,141 @@ impl Update {
     /// 当拉起新进程失败时返回 [`UpdateError::SelfReplace`]。若新进程拉起成功，将退出当前进程，正常情况下不会返回。
     pub fn restart(&self) -> Result<Infallible> {
         restart_with(|_| {})
+    }
+}
+
+/// 已下载并完成哈希与数字签名验证的待安装更新实体
+///
+/// # 设计原理
+/// - **实现初衷**：彻底解耦更新生命周期中的“网络下载/验签”与“物理磁盘覆盖/安装器派生”两阶段。
+/// - **核心优势**：支持静默后台预下载更新包（不产生任何正在运行进程的文件覆盖破坏），在用户空闲或确认时再调用 `install()`。
+/// - **代价与局限**：安装前更新包暂存于操作系统临时目录中。
+#[derive(Debug, Clone)]
+pub struct DownloadedUpdate {
+    current_version: Version,
+    release: ResolvedRelease,
+    downloaded_path: PathBuf,
+}
+
+impl DownloadedUpdate {
+    /// 获取当前本地版本
+    pub fn current_version(&self) -> &Version {
+        &self.current_version
+    }
+
+    /// 获取目标新版本
+    pub fn version(&self) -> &Version {
+        &self.release.version
+    }
+
+    /// 获取已下载并验签完毕的本地文件物理路径
+    pub fn downloaded_path(&self) -> &Path {
+        &self.downloaded_path
+    }
+
+    /// 获取解析后的版本元数据引用
+    pub fn release(&self) -> &ResolvedRelease {
+        &self.release
+    }
+
+    /// 执行物理安装、解压替换或派生拉起外部安装器
+    ///
+    /// # Errors
+    /// 当解压、二进制替换或安装器派生失败时返回对应错误。
+    pub fn install<F>(&self, mut callback: F) -> Result<()>
+    where
+        F: FnMut(UpdateEvent),
+    {
+        apply_downloaded_payload(&self.release, &self.downloaded_path, &mut callback)
+    }
+}
+
+fn apply_downloaded_payload<F>(
+    release: &ResolvedRelease,
+    temp_path: &Path,
+    callback: &mut F,
+) -> Result<()>
+where
+    F: FnMut(UpdateEvent),
+{
+    match release.package.package_type {
+        PackageType::Binary => {
+            callback(UpdateEvent::Installing);
+            replace_binary(temp_path)?;
+            let _ = fs::remove_file(temp_path);
+            record_state_if_possible(&release.version);
+            callback(UpdateEvent::ReadyToRestart);
+        }
+        PackageType::Archive => {
+            callback(UpdateEvent::ExtractingArchive);
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let sandbox_name = format!("shipup_sandbox_{}_{}", std::process::id(), timestamp);
+            let sandbox_dir = temp_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(sandbox_name);
+
+            let apply_result = (|| -> Result<()> {
+                let extracted_binary = extract_archive(
+                    temp_path,
+                    &sandbox_dir,
+                    release.package.executable_path.as_deref(),
+                )?;
+
+                callback(UpdateEvent::Installing);
+
+                // 同步解压目录中除主程序外的全部伴随依赖（动态库、静态资源等）到宿主应用目录
+                let current_exe = std::env::current_exe()?;
+                if let Some(target_dir) = current_exe.parent() {
+                    let payload_dir = extracted_binary.parent().unwrap_or(&sandbox_dir);
+                    sync_extracted_payload(payload_dir, target_dir, &extracted_binary)?;
+                }
+
+                replace_binary(&extracted_binary)?;
+                Ok(())
+            })();
+
+            let _ = fs::remove_dir_all(&sandbox_dir);
+            let _ = fs::remove_file(temp_path);
+            apply_result?;
+
+            record_state_if_possible(&release.version);
+            callback(UpdateEvent::ReadyToRestart);
+        }
+        PackageType::Installer => {
+            callback(UpdateEvent::Installing);
+            let installer_options = InstallerOptions {
+                user_args: &release.package.install_args,
+                install_mode: release.package.install_mode,
+                require_elevation: release.package.require_elevation,
+            };
+            spawn_installer(temp_path, &installer_options)?;
+            callback(UpdateEvent::ReadyToRestart);
+        }
+    }
+
+    Ok(())
+}
+
+fn record_state_if_possible(target_version: &Version) {
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(target_dir) = current_exe.parent()
+    {
+        let backup_path = target_dir.join(format!(
+            "{}.shipup.old",
+            current_exe
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ));
+        let _ = crate::recovery::record_update_state(
+            target_dir,
+            &target_version.to_string(),
+            &backup_path,
+        );
     }
 }
 
@@ -874,6 +996,7 @@ async fn fetch_manifest_async(client: &reqwest::Client, endpoint: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::PackageInfo;
 
     #[test]
     fn test_custom_version_comparator() {
@@ -978,5 +1101,40 @@ mod tests {
         // 6. 清空偏好后，更新再次恢复
         updater.clear_preferences().unwrap();
         assert!(updater.evaluate_manifest(manifest_json).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_downloaded_update_properties() {
+        let release = ResolvedRelease {
+            version: Version::parse("1.2.0").unwrap(),
+            min_supported_version: None,
+            is_mandatory: false,
+            pub_date: Some("2026-09-09".to_string()),
+            notes: Some("更新说明".to_string()),
+            package: PackageInfo {
+                url: "https://example.com/app.exe".to_string(),
+                signature: None,
+                checksum: None,
+                package_type: PackageType::Binary,
+                install_mode: None,
+                install_args: vec![],
+                executable_path: None,
+                require_elevation: false,
+            },
+        };
+
+        let temp_path = PathBuf::from("C:\\temp\\app.exe.shipup.tmp");
+        let downloaded = DownloadedUpdate {
+            current_version: Version::parse("1.0.0").unwrap(),
+            release,
+            downloaded_path: temp_path.clone(),
+        };
+
+        assert_eq!(downloaded.version(), &Version::parse("1.2.0").unwrap());
+        assert_eq!(
+            downloaded.current_version(),
+            &Version::parse("1.0.0").unwrap()
+        );
+        assert_eq!(downloaded.downloaded_path(), temp_path.as_path());
     }
 }

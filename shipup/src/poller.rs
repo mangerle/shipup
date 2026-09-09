@@ -1,7 +1,7 @@
 // shipup 跨平台自更新系统 - 后台周期性静默轮询与暂存调度器
 
 use crate::error::UpdateError;
-use crate::updater::{Update, Updater};
+use crate::updater::{DownloadedUpdate, Update, Updater};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -19,8 +19,8 @@ pub enum AutoPollEvent {
     NewVersionAvailable(Update),
     /// 正在后台静默下载安装包
     Downloading(Update),
-    /// 更新包已在后台下载校验完毕，已暂存就绪，宿主可随时安排重启生效
-    UpdateReady(Update),
+    /// 更新包已在后台下载校验完毕，已暂存就绪，宿主可随时安排安装与重启生效
+    UpdateReady(DownloadedUpdate),
     /// 当前已是最新版本
     UpToDate,
     /// 后台轮询发生可恢复网络异常或配置错误
@@ -137,10 +137,10 @@ where
                             if options.silent_download {
                                 callback(AutoPollEvent::Downloading(update.clone()));
                                 let cancel_token = Some(Arc::clone(&worker_stop));
-                                match update
-                                    .download_and_install_with_cancellation(cancel_token, |_| {})
-                                {
-                                    Ok(()) => callback(AutoPollEvent::UpdateReady(update)),
+                                match update.download_with_cancellation(cancel_token, |_| {}) {
+                                    Ok(downloaded) => {
+                                        callback(AutoPollEvent::UpdateReady(downloaded))
+                                    }
                                     Err(UpdateError::Cancelled) => {
                                         log::info!("后台静默下载更新包已被主动取消");
                                         break;
@@ -202,10 +202,10 @@ where
                             callback(AutoPollEvent::Downloading(update.clone()));
                             let cancel_token = Some(Arc::clone(&worker_stop));
                             match update
-                                .download_and_install_with_cancellation_async(cancel_token, |_| {})
+                                .download_with_cancellation_async(cancel_token, |_| {})
                                 .await
                             {
-                                Ok(()) => callback(AutoPollEvent::UpdateReady(update)),
+                                Ok(downloaded) => callback(AutoPollEvent::UpdateReady(downloaded)),
                                 Err(UpdateError::Cancelled) => {
                                     log::info!("后台异步静默下载更新包已被主动取消");
                                     break;

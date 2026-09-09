@@ -47,4 +47,4 @@ pub use recovery::{
 };
 pub use restart::{RestartContext, SHIPUP_RESTARTED_ARG, is_restarted_by_shipup, restart_with};
 pub use template::{TemplateContext, resolve_url_template};
-pub use updater::{Update, Updater};
+pub use updater::{DownloadedUpdate, Update, Updater};
