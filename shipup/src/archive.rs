@@ -2,27 +2,57 @@
 
 use crate::error::{Result, UpdateError};
 use std::fs;
-#[cfg(any(feature = "archive-zip", feature = "archive-tar"))]
+#[cfg(any(
+    feature = "archive-zip",
+    feature = "archive-tar",
+    feature = "archive-tar-zst",
+    feature = "archive-tar-xz"
+))]
 use std::fs::File;
-#[cfg(any(feature = "archive-zip", feature = "archive-tar"))]
+#[cfg(any(
+    feature = "archive-zip",
+    feature = "archive-tar",
+    feature = "archive-tar-zst",
+    feature = "archive-tar-xz"
+))]
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-#[cfg(any(feature = "archive-zip", feature = "archive-tar"))]
+#[cfg(any(
+    feature = "archive-zip",
+    feature = "archive-tar",
+    feature = "archive-tar-zst",
+    feature = "archive-tar-xz"
+))]
 /// 默认解压后最大允许解压膨胀倍数（防解压炸弹）
 const MAX_EXPANSION_RATIO: u64 = 10;
-#[cfg(any(feature = "archive-zip", feature = "archive-tar"))]
+#[cfg(any(
+    feature = "archive-zip",
+    feature = "archive-tar",
+    feature = "archive-tar-zst",
+    feature = "archive-tar-xz"
+))]
 /// 默认解压体积硬上限（1GB）
 const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
 
-#[cfg(any(feature = "archive-zip", feature = "archive-tar"))]
+#[cfg(any(
+    feature = "archive-zip",
+    feature = "archive-tar",
+    feature = "archive-tar-zst",
+    feature = "archive-tar-xz"
+))]
 /// 解压安全预算计量器（防解压炸弹）
 struct ExtractionBudget {
     extracted: u64,
     max_allowed: u64,
 }
 
-#[cfg(any(feature = "archive-zip", feature = "archive-tar"))]
+#[cfg(any(
+    feature = "archive-zip",
+    feature = "archive-tar",
+    feature = "archive-tar-zst",
+    feature = "archive-tar-xz"
+))]
 impl ExtractionBudget {
     fn new(max_allowed: u64) -> Self {
         Self {
@@ -42,15 +72,78 @@ impl ExtractionBudget {
     }
 }
 
+/// 归档格式类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveFormat {
+    /// 标准 Zip 压缩归档
+    Zip,
+    /// Gzip 压缩的 Tar 归档 (.tar.gz / .tgz)
+    TarGz,
+    /// Zstandard 压缩的 Tar 归档 (.tar.zst / .tzst)
+    TarZst,
+    /// XZ / LZMA2 压缩的 Tar 归档 (.tar.xz / .txz)
+    TarXz,
+    /// 无法从魔数或扩展名推断的格式
+    Unknown,
+}
+
+/// 基于文件魔数（前 6 字节）与扩展名自动嗅探归档文件格式
+pub fn detect_archive_format(path: &Path) -> ArchiveFormat {
+    // 1. 优先读取文件头魔数进行精准特征匹配
+    if let Ok(mut file) = File::open(path) {
+        let mut magic = [0u8; 6];
+        if let Ok(n) = Read::read(&mut file, &mut magic) {
+            if n >= 4 && magic[..4] == [0x50, 0x4B, 0x03, 0x04] {
+                return ArchiveFormat::Zip;
+            }
+            if n >= 2 && magic[..2] == [0x1F, 0x8B] {
+                return ArchiveFormat::TarGz;
+            }
+            if n >= 4 && magic[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
+                return ArchiveFormat::TarZst;
+            }
+            if n >= 6 && magic[..6] == [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00] {
+                return ArchiveFormat::TarXz;
+            }
+        }
+    }
+
+    // 2. 魔数未命中时回退到文件扩展名判定
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if file_name.ends_with(".zip") {
+        ArchiveFormat::Zip
+    } else if file_name.ends_with(".tar.gz") || file_name.ends_with(".tgz") {
+        ArchiveFormat::TarGz
+    } else if file_name.ends_with(".tar.zst")
+        || file_name.ends_with(".tzst")
+        || file_name.ends_with(".zst")
+    {
+        ArchiveFormat::TarZst
+    } else if file_name.ends_with(".tar.xz")
+        || file_name.ends_with(".txz")
+        || file_name.ends_with(".xz")
+    {
+        ArchiveFormat::TarXz
+    } else {
+        ArchiveFormat::Unknown
+    }
+}
+
 /// 解压更新归档包到安全沙箱目录，并提取指定的目标可执行文件或 Bundle
 ///
 /// # 设计原理
 /// - **实现初衷**：为分发包含依赖资产或 macOS `.app` 目录树的软件提供安全的临时解压隔离区，防止直接污染安装目录。
 /// - **核心优势**：强制前置规范路径校验（Canonical Path），阻断 Zip Slip 路径逃逸，并对解压总膨胀体积实施熔断限制。
+///   支持基于文件魔数自动嗅探 Zip、Tar.gz、Tar.zst 与 Tar.xz。
 /// - **代价与局限**：解压需消耗额外的磁盘临时空间，解压完成后需由调用方负责清理沙箱目录。
 ///
 /// # 参数
-/// * `archive_path`: 归档文件路径（.zip 或 .tar.gz）
+/// * `archive_path`: 归档文件路径（.zip / .tar.gz / .tar.zst / .tar.xz）
 /// * `sandbox_dir`: 临时沙箱目标解压目录
 /// * `executable_rel_path`: 归档包内目标主程序的相对路径
 ///
@@ -66,20 +159,22 @@ pub fn extract_archive(
     fs::create_dir_all(sandbox_dir)?;
     let canonical_sandbox = sandbox_dir.canonicalize()?;
 
-    let file_name = archive_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let format = detect_archive_format(archive_path);
+    log::debug!("检测到归档文件格式: {:?}", format);
 
-    if file_name.ends_with(".zip") {
-        extract_zip(archive_path, &canonical_sandbox)?;
-    } else if file_name.ends_with(".tar.gz") || file_name.ends_with(".tgz") {
-        extract_tar_gz(archive_path, &canonical_sandbox)?;
-    } else {
-        // 未知扩展名时优先尝试按 zip 解压，若失败则尝试按 tar.gz 解压
-        if extract_zip(archive_path, &canonical_sandbox).is_err() {
-            extract_tar_gz(archive_path, &canonical_sandbox)?;
+    match format {
+        ArchiveFormat::Zip => extract_zip(archive_path, &canonical_sandbox)?,
+        ArchiveFormat::TarGz => extract_tar_gz(archive_path, &canonical_sandbox)?,
+        ArchiveFormat::TarZst => extract_tar_zst(archive_path, &canonical_sandbox)?,
+        ArchiveFormat::TarXz => extract_tar_xz(archive_path, &canonical_sandbox)?,
+        ArchiveFormat::Unknown => {
+            // 未知格式时按 Zip -> TarGz -> TarZst -> TarXz 优先级顺序尝试解压
+            if extract_zip(archive_path, &canonical_sandbox).is_err()
+                && extract_tar_gz(archive_path, &canonical_sandbox).is_err()
+                && extract_tar_zst(archive_path, &canonical_sandbox).is_err()
+            {
+                extract_tar_xz(archive_path, &canonical_sandbox)?;
+            }
         }
     }
 
@@ -184,16 +279,17 @@ fn extract_zip(_archive_path: &Path, _canonical_sandbox: &Path) -> Result<()> {
     ))
 }
 
-#[cfg(feature = "archive-tar")]
-fn extract_tar_gz(archive_path: &Path, canonical_sandbox: &Path) -> Result<()> {
-    let file = File::open(archive_path)?;
-    let archive_len = file.metadata()?.len();
-    let max_allowed_bytes = archive_len
-        .saturating_mul(MAX_EXPANSION_RATIO)
-        .min(MAX_EXTRACTED_BYTES);
-
-    let gz = flate2::read::GzDecoder::new(file);
-    let mut tar = tar::Archive::new(gz);
+#[cfg(any(
+    feature = "archive-tar",
+    feature = "archive-tar-zst",
+    feature = "archive-tar-xz"
+))]
+fn extract_tar_stream<R: Read>(
+    reader: R,
+    canonical_sandbox: &Path,
+    max_allowed_bytes: u64,
+) -> Result<()> {
+    let mut tar = tar::Archive::new(reader);
     let mut budget = ExtractionBudget::new(max_allowed_bytes);
 
     let entries = tar
@@ -238,6 +334,111 @@ fn extract_tar_gz(archive_path: &Path, canonical_sandbox: &Path) -> Result<()> {
 }
 
 #[cfg(feature = "archive-tar")]
+fn extract_tar_gz(archive_path: &Path, canonical_sandbox: &Path) -> Result<()> {
+    let file = File::open(archive_path)?;
+    let archive_len = file.metadata()?.len();
+    let max_allowed_bytes = archive_len
+        .saturating_mul(MAX_EXPANSION_RATIO)
+        .min(MAX_EXTRACTED_BYTES);
+
+    let gz = flate2::read::GzDecoder::new(file);
+    extract_tar_stream(gz, canonical_sandbox, max_allowed_bytes)
+}
+
+#[cfg(not(feature = "archive-tar"))]
+fn extract_tar_gz(_archive_path: &Path, _canonical_sandbox: &Path) -> Result<()> {
+    Err(UpdateError::ArchiveExtract(
+        "当前编译配置未启用 archive-tar 特性，无法解压 .tar.gz 归档文件".to_string(),
+    ))
+}
+
+#[cfg(feature = "archive-tar-zst")]
+fn extract_tar_zst(archive_path: &Path, canonical_sandbox: &Path) -> Result<()> {
+    let file = File::open(archive_path)?;
+    let archive_len = file.metadata()?.len();
+    let max_allowed_bytes = archive_len
+        .saturating_mul(MAX_EXPANSION_RATIO)
+        .min(MAX_EXTRACTED_BYTES);
+
+    let zst = ruzstd::decoding::StreamingDecoder::new(file)
+        .map_err(|e| UpdateError::ArchiveExtract(format!("初始化 zstd 解压器失败: {}", e)))?;
+    extract_tar_stream(zst, canonical_sandbox, max_allowed_bytes)
+}
+
+#[cfg(not(feature = "archive-tar-zst"))]
+fn extract_tar_zst(_archive_path: &Path, _canonical_sandbox: &Path) -> Result<()> {
+    Err(UpdateError::ArchiveExtract(
+        "当前编译配置未启用 archive-tar-zst 特性，无法解压 .tar.zst 归档文件".to_string(),
+    ))
+}
+
+#[cfg(feature = "archive-tar-xz")]
+/// 带有体积安全预算的写入封装（防解压炸弹）
+struct BudgetedWriter<'a, W: io::Write> {
+    writer: &'a mut W,
+    budget: ExtractionBudget,
+}
+
+#[cfg(feature = "archive-tar-xz")]
+impl<'a, W: io::Write> BudgetedWriter<'a, W> {
+    fn new(writer: &'a mut W, max_allowed: u64) -> Self {
+        Self {
+            writer,
+            budget: ExtractionBudget::new(max_allowed),
+        }
+    }
+}
+
+#[cfg(feature = "archive-tar-xz")]
+impl<'a, W: io::Write> io::Write for BudgetedWriter<'a, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.budget
+            .check_and_add(buf.len() as u64)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+#[cfg(feature = "archive-tar-xz")]
+fn extract_tar_xz(archive_path: &Path, canonical_sandbox: &Path) -> Result<()> {
+    use std::io::BufReader;
+    let file = File::open(archive_path)?;
+    let archive_len = file.metadata()?.len();
+    let max_allowed_bytes = archive_len
+        .saturating_mul(MAX_EXPANSION_RATIO)
+        .min(MAX_EXTRACTED_BYTES);
+
+    let temp_tar_path = canonical_sandbox.join(".shipup_decompressed.tar");
+    {
+        let mut reader = BufReader::new(file);
+        let mut out_file = File::create(&temp_tar_path)?;
+        let mut budgeted_writer = BudgetedWriter::new(&mut out_file, max_allowed_bytes);
+        lzma_rs::xz_decompress(&mut reader, &mut budgeted_writer)
+            .map_err(|e| UpdateError::ArchiveExtract(format!("解压 xz 数据流失败: {}", e)))?;
+    }
+
+    let tar_file = File::open(&temp_tar_path)?;
+    let res = extract_tar_stream(tar_file, canonical_sandbox, max_allowed_bytes);
+    let _ = fs::remove_file(&temp_tar_path);
+    res
+}
+
+#[cfg(not(feature = "archive-tar-xz"))]
+fn extract_tar_xz(_archive_path: &Path, _canonical_sandbox: &Path) -> Result<()> {
+    Err(UpdateError::ArchiveExtract(
+        "当前编译配置未启用 archive-tar-xz 特性，无法解压 .tar.xz 归档文件".to_string(),
+    ))
+}
+
+#[cfg(any(
+    feature = "archive-tar",
+    feature = "archive-tar-zst",
+    feature = "archive-tar-xz"
+))]
 fn unpack_single_tar_entry<R: Read>(
     entry: &mut tar::Entry<'_, R>,
     dest_path: &Path,
@@ -280,13 +481,6 @@ fn unpack_single_tar_entry<R: Read>(
     }
 
     Ok(())
-}
-
-#[cfg(not(feature = "archive-tar"))]
-fn extract_tar_gz(_archive_path: &Path, _canonical_sandbox: &Path) -> Result<()> {
-    Err(UpdateError::ArchiveExtract(
-        "当前编译配置未启用 archive-tar 特性，无法解压 .tar.gz 归档文件".to_string(),
-    ))
 }
 
 /// 在沙箱目录中扫描查找唯一的执行程序
@@ -444,5 +638,115 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&temp_base);
+    }
+
+    #[test]
+    fn test_detect_archive_format_by_magic_and_extension() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("shipup_detect_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        // 1. 测试扩展名推断
+        let zip_path = temp_dir.join("test.zip");
+        File::create(&zip_path).unwrap();
+        assert_eq!(detect_archive_format(&zip_path), ArchiveFormat::Zip);
+
+        let targz_path = temp_dir.join("test.tar.gz");
+        File::create(&targz_path).unwrap();
+        assert_eq!(detect_archive_format(&targz_path), ArchiveFormat::TarGz);
+
+        let tarzst_path = temp_dir.join("test.tar.zst");
+        File::create(&tarzst_path).unwrap();
+        assert_eq!(detect_archive_format(&tarzst_path), ArchiveFormat::TarZst);
+
+        let tarxz_path = temp_dir.join("test.tar.xz");
+        File::create(&tarxz_path).unwrap();
+        assert_eq!(detect_archive_format(&tarxz_path), ArchiveFormat::TarXz);
+
+        // 2. 测试基于魔数识别（无扩展名文件）
+        let magic_zst = temp_dir.join("package_zst_no_ext");
+        fs::write(&magic_zst, [0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00]).unwrap();
+        assert_eq!(detect_archive_format(&magic_zst), ArchiveFormat::TarZst);
+
+        let magic_xz = temp_dir.join("package_xz_no_ext");
+        fs::write(&magic_xz, [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]).unwrap();
+        assert_eq!(detect_archive_format(&magic_xz), ArchiveFormat::TarXz);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_extract_tar_xz_and_magic_sniffing() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("shipup_tar_xz_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        // 打包单个可执行文件进 tar
+        let mut tar_builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        let payload_content = b"hello tar.xz payload binary";
+        header.set_path("my_xz_app.exe").unwrap();
+        header.set_size(payload_content.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        tar_builder.append(&header, &payload_content[..]).unwrap();
+        let tar_bytes = tar_builder.into_inner().unwrap();
+
+        // 使用 lzma_rs 压缩为 xz 流
+        let mut xz_bytes = Vec::new();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(tar_bytes), &mut xz_bytes).unwrap();
+
+        // 写入无扩展名文件，验证魔数识别自动触发 xz 解压
+        let archive_file = temp_dir.join("unnamed_archive_bundle");
+        fs::write(&archive_file, xz_bytes).unwrap();
+
+        let sandbox = temp_dir.join("sandbox");
+        let extracted_exe =
+            extract_archive(&archive_file, &sandbox, Some("my_xz_app.exe")).unwrap();
+
+        assert!(extracted_exe.exists());
+        assert_eq!(fs::read(extracted_exe).unwrap(), payload_content);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_extract_tar_zst_and_magic_sniffing() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("shipup_tar_zst_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        // 打包单个可执行文件进 tar
+        let mut tar_builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        let payload_content = b"hello tar.zst payload binary";
+        header.set_path("my_zst_app.exe").unwrap();
+        header.set_size(payload_content.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        tar_builder.append(&header, &payload_content[..]).unwrap();
+        let tar_bytes = tar_builder.into_inner().unwrap();
+
+        // 使用 ruzstd 压缩为 zstd 帧
+        let zst_bytes = ruzstd::encoding::compress_to_vec(
+            &tar_bytes[..],
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+
+        // 写入无扩展名文件，验证魔数识别自动触发 zstd 解压
+        let archive_file = temp_dir.join("unnamed_zst_archive_bundle");
+        fs::write(&archive_file, zst_bytes).unwrap();
+
+        let sandbox = temp_dir.join("sandbox");
+        let extracted_exe =
+            extract_archive(&archive_file, &sandbox, Some("my_zst_app.exe")).unwrap();
+
+        assert!(extracted_exe.exists());
+        assert_eq!(fs::read(extracted_exe).unwrap(), payload_content);
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

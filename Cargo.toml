@@ -52,6 +52,8 @@ clap = { version = "4.6", features = ["derive"] }
 zip = { version = "8.6", default-features = false }
 flate2 = "1.1"
 tar = "0.4.46"
+ruzstd = "0.8"
+lzma-rs = "0.3"
 
 # 生产发布体积与性能优化
 [profile.release]
