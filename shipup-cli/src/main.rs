@@ -174,30 +174,35 @@ fn compute_payload_integrity(
     Ok((checksum, signature))
 }
 
+/// 待写入清单的发布包实体信息
+struct ManifestReleaseEntry {
+    version: Version,
+    min_supported_version: Option<Version>,
+    package_info: PackageInfo,
+}
+
 /// 将包信息合并至指定通道或主通道的 Manifest 数据结构中
 fn update_manifest_entries(
     manifest: &mut Manifest,
     args: &ReleaseArgs,
-    version: Version,
-    min_supported_version: Option<Version>,
-    package_info: PackageInfo,
+    entry: ManifestReleaseEntry,
 ) {
     if let Some(ref ch) = args.channel {
         let ch_entry = manifest
             .channels
             .entry(ch.to_string())
             .or_insert_with(|| ChannelInfo {
-                version: version.clone(),
-                min_supported_version: min_supported_version.clone(),
+                version: entry.version.clone(),
+                min_supported_version: entry.min_supported_version.clone(),
                 force_update: args.force_update,
                 pub_date: None,
                 notes: args.notes.clone(),
                 packages: HashMap::new(),
             });
 
-        ch_entry.version = version;
-        if min_supported_version.is_some() {
-            ch_entry.min_supported_version = min_supported_version;
+        ch_entry.version = entry.version;
+        if entry.min_supported_version.is_some() {
+            ch_entry.min_supported_version = entry.min_supported_version;
         }
         if args.force_update {
             ch_entry.force_update = true;
@@ -205,11 +210,11 @@ fn update_manifest_entries(
         if let Some(ref n) = args.notes {
             ch_entry.notes = Some(n.clone());
         }
-        ch_entry.packages.insert(args.target.clone(), package_info);
+        ch_entry.packages.insert(args.target.clone(), entry.package_info);
     } else {
-        manifest.version = version;
-        if min_supported_version.is_some() {
-            manifest.min_supported_version = min_supported_version;
+        manifest.version = entry.version;
+        if entry.min_supported_version.is_some() {
+            manifest.min_supported_version = entry.min_supported_version;
         }
         if args.force_update {
             manifest.force_update = true;
@@ -217,7 +222,7 @@ fn update_manifest_entries(
         if let Some(ref n) = args.notes {
             manifest.notes = Some(n.clone());
         }
-        manifest.packages.insert(args.target.clone(), package_info);
+        manifest.packages.insert(args.target.clone(), entry.package_info);
     }
 }
 
@@ -243,20 +248,14 @@ fn handle_release(args: &ReleaseArgs) -> Result<(), Box<dyn std::error::Error>> 
         require_elevation: args.require_elevation,
     };
 
-    let mut manifest = load_or_init_manifest(
-        &args.manifest,
-        &version,
-        min_supported_version.as_ref(),
-        args,
-    )?;
-
-    update_manifest_entries(
-        &mut manifest,
-        args,
+    let entry = ManifestReleaseEntry {
         version,
         min_supported_version,
         package_info,
-    );
+    };
+
+    let mut manifest = load_or_init_manifest(&args.manifest, args, &entry)?;
+    update_manifest_entries(&mut manifest, args, entry);
 
     save_manifest_file(&args.manifest, &manifest)?;
     log::info!(
@@ -269,17 +268,16 @@ fn handle_release(args: &ReleaseArgs) -> Result<(), Box<dyn std::error::Error>> 
 /// 读取现有 Manifest 文件或初始化默认空 Manifest
 fn load_or_init_manifest(
     manifest_path: &Path,
-    version: &Version,
-    min_supported_version: Option<&Version>,
     args: &ReleaseArgs,
+    entry: &ManifestReleaseEntry,
 ) -> Result<Manifest, Box<dyn std::error::Error>> {
     if manifest_path.exists() {
         let content = fs::read_to_string(manifest_path)?;
         Ok(serde_json::from_str::<Manifest>(&content)?)
     } else {
         Ok(Manifest {
-            version: version.clone(),
-            min_supported_version: min_supported_version.cloned(),
+            version: entry.version.clone(),
+            min_supported_version: entry.min_supported_version.clone(),
             force_update: args.force_update,
             pub_date: None,
             notes: args.notes.clone(),

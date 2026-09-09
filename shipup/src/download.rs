@@ -283,14 +283,14 @@ where
     };
 
     event_callback(UpdateEvent::DownloadStarted { total_bytes });
-    pipe_blocking_stream(
-        &mut response,
+    let ctx = StreamPipeContext {
         file,
         initial_downloaded,
         total_bytes,
-        options,
+        cancel_flag: options.cancel_flag.as_ref(),
         event_callback,
-    )?;
+    };
+    pipe_blocking_stream(&mut response, ctx)?;
 
     log::info!(
         "更新包同步下载完成，临时路径: {}",
@@ -299,24 +299,29 @@ where
     Ok(())
 }
 
+/// 流式传输上下文对象
+struct StreamPipeContext<'a, TFile, F> {
+    file: TFile,
+    initial_downloaded: u64,
+    total_bytes: Option<u64>,
+    cancel_flag: Option<&'a Arc<AtomicBool>>,
+    event_callback: &'a mut F,
+}
+
 #[cfg(feature = "blocking")]
 fn pipe_blocking_stream<F>(
     response: &mut reqwest::blocking::Response,
-    mut file: File,
-    initial_downloaded: u64,
-    total_bytes: Option<u64>,
-    options: &DownloadOptions<'_>,
-    event_callback: &mut F,
+    mut ctx: StreamPipeContext<'_, File, F>,
 ) -> Result<()>
 where
     F: FnMut(UpdateEvent),
 {
-    let mut downloaded_bytes: u64 = initial_downloaded;
-    let mut tracker = DownloadProgressTracker::new(total_bytes);
+    let mut downloaded_bytes: u64 = ctx.initial_downloaded;
+    let mut tracker = DownloadProgressTracker::new(ctx.total_bytes);
     let mut buffer = [0u8; BUFFER_SIZE];
 
     loop {
-        if let Some(ref flag) = options.cancel_flag
+        if let Some(flag) = ctx.cancel_flag
             && flag.load(Ordering::Relaxed)
         {
             log::warn!("检测到用户主动取消下载信号，保留已下载文件以供断点续传");
@@ -329,23 +334,23 @@ where
             Err(e) => return Err(UpdateError::Io(e)),
         };
 
-        if let Err(e) = file.write_all(&buffer[..read_bytes]) {
+        if let Err(e) = ctx.file.write_all(&buffer[..read_bytes]) {
             return Err(UpdateError::Io(e));
         }
 
         downloaded_bytes = downloaded_bytes.saturating_add(read_bytes as u64);
         let (percent, speed_bytes_per_sec, eta) = tracker.update(downloaded_bytes);
 
-        event_callback(UpdateEvent::DownloadProgress {
+        (ctx.event_callback)(UpdateEvent::DownloadProgress {
             downloaded_bytes,
-            total_bytes,
+            total_bytes: ctx.total_bytes,
             percent,
             speed_bytes_per_sec,
             eta,
         });
     }
 
-    file.flush()?;
+    ctx.file.flush()?;
     Ok(())
 }
 
@@ -466,15 +471,14 @@ where
     };
 
     event_callback(UpdateEvent::DownloadStarted { total_bytes });
-    pipe_async_stream(
-        response,
+    let ctx = StreamPipeContext {
         file,
         initial_downloaded,
         total_bytes,
-        options,
+        cancel_flag: options.cancel_flag.as_ref(),
         event_callback,
-    )
-    .await?;
+    };
+    pipe_async_stream(response, ctx).await?;
 
     log::info!(
         "更新包异步下载完成，临时路径: {}",
@@ -486,23 +490,19 @@ where
 #[cfg(feature = "async")]
 async fn pipe_async_stream<F>(
     response: reqwest::Response,
-    mut file: tokio::fs::File,
-    initial_downloaded: u64,
-    total_bytes: Option<u64>,
-    options: &DownloadOptions<'_>,
-    event_callback: &mut F,
+    mut ctx: StreamPipeContext<'_, tokio::fs::File, F>,
 ) -> Result<()>
 where
     F: FnMut(UpdateEvent) + Send,
 {
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
-    let mut downloaded_bytes: u64 = initial_downloaded;
-    let mut tracker = DownloadProgressTracker::new(total_bytes);
+    let mut downloaded_bytes: u64 = ctx.initial_downloaded;
+    let mut tracker = DownloadProgressTracker::new(ctx.total_bytes);
     let mut stream = response.bytes_stream();
 
     while let Some(chunk_res) = stream.next().await {
-        if let Some(ref flag) = options.cancel_flag
+        if let Some(flag) = ctx.cancel_flag
             && flag.load(Ordering::Relaxed)
         {
             log::warn!("检测到用户主动取消异步下载信号，保留已下载文件以供断点续传");
@@ -514,23 +514,23 @@ where
             Err(e) => return Err(UpdateError::Network(format!("下载数据流中断: {}", e))),
         };
 
-        if let Err(e) = file.write_all(&chunk).await {
+        if let Err(e) = ctx.file.write_all(&chunk).await {
             return Err(UpdateError::Io(e));
         }
 
         downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
         let (percent, speed_bytes_per_sec, eta) = tracker.update(downloaded_bytes);
 
-        event_callback(UpdateEvent::DownloadProgress {
+        (ctx.event_callback)(UpdateEvent::DownloadProgress {
             downloaded_bytes,
-            total_bytes,
+            total_bytes: ctx.total_bytes,
             percent,
             speed_bytes_per_sec,
             eta,
         });
     }
 
-    file.flush().await?;
+    ctx.file.flush().await?;
     Ok(())
 }
 

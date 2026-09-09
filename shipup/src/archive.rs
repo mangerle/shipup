@@ -15,6 +15,33 @@ const MAX_EXPANSION_RATIO: u64 = 10;
 /// 默认解压体积硬上限（1GB）
 const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
 
+#[cfg(any(feature = "archive-zip", feature = "archive-tar"))]
+/// 解压安全预算计量器（防解压炸弹）
+struct ExtractionBudget {
+    extracted: u64,
+    max_allowed: u64,
+}
+
+#[cfg(any(feature = "archive-zip", feature = "archive-tar"))]
+impl ExtractionBudget {
+    fn new(max_allowed: u64) -> Self {
+        Self {
+            extracted: 0,
+            max_allowed,
+        }
+    }
+
+    fn check_and_add(&mut self, bytes: u64) -> Result<()> {
+        self.extracted = self.extracted.saturating_add(bytes);
+        if self.extracted > self.max_allowed {
+            return Err(UpdateError::ArchiveExtract(
+                "解压后体积超出安全阈值，防解压炸弹机制已熔断".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// 解压更新归档包到安全沙箱目录，并提取指定的目标可执行文件或 Bundle
 ///
 /// # 设计原理
@@ -79,7 +106,7 @@ fn extract_zip(archive_path: &Path, canonical_sandbox: &Path) -> Result<()> {
     let mut zip = zip::ZipArchive::new(file)
         .map_err(|e| UpdateError::ArchiveExtract(format!("读取 zip 归档失败: {}", e)))?;
 
-    let mut total_extracted: u64 = 0;
+    let mut budget = ExtractionBudget::new(max_allowed_bytes);
 
     for i in 0..zip.len() {
         let mut entry = zip
@@ -102,12 +129,7 @@ fn extract_zip(archive_path: &Path, canonical_sandbox: &Path) -> Result<()> {
             ));
         }
 
-        unpack_single_zip_entry(
-            &mut entry,
-            &dest_path,
-            &mut total_extracted,
-            max_allowed_bytes,
-        )?;
+        unpack_single_zip_entry(&mut entry, &dest_path, &mut budget)?;
     }
 
     Ok(())
@@ -117,8 +139,7 @@ fn extract_zip(archive_path: &Path, canonical_sandbox: &Path) -> Result<()> {
 fn unpack_single_zip_entry<R: Read>(
     entry: &mut zip::read::ZipFile<'_, R>,
     dest_path: &Path,
-    total_extracted: &mut u64,
-    max_allowed_bytes: u64,
+    budget: &mut ExtractionBudget,
 ) -> Result<()> {
     if entry.is_dir() {
         fs::create_dir_all(dest_path)?;
@@ -139,12 +160,7 @@ fn unpack_single_zip_entry<R: Read>(
         if n == 0 {
             break;
         }
-        *total_extracted += n as u64;
-        if *total_extracted > max_allowed_bytes {
-            return Err(UpdateError::ArchiveExtract(
-                "解压后体积超出安全阈值，防解压炸弹机制已熔断".to_string(),
-            ));
-        }
+        budget.check_and_add(n as u64)?;
         io::Write::write_all(&mut out_file, &buffer[..n])?;
     }
 
@@ -174,7 +190,7 @@ fn extract_tar_gz(archive_path: &Path, canonical_sandbox: &Path) -> Result<()> {
 
     let gz = flate2::read::GzDecoder::new(file);
     let mut tar = tar::Archive::new(gz);
-    let mut total_extracted: u64 = 0;
+    let mut budget = ExtractionBudget::new(max_allowed_bytes);
 
     let entries = tar
         .entries()
@@ -211,12 +227,7 @@ fn extract_tar_gz(archive_path: &Path, canonical_sandbox: &Path) -> Result<()> {
             ));
         }
 
-        unpack_single_tar_entry(
-            &mut entry,
-            &dest_path,
-            &mut total_extracted,
-            max_allowed_bytes,
-        )?;
+        unpack_single_tar_entry(&mut entry, &dest_path, &mut budget)?;
     }
 
     Ok(())
@@ -226,8 +237,7 @@ fn extract_tar_gz(archive_path: &Path, canonical_sandbox: &Path) -> Result<()> {
 fn unpack_single_tar_entry<R: Read>(
     entry: &mut tar::Entry<'_, R>,
     dest_path: &Path,
-    total_extracted: &mut u64,
-    max_allowed_bytes: u64,
+    budget: &mut ExtractionBudget,
 ) -> Result<()> {
     let entry_type = entry.header().entry_type();
     if entry_type.is_symlink() || entry_type.is_hard_link() {
@@ -253,12 +263,7 @@ fn unpack_single_tar_entry<R: Read>(
         if n == 0 {
             break;
         }
-        *total_extracted += n as u64;
-        if *total_extracted > max_allowed_bytes {
-            return Err(UpdateError::ArchiveExtract(
-                "解压后体积超出安全阈值，防解压炸弹机制已熔断".to_string(),
-            ));
-        }
+        budget.check_and_add(n as u64)?;
         io::Write::write_all(&mut out_file, &buffer[..n])?;
     }
 
