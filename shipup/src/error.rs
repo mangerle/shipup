@@ -108,6 +108,10 @@ pub enum UpdateError {
         "本地文件传输协议受限: 地址 '{0}' 采用 file:// 协议，需通过 allow_file_protocol 显式允许"
     )]
     FileProtocolNotAllowed(String),
+
+    /// 未找到指定的历史回滚版本或备份物理文件已丢失
+    #[error("未找到可用的历史回滚版本 ({0}) 或物理备份文件已丢失")]
+    RollbackVersionNotFound(String),
 }
 
 impl From<semver::Error> for UpdateError {

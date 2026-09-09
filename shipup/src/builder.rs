@@ -61,6 +61,8 @@ pub struct UpdaterConfig {
     pub fallback_manifest: Option<Manifest>,
     /// 客户端设备稳定唯一标识（用于灰度放量哈希分桶）
     pub client_id: Option<String>,
+    /// 最大保留的历史版本回滚备份数量（默认 3）
+    pub max_rollback_entries: usize,
 }
 
 impl std::fmt::Debug for UpdaterConfig {
@@ -89,6 +91,7 @@ impl std::fmt::Debug for UpdaterConfig {
                 &self.version_comparator.is_some(),
             )
             .field("preference_path", &self.preference_path)
+            .field("max_rollback_entries", &self.max_rollback_entries)
             .finish()
     }
 }
@@ -134,6 +137,7 @@ pub struct UpdaterBuilder {
     pub(crate) allow_file_protocol: bool,
     pub(crate) fallback_manifest: Option<Manifest>,
     pub(crate) client_id: Option<String>,
+    pub(crate) max_rollback_entries: usize,
 }
 
 impl std::fmt::Debug for UpdaterBuilder {
@@ -166,6 +170,7 @@ impl std::fmt::Debug for UpdaterBuilder {
             .field("allow_file_protocol", &self.allow_file_protocol)
             .field("has_fallback_manifest", &self.fallback_manifest.is_some())
             .field("client_id", &self.client_id)
+            .field("max_rollback_entries", &self.max_rollback_entries)
             .finish()
     }
 }
@@ -194,6 +199,7 @@ impl Default for UpdaterBuilder {
             allow_file_protocol: false,
             fallback_manifest: None,
             client_id: None,
+            max_rollback_entries: crate::recovery::DEFAULT_MAX_ROLLBACK_ENTRIES,
         }
     }
 }
@@ -434,6 +440,15 @@ impl UpdaterBuilder {
         self
     }
 
+    /// 设置最大保留的历史版本回滚备份数量（默认 3 个）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：允许调用方根据磁盘存储空间与历史可追溯性灵活配置旧版本保留条目数。
+    pub fn max_rollback_entries(mut self, max: usize) -> Self {
+        self.max_rollback_entries = max;
+        self
+    }
+
     /// 构建 Updater 实例并完成前置安全门禁与合法性校验
     ///
     /// # 校验内容
@@ -494,6 +509,7 @@ impl UpdaterBuilder {
             allow_file_protocol: self.allow_file_protocol,
             fallback_manifest: self.fallback_manifest,
             client_id: self.client_id,
+            max_rollback_entries: self.max_rollback_entries,
         };
 
         Ok(Updater::new(config))

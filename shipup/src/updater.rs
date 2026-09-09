@@ -48,6 +48,7 @@ pub(crate) struct NetworkSecurityConfig {
     pub require_signature: bool,
     pub max_bytes_per_sec: Option<u64>,
     pub allow_file_protocol: bool,
+    pub max_rollback_entries: usize,
 }
 
 /// 更新器内部共享核心状态实体
@@ -215,6 +216,60 @@ impl Updater {
             .clone()
     }
 
+    /// 解析更新状态与历史记录存放目录
+    fn resolve_state_dir(&self) -> PathBuf {
+        crate::preference::resolve_safe_data_dir().unwrap_or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| PathBuf::from("."))
+        })
+    }
+
+    /// 获取当前所有物理备份依然存在的可用回滚历史版本列表（按时间倒序排列，最新备份在前）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：向宿主 UI 或控制台暴露历史上可用于安全降级回滚的稳定版本清单。
+    /// - **核心优势**：自动过滤物理文件已丢失的孤儿记录，确保返回的版本均可被成功执行回滚。
+    pub fn available_rollback_versions(&self) -> Vec<Version> {
+        let state_dir = self.resolve_state_dir();
+        crate::recovery::list_available_rollback_versions(&state_dir)
+    }
+
+    /// 主动回滚至指定的历史版本
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：将原本“只能依赖连续崩溃 3 次被动自愈”的回滚机制升级为宿主可主动触发的确定性运维能力。
+    /// - **核心优势**：校验物理文件完整性，兼容当前运行二进制自替换与外部托管沙箱，回滚完成后自动解除自愈观察期标记。
+    ///
+    /// # Errors
+    /// 当目标版本在历史中不存在、物理备份文件已丢失或执行文件原子替换失败时返回 [`UpdateError`]。
+    pub fn rollback_to(&self, target_version: &Version) -> Result<()> {
+        let state_dir = self.resolve_state_dir();
+        let current_exe = std::env::current_exe()?;
+        crate::recovery::execute_manual_rollback_to(&state_dir, &current_exe, target_version)
+    }
+
+    /// 主动回滚至最近的一个历史备份版本
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：提供一键回退到“上一个可用版本”的极简接口，常用于用户在设置中点击“回滚上个版本”按钮。
+    /// - **核心优势**：自动获取时间戳最新的可用历史版本执行回滚，无须调用方手动查找比对版本号。
+    ///
+    /// # Errors
+    /// 当系统无任何可用的历史备份或物理替换执行失败时返回 [`UpdateError`]。
+    pub fn rollback_to_previous(&self) -> Result<Version> {
+        let versions = self.available_rollback_versions();
+        let target = versions.first().ok_or_else(|| {
+            UpdateError::RollbackVersionNotFound(
+                "当前系统未检测到任何可用的历史回滚版本".to_string(),
+            )
+        })?;
+        let version_cloned = target.clone();
+        self.rollback_to(&version_cloned)?;
+        Ok(version_cloned)
+    }
+
     pub(crate) fn new(config: UpdaterConfig) -> Self {
         if config.auto_recover_on_init {
             // 仅在显式声明时执行单次启动自愈检查，防止多实例重复自增计数误触发回滚
@@ -282,6 +337,7 @@ impl Updater {
                     require_signature: config.require_signature,
                     max_bytes_per_sec: config.max_bytes_per_sec,
                     allow_file_protocol: config.allow_file_protocol,
+                    max_rollback_entries: config.max_rollback_entries,
                 }),
                 version_comparator: config.version_comparator,
                 preference: Mutex::new(preference),
@@ -709,6 +765,7 @@ impl Update {
             current_version: self.current_version.clone(),
             release: self.release.clone(),
             downloaded_path: temp_download_path,
+            max_rollback_entries: self.config.max_rollback_entries,
         })
     }
 
@@ -843,6 +900,7 @@ impl Update {
             current_version: self.current_version.clone(),
             release: self.release.clone(),
             downloaded_path: temp_download_path,
+            max_rollback_entries: self.config.max_rollback_entries,
         })
     }
 
@@ -957,6 +1015,7 @@ pub struct DownloadedUpdate {
     current_version: Version,
     release: ResolvedRelease,
     downloaded_path: PathBuf,
+    max_rollback_entries: usize,
 }
 
 impl DownloadedUpdate {
@@ -1001,7 +1060,13 @@ impl DownloadedUpdate {
     where
         F: FnMut(UpdateEvent),
     {
-        match apply_downloaded_payload(&self.release, &self.downloaded_path, &mut callback) {
+        match apply_downloaded_payload(
+            &self.current_version,
+            &self.release,
+            &self.downloaded_path,
+            self.max_rollback_entries,
+            &mut callback,
+        ) {
             Ok(()) => {
                 callback(UpdateEvent::Completed);
                 Ok(())
@@ -1017,8 +1082,10 @@ impl DownloadedUpdate {
 }
 
 fn apply_downloaded_payload<F>(
+    current_version: &Version,
     release: &ResolvedRelease,
     temp_path: &Path,
+    max_rollback_entries: usize,
     callback: &mut F,
 ) -> Result<()>
 where
@@ -1027,10 +1094,15 @@ where
     match release.package.package_type {
         PackageType::Binary => {
             callback(UpdateEvent::Installing);
-            let backup_path = prepare_backup_before_replace()?;
+            let backup_path = prepare_backup_before_replace(current_version)?;
             replace_binary(temp_path)?;
             let _ = fs::remove_file(temp_path);
-            record_state_if_possible(&release.version, backup_path.as_deref());
+            record_state_if_possible(
+                current_version,
+                &release.version,
+                backup_path.as_deref(),
+                max_rollback_entries,
+            );
             callback(UpdateEvent::ReadyToRestart);
         }
         PackageType::Archive => {
@@ -1061,7 +1133,7 @@ where
                     sync_extracted_payload(payload_dir, target_dir, &extracted_binary)?;
                 }
 
-                let backup_path = prepare_backup_before_replace()?;
+                let backup_path = prepare_backup_before_replace(current_version)?;
                 replace_binary(&extracted_binary)?;
                 Ok(backup_path)
             })();
@@ -1070,7 +1142,12 @@ where
             let _ = fs::remove_file(temp_path);
             let backup_path = apply_result?;
 
-            record_state_if_possible(&release.version, backup_path.as_deref());
+            record_state_if_possible(
+                current_version,
+                &release.version,
+                backup_path.as_deref(),
+                max_rollback_entries,
+            );
             callback(UpdateEvent::ReadyToRestart);
         }
         PackageType::Installer => {
@@ -1088,7 +1165,7 @@ where
     Ok(())
 }
 
-fn prepare_backup_before_replace() -> Result<Option<PathBuf>> {
+fn prepare_backup_before_replace(current_version: &Version) -> Result<Option<PathBuf>> {
     #[cfg(target_os = "macos")]
     {
         if let Some(bundle) = crate::platform::macos::find_current_app_bundle() {
@@ -1097,11 +1174,8 @@ fn prepare_backup_before_replace() -> Result<Option<PathBuf>> {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("app.app");
-                let backup_bundle = parent.join(format!(
-                    "{}{}",
-                    bundle_name,
-                    crate::platform::macos::OLD_BACKUP_SUFFIX
-                ));
+                let backup_bundle =
+                    parent.join(format!("{}.shipup.{}.old", bundle_name, current_version));
                 return Ok(Some(backup_bundle));
             }
         }
@@ -1114,7 +1188,7 @@ fn prepare_backup_before_replace() -> Result<Option<PathBuf>> {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("app");
-        let backup_path = parent.join(format!("{}.shipup.old", exe_name));
+        let backup_path = parent.join(format!("{}.shipup.{}.old", exe_name, current_version));
         if backup_path.exists() {
             let _ = fs::remove_file(&backup_path);
         }
@@ -1129,13 +1203,29 @@ fn prepare_backup_before_replace() -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-fn record_state_if_possible(target_version: &Version, backup_path: Option<&Path>) {
-    if let Some(target_dir) = crate::preference::resolve_safe_data_dir()
+fn record_state_if_possible(
+    current_version: &Version,
+    target_version: &Version,
+    backup_path: Option<&Path>,
+    max_rollback_entries: usize,
+) {
+    let target_dir = crate::preference::resolve_safe_data_dir().or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    });
+
+    if let Some(dir) = target_dir
         && let Some(backup) = backup_path
         && backup.exists()
     {
-        let _ =
-            crate::recovery::record_update_state(&target_dir, &target_version.to_string(), backup);
+        let _ = crate::recovery::record_update_state(&dir, &target_version.to_string(), backup);
+        let _ = crate::recovery::record_rollback_version(
+            &dir,
+            current_version,
+            backup,
+            max_rollback_entries,
+        );
     }
 }
 
@@ -1405,6 +1495,7 @@ mod tests {
             current_version: Version::parse("1.0.0").unwrap(),
             release,
             downloaded_path: temp_path.clone(),
+            max_rollback_entries: crate::recovery::DEFAULT_MAX_ROLLBACK_ENTRIES,
         };
 
         assert_eq!(downloaded.version(), &Version::parse("1.2.0").unwrap());

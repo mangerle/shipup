@@ -42,8 +42,10 @@ pub use platform::{
 pub use poller::{AutoPollEvent, AutoPollOptions, AutoPollerHandle};
 pub use preference::UpdatePreference;
 pub use recovery::{
-    HealthCheckStatus, check_and_recover_current, check_and_recover_once, confirm_update_success,
-    confirm_update_success_in_dir,
+    DEFAULT_MAX_ROLLBACK_ENTRIES, HealthCheckStatus, ROLLBACK_HISTORY_FILENAME, RollbackEntry,
+    RollbackHistory, check_and_recover_current, check_and_recover_once, confirm_update_success,
+    confirm_update_success_in_dir, execute_manual_rollback_to, list_available_rollback_versions,
+    load_rollback_history, record_rollback_version,
 };
 pub use restart::{RestartContext, SHIPUP_RESTARTED_ARG, is_restarted_by_shipup, restart_with};
 pub use template::{TemplateContext, resolve_url_template};

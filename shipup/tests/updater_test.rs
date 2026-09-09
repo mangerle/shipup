@@ -273,3 +273,27 @@ fn test_invalid_signature_and_checksum_mismatch() {
     let sig_res = verify_ed25519(payload, &dummy_sig, &dummy_pub);
     assert!(matches!(sig_res, Err(UpdateError::InvalidSignature)));
 }
+
+#[test]
+fn test_updater_manual_rollback_api() {
+    let temp_dir = std::env::temp_dir().join(format!("shipup_rb_api_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let exe_path = temp_dir.join("app.exe");
+    std::fs::write(&exe_path, b"version-2.0.0-code").unwrap();
+
+    let backup_path = temp_dir.join("app.exe.shipup.1.0.0.old");
+    std::fs::write(&backup_path, b"version-1.0.0-code").unwrap();
+
+    let v1 = semver::Version::parse("1.0.0").unwrap();
+    shipup::record_rollback_version(&temp_dir, &v1, &backup_path, 3).unwrap();
+
+    let available = shipup::list_available_rollback_versions(&temp_dir);
+    assert_eq!(available, vec![v1.clone()]);
+
+    shipup::execute_manual_rollback_to(&temp_dir, &exe_path, &v1).unwrap();
+    assert_eq!(std::fs::read(&exe_path).unwrap(), b"version-1.0.0-code");
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
