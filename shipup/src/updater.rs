@@ -505,12 +505,44 @@ impl Updater {
 
     /// 针对 Manifest 实体结构执行验签与版本评估
     fn evaluate_manifest_struct(&self, manifest: &Manifest) -> Result<Option<Update>> {
+        // 1. 校验 Manifest 有效期限，防范过期清单重放攻击
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        manifest.verify_freshness(now_unix)?;
+
+        // 2. 校验 Manifest 清单自身数字签名
         if !self.inner.config.public_keys.is_empty() {
             if let Some(ref _sig) = manifest.signature {
                 manifest.verify_signature(&self.inner.config.public_keys)?;
                 log::info!("更新源 Manifest 清单自身数字签名防伪验证通过");
             } else if self.inner.config.require_signature {
                 log::debug!("当前 Manifest 未附带根级数字签名，将严格依赖后续安装包体级数字签名");
+            }
+        }
+
+        // 3. 校验单调递增版本序号（防重放与版本逆向），并在合法时更新偏好
+        if let Some(remote_seq) = manifest.version_seq {
+            let mut pref = self
+                .inner
+                .preference
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(current_seq) = pref.last_version_seq()
+                && remote_seq < current_seq
+            {
+                return Err(UpdateError::StaleManifestVersion {
+                    current: current_seq,
+                    remote: remote_seq,
+                });
+            }
+            let is_newer = pref.last_version_seq().is_none_or(|curr| remote_seq > curr);
+            if is_newer {
+                pref.record_version_seq(remote_seq);
+                if let Some(ref path) = self.inner.preference_path {
+                    let _ = pref.save_to_file(path);
+                }
             }
         }
 
@@ -1701,5 +1733,99 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn test_evaluate_manifest_expired_rejected() {
+        let temp_pref = std::env::temp_dir().join(format!(
+            "test_pref_exp_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let updater = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .target("x86_64-pc-windows-msvc")
+            .manifest_url("https://example.com/manifest.json")
+            .preference_path(&temp_pref)
+            .require_signature(false)
+            .build()
+            .unwrap();
+
+        // 设定过期时间为过去的某个时间点（1970年）
+        let expired_manifest_json = r#"{
+            "version": "2.0.0",
+            "expires_at": "1970-01-01T00:00:00Z",
+            "packages": {
+                "x86_64-pc-windows-msvc": {
+                    "url": "https://example.com/app-2.0.0.zip",
+                    "package_type": "archive"
+                }
+            }
+        }"#;
+
+        let result = updater.evaluate_manifest(expired_manifest_json);
+        assert!(matches!(result, Err(UpdateError::ManifestExpired(_))));
+        let _ = std::fs::remove_file(&temp_pref);
+    }
+
+    #[test]
+    fn test_evaluate_manifest_version_seq_anti_replay() {
+        let temp_pref = std::env::temp_dir().join(format!(
+            "test_pref_seq_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let updater = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .target("x86_64-pc-windows-msvc")
+            .manifest_url("https://example.com/manifest.json")
+            .preference_path(&temp_pref)
+            .require_signature(false)
+            .build()
+            .unwrap();
+
+        // 1. 首次处理高版本序号 version_seq = 100
+        let manifest_v100 = r#"{
+            "version": "2.0.0",
+            "version_seq": 100,
+            "packages": {
+                "x86_64-pc-windows-msvc": {
+                    "url": "https://example.com/app-2.0.0.zip",
+                    "package_type": "archive"
+                }
+            }
+        }"#;
+        assert!(updater.evaluate_manifest(manifest_v100).unwrap().is_some());
+        assert_eq!(updater.preferences().last_version_seq(), Some(100));
+
+        // 2. 攻击者尝试重放低版本序号 version_seq = 90 的旧清单
+        let stale_manifest = r#"{
+            "version": "2.0.0",
+            "version_seq": 90,
+            "packages": {
+                "x86_64-pc-windows-msvc": {
+                    "url": "https://example.com/app-2.0.0.zip",
+                    "package_type": "archive"
+                }
+            }
+        }"#;
+        let err = updater.evaluate_manifest(stale_manifest);
+        assert!(matches!(
+            err,
+            Err(UpdateError::StaleManifestVersion {
+                current: 100,
+                remote: 90
+            })
+        ));
+
+        let _ = std::fs::remove_file(&temp_pref);
     }
 }

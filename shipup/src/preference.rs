@@ -25,9 +25,23 @@ pub struct UpdatePreference {
     /// 客户端设备持久化稳定唯一标识（用于灰度放量哈希分桶）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// 客户端已知的最高清单单调递增版本序号（用于防重放攻击）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_version_seq: Option<u64>,
 }
 
 impl UpdatePreference {
+    /// 获取当前记录的最高版本序号
+    pub fn last_version_seq(&self) -> Option<u64> {
+        self.last_version_seq
+    }
+
+    /// 更新记录的最高版本序号（仅在序号单调递增时覆写）
+    pub fn record_version_seq(&mut self, seq: u64) {
+        if self.last_version_seq.is_none_or(|curr| seq > curr) {
+            self.last_version_seq = Some(seq);
+        }
+    }
     /// 从指定本地 JSON 文件中反序列化加载更新偏好配置
     ///
     /// # 设计原理

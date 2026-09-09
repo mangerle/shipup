@@ -188,6 +188,14 @@ pub struct Manifest {
     /// 默认主通道灰度放量比例（0..=100，若未配置则默认全量放行）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout_percentage: Option<u8>,
+
+    /// 清单过期失效时间戳（RFC 3339 格式，如 "2026-09-10T12:00:00Z"），用于防御重放攻击
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+
+    /// 单调递增的清单版本序号，用于防范版本降级与重放攻击
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_seq: Option<u64>,
 }
 
 /// 解析路由后最终用于执行更新的结构体
@@ -265,6 +273,30 @@ impl Manifest {
             .ok_or(UpdateError::MissingSignature)?;
         let canonical_bytes = self.compute_canonical_bytes()?;
         crate::signature::verify_ed25519_any_key(&canonical_bytes, sig, public_keys)
+    }
+
+    /// 校验 Manifest 是否已超过指定的过期失效时间戳
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：防御重放攻击（Replay Attacks），杜绝攻击者使用已废弃但带有合法签名的旧版本清单。
+    /// - **核心优势**：直接基于绝对 Unix 秒数比对，零额外外部重度依赖。
+    ///
+    /// # Errors
+    /// 当配置了 `expires_at` 且当前时间已晚于该时间戳时，返回 [`UpdateError::ManifestExpired`]。
+    pub fn verify_freshness(&self, now_unix: u64) -> Result<()> {
+        if let Some(ref exp) = self.expires_at {
+            if let Some(exp_ts) = parse_rfc3339_to_unix(exp) {
+                if now_unix > exp_ts {
+                    return Err(UpdateError::ManifestExpired(exp.clone()));
+                }
+            } else {
+                return Err(UpdateError::ManifestParse(format!(
+                    "无法解析 expires_at 时间戳: {}",
+                    exp
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// 根据路由选项进行通道选择与平台 Target 匹配
@@ -446,6 +478,83 @@ pub fn current_target_triple() -> &'static str {
     return "unknown-target";
 }
 
+/// 将 RFC 3339 UTC 格式的时间戳字符串（如 "2026-09-10T12:00:00Z"）解析为 Unix 时间戳秒数
+///
+/// # 设计原理
+/// - **实现初衷**：为 Manifest 的 `expires_at` 提供无需庞大外部依赖的高性能纯 Rust 解析器。
+/// - **核心优势**：遵循格里高利历闰年规则，严格校验日期时间边界，拒绝非法时间格式。
+pub fn parse_rfc3339_to_unix(s: &str) -> Option<u64> {
+    let clean = s.trim();
+    if clean.len() < 20 {
+        return None;
+    }
+    let parts: Vec<&str> = clean.split('T').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let date_parts: Vec<&str> = parts[0].split('-').collect();
+    if date_parts.len() != 3 {
+        return None;
+    }
+    let year: i32 = date_parts[0].parse().ok()?;
+    let month: u32 = date_parts[1].parse().ok()?;
+    let day: u32 = date_parts[2].parse().ok()?;
+
+    let time_str = parts[1].trim_end_matches('Z');
+    let time_parts: Vec<&str> = time_str.split(':').collect();
+    if time_parts.len() < 3 {
+        return None;
+    }
+    let hour: u32 = time_parts[0].parse().ok()?;
+    let min: u32 = time_parts[1].parse().ok()?;
+    let sec_str = time_parts[2].split('.').next()?;
+    let sec: u32 = sec_str.parse().ok()?;
+
+    if year < 1970
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour >= 24
+        || min >= 60
+        || sec >= 60
+    {
+        return None;
+    }
+
+    let mut total_days: i64 = 0;
+    for y in 1970..year {
+        let is_leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+        total_days += if is_leap { 366 } else { 365 };
+    }
+
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let days_in_months = [
+        31,
+        if is_leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+
+    for m in 1..month {
+        total_days += days_in_months[(m - 1) as usize] as i64;
+    }
+    total_days += (day - 1) as i64;
+
+    let total_secs = total_days * 86400 + (hour as i64 * 3600) + (min as i64 * 60) + (sec as i64);
+    if total_secs < 0 {
+        None
+    } else {
+        Some(total_secs as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,6 +648,8 @@ mod tests {
             channels,
             signature: None,
             rollout_percentage: None,
+            expires_at: None,
+            version_seq: None,
         };
 
         let current_ver = Version::parse("1.0.0").unwrap();
@@ -636,6 +747,8 @@ mod tests {
             channels: BTreeMap::new(),
             signature: None,
             rollout_percentage: None,
+            expires_at: None,
+            version_seq: None,
         };
 
         // 计算规范字节并进行签名
@@ -718,5 +831,47 @@ mod tests {
             instance_b.verify_signature(&[pubkey_b64]).is_ok(),
             "跨实例反序列化后验签必须成功通过"
         );
+    }
+
+    #[test]
+    fn test_parse_rfc3339_to_unix() {
+        // 标准纪元原点
+        assert_eq!(parse_rfc3339_to_unix("1970-01-01T00:00:00Z"), Some(0));
+        // 2026 年已知时间戳 (1767225600)
+        assert_eq!(
+            parse_rfc3339_to_unix("2026-01-01T00:00:00Z"),
+            Some(1767225600)
+        );
+        // 边界非法格式返回 None
+        assert_eq!(parse_rfc3339_to_unix("invalid-timestamp"), None);
+        assert_eq!(parse_rfc3339_to_unix("1969-12-31T23:59:59Z"), None);
+    }
+
+    #[test]
+    fn test_manifest_expires_at_and_freshness_verification() {
+        let mut manifest = Manifest {
+            version: Version::parse("2.0.0").unwrap(),
+            min_supported_version: None,
+            force_update: false,
+            pub_date: None,
+            notes: None,
+            packages: BTreeMap::new(),
+            channels: BTreeMap::new(),
+            signature: None,
+            rollout_percentage: None,
+            expires_at: Some("2026-01-01T00:00:00Z".to_string()),
+            version_seq: Some(10),
+        };
+
+        // 1. 在过期时间之前评估，应当成功通过
+        assert!(manifest.verify_freshness(1767225599).is_ok());
+
+        // 2. 达到或超过过期时间评估，应当返回 ManifestExpired
+        let err = manifest.verify_freshness(1767225601);
+        assert!(matches!(err, Err(UpdateError::ManifestExpired(_))));
+
+        // 3. 未设置 expires_at 时恒定放行
+        manifest.expires_at = None;
+        assert!(manifest.verify_freshness(9999999999).is_ok());
     }
 }

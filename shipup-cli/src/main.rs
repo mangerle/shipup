@@ -59,6 +59,12 @@ struct BatchReleaseConfig {
     rollout_percentage: Option<u8>,
     manifest: Option<PathBuf>,
     key: Option<PathBuf>,
+    #[serde(default)]
+    expires_at: Option<String>,
+    #[serde(default)]
+    expires_in: Option<String>,
+    #[serde(default)]
+    version_seq: Option<u64>,
     packages: Vec<BatchPackageConfig>,
 }
 
@@ -152,6 +158,18 @@ struct ReleaseArgs {
     /// 灰度放量比例（0..=100，若不指定则全量发布）
     #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
     rollout_percentage: Option<u8>,
+
+    /// 清单过期失效时间戳（RFC 3339 格式，例如 2026-10-01T00:00:00Z）
+    #[arg(long)]
+    expires_at: Option<String>,
+
+    /// 相对当前时间的清单有效时长（例如 30d、24h、60m，自动换算为 expires_at）
+    #[arg(long)]
+    expires_in: Option<String>,
+
+    /// 单调递增的清单版本序号（防重放与版本逆向）
+    #[arg(long)]
+    version_seq: Option<u64>,
 
     /// Manifest JSON 输出或合并文件路径
     #[arg(short, long, default_value = "latest.json")]
@@ -315,6 +333,58 @@ fn format_timestamp_rfc3339(total_secs: u64) -> String {
     let day = (days + 1) as u32;
 
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// 解析相对时长字符串（例如 "30d", "24h", "60m", "3600s"）为 Duration
+///
+/// # 设计原理
+/// - **实现初衷**：为 CLI 发布者提供人性化的 `--expires-in 30d` 语法糖，无须手动换算绝对时间戳。
+/// - **核心优势**：支持常用时间单位（天/小时/分钟/秒），饱和乘法杜绝整数溢出。
+/// - **代价与局限**：仅支持单级单位（如 "30d"），不支持复杂复合表达式（如 "1d2h"）。
+fn parse_duration_str(s: &str) -> Result<std::time::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("时长字符串不能为空");
+    }
+    let (num_part, unit) = s.split_at(
+        s.find(|c: char| !c.is_ascii_digit())
+            .ok_or_else(|| anyhow!("缺少时间单位后缀（支持 d/h/m/s），输入: {}", s))?,
+    );
+    let num: u64 = num_part
+        .parse()
+        .with_context(|| format!("解析时长数值失败: {}", num_part))?;
+    let secs = match unit.trim().to_ascii_lowercase().as_str() {
+        "d" | "day" | "days" => num.saturating_mul(86400),
+        "h" | "hour" | "hours" => num.saturating_mul(3600),
+        "m" | "min" | "mins" | "minute" | "minutes" => num.saturating_mul(60),
+        "s" | "sec" | "secs" | "second" | "seconds" => num,
+        other => anyhow::bail!("不支持的时间单位 '{}'，可选: d, h, m, s", other),
+    };
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+/// 计算并裁决最终的 expires_at RFC 3339 字符串
+///
+/// # 设计原理
+/// - **实现初衷**：统一绝对时间戳 `--expires-at` 与相对时长 `--expires-in` 的计算规则。
+/// - **优先级策略**：若同时提供，优先采用显式绝对时间戳 `--expires-at`。
+fn resolve_expires_at(
+    expires_at: Option<&str>,
+    expires_in: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(exp) = expires_at {
+        Ok(Some(exp.to_string()))
+    } else if let Some(in_str) = expires_in {
+        let dur = parse_duration_str(in_str)?;
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let target_secs = now_secs.saturating_add(dur.as_secs());
+        Ok(Some(format_timestamp_rfc3339(target_secs)))
+    } else {
+        Ok(None)
+    }
 }
 
 /// 流式读取发布包计算 SHA-256 哈希值，并在提供私钥且体积安全时生成 Ed25519 数字签名
@@ -493,6 +563,18 @@ fn update_manifest_entries(
             .insert(target.to_string(), entry.package_info);
     }
 
+    // 若发布参数中指定了过期时间或版本序号，同步更新清单根级别防重放元数据
+    let resolved_expires_at =
+        resolve_expires_at(args.expires_at.as_deref(), args.expires_in.as_deref())
+            .ok()
+            .flatten();
+    if resolved_expires_at.is_some() {
+        manifest.expires_at = resolved_expires_at;
+    }
+    if args.version_seq.is_some() {
+        manifest.version_seq = args.version_seq;
+    }
+
     // 清单内容变更后，原有的全局签名已失效，予以重置
     manifest.signature = None;
 }
@@ -657,11 +739,23 @@ fn handle_batch_release(config_path: &Path, default_manifest_path: &Path) -> Res
         })
         .unwrap_or_else(|| default_manifest_path.to_path_buf());
 
+    let resolved_expires_at = resolve_expires_at(
+        batch_config.expires_at.as_deref(),
+        batch_config.expires_in.as_deref(),
+    )?;
+
     let mut manifest = if manifest_path.exists() {
         let content = fs::read_to_string(&manifest_path)
             .with_context(|| format!("读取已有 Manifest 文件失败: {}", manifest_path.display()))?;
-        serde_json::from_str::<Manifest>(&content)
-            .with_context(|| format!("反序列化 Manifest JSON 失败: {}", manifest_path.display()))?
+        let mut m = serde_json::from_str::<Manifest>(&content)
+            .with_context(|| format!("反序列化 Manifest JSON 失败: {}", manifest_path.display()))?;
+        if resolved_expires_at.is_some() {
+            m.expires_at = resolved_expires_at;
+        }
+        if batch_config.version_seq.is_some() {
+            m.version_seq = batch_config.version_seq;
+        }
+        m
     } else {
         Manifest {
             version: version.clone(),
@@ -673,6 +767,8 @@ fn handle_batch_release(config_path: &Path, default_manifest_path: &Path) -> Res
             channels: BTreeMap::new(),
             signature: None,
             rollout_percentage: batch_config.rollout_percentage,
+            expires_at: resolved_expires_at,
+            version_seq: batch_config.version_seq,
         }
     };
 
@@ -693,22 +789,34 @@ fn handle_batch_release(config_path: &Path, default_manifest_path: &Path) -> Res
             );
         }
 
-        let key_path = pkg.key.as_ref().or(batch_config.key.as_ref()).map(|kp| {
-            if kp.is_relative() {
-                config_dir.join(kp)
-            } else {
-                kp.clone()
-            }
-        });
-
-        let (checksum, signature) = compute_payload_integrity(&pkg_path, key_path.as_deref())?;
-
         let parsed_pkg_type = PackageType::from_str(&pkg.package_type).with_context(|| {
             format!(
-                "平台 '{}' 的包类型 '{}' 无效，可选: binary, archive, installer",
+                "平台 '{}' 的包类型 '{}' 解析失败，可选: binary, archive, installer",
                 pkg.target, pkg.package_type
             )
         })?;
+
+        let key_path = pkg
+            .key
+            .as_ref()
+            .map(|p| {
+                if p.is_relative() {
+                    config_dir.join(p)
+                } else {
+                    p.clone()
+                }
+            })
+            .or_else(|| {
+                batch_config.key.as_ref().map(|p| {
+                    if p.is_relative() {
+                        config_dir.join(p)
+                    } else {
+                        p.clone()
+                    }
+                })
+            });
+
+        let (checksum, signature) = compute_payload_integrity(&pkg_path, key_path.as_deref())?;
 
         let parsed_install_mode = match pkg.install_mode {
             Some(ref mode) => match mode.to_ascii_lowercase().as_str() {
@@ -765,6 +873,9 @@ fn handle_batch_release(config_path: &Path, default_manifest_path: &Path) -> Res
             channel: batch_config.channel.clone(),
             require_elevation: pkg.require_elevation,
             rollout_percentage: batch_config.rollout_percentage,
+            expires_at: batch_config.expires_at.clone(),
+            expires_in: batch_config.expires_in.clone(),
+            version_seq: batch_config.version_seq,
             manifest: manifest_path.clone(),
         };
 
@@ -942,6 +1053,12 @@ fn handle_inspect(args: &InspectArgs) -> Result<()> {
             "无"
         }
     );
+    if let Some(ref exp) = manifest.expires_at {
+        println!("失效时间 (Expires): {}", exp);
+    }
+    if let Some(seq) = manifest.version_seq {
+        println!("版本序号 (Seq):     {}", seq);
+    }
 
     println!("\n[主通道平台包矩阵 (共 {} 个)]", manifest.packages.len());
     for (target, pkg) in &manifest.packages {
@@ -1000,11 +1117,20 @@ fn load_or_init_manifest(
     args: &ReleaseArgs,
     entry: &ManifestReleaseEntry,
 ) -> Result<Manifest> {
+    let resolved_expires_at =
+        resolve_expires_at(args.expires_at.as_deref(), args.expires_in.as_deref())?;
     if manifest_path.exists() {
         let content = fs::read_to_string(manifest_path)
             .with_context(|| format!("读取已有 Manifest 文件失败: {}", manifest_path.display()))?;
-        serde_json::from_str::<Manifest>(&content)
-            .with_context(|| format!("反序列化 Manifest JSON 失败: {}", manifest_path.display()))
+        let mut m = serde_json::from_str::<Manifest>(&content)
+            .with_context(|| format!("反序列化 Manifest JSON 失败: {}", manifest_path.display()))?;
+        if resolved_expires_at.is_some() {
+            m.expires_at = resolved_expires_at;
+        }
+        if args.version_seq.is_some() {
+            m.version_seq = args.version_seq;
+        }
+        Ok(m)
     } else {
         Ok(Manifest {
             version: entry.version.clone(),
@@ -1016,6 +1142,8 @@ fn load_or_init_manifest(
             channels: BTreeMap::new(),
             signature: None,
             rollout_percentage: args.rollout_percentage,
+            expires_at: resolved_expires_at,
+            version_seq: args.version_seq,
         })
     }
 }
@@ -1092,6 +1220,8 @@ mod tests {
             channels: BTreeMap::new(),
             signature: Some("old_signature".to_string()),
             rollout_percentage: None,
+            expires_at: None,
+            version_seq: None,
         };
 
         // 1. 尝试合并低版本 1.1.0（例如补发旧平台包）
@@ -1130,6 +1260,9 @@ mod tests {
             channel: None,
             require_elevation: false,
             rollout_percentage: None,
+            expires_at: None,
+            expires_in: None,
+            version_seq: None,
             manifest: PathBuf::from("latest.json"),
         };
 
@@ -1146,7 +1279,7 @@ mod tests {
         assert!(manifest.packages.contains_key("x86_64-pc-windows-msvc"));
         assert_eq!(manifest.signature, None); // 签名已被安全失效重置
 
-        // 2. 合并更高版本 1.3.0 并附带 30% 灰度放量
+        // 2. 合并更高版本 1.3.0 并附带 30% 灰度放量与过期/序号设置
         let entry_new = ManifestReleaseEntry {
             version: Version::parse("1.3.0").unwrap(),
             min_supported_version: None,
@@ -1182,16 +1315,21 @@ mod tests {
             channel: None,
             require_elevation: false,
             rollout_percentage: Some(30),
+            expires_at: Some("2026-12-31T00:00:00Z".to_string()),
+            expires_in: None,
+            version_seq: Some(10),
             manifest: PathBuf::from("latest.json"),
         };
 
         update_manifest_entries(&mut manifest, "aarch64-apple-darwin", &args_new, entry_new);
 
-        // 验证：升级为主版本 1.3.0，灰度比例设置为 30%
+        // 验证：升级为主版本 1.3.0，灰度比例设置为 30%，防重放字段同步生效
         assert_eq!(manifest.version, Version::parse("1.3.0").unwrap());
         assert_eq!(manifest.notes.as_deref(), Some("全新 1.3.0"));
         assert_eq!(manifest.pub_date.as_deref(), Some("2026-10-01T00:00:00Z"));
         assert_eq!(manifest.rollout_percentage, Some(30));
+        assert_eq!(manifest.expires_at.as_deref(), Some("2026-12-31T00:00:00Z"));
+        assert_eq!(manifest.version_seq, Some(10));
         assert!(manifest.force_update);
         assert!(manifest.packages.contains_key("x86_64-pc-windows-msvc"));
         assert!(manifest.packages.contains_key("aarch64-apple-darwin"));
@@ -1293,6 +1431,36 @@ executable_path = "myapp"
         assert!(err_msg.contains("不匹配"));
 
         let _ = fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_duration_and_resolve_expires_at() -> Result<()> {
+        assert_eq!(
+            parse_duration_str("30d")?,
+            std::time::Duration::from_secs(30 * 86400)
+        );
+        assert_eq!(
+            parse_duration_str("24h")?,
+            std::time::Duration::from_secs(24 * 3600)
+        );
+        assert_eq!(
+            parse_duration_str("60m")?,
+            std::time::Duration::from_secs(60 * 60)
+        );
+        assert_eq!(
+            parse_duration_str("3600s")?,
+            std::time::Duration::from_secs(3600)
+        );
+
+        let res_explicit = resolve_expires_at(Some("2026-10-01T00:00:00Z"), Some("30d"))?;
+        assert_eq!(res_explicit.as_deref(), Some("2026-10-01T00:00:00Z"));
+
+        let res_relative = resolve_expires_at(None, Some("1d"))?;
+        assert!(res_relative.is_some());
+        let rel_ts = res_relative.unwrap();
+        assert_eq!(rel_ts.len(), 20);
+        assert!(rel_ts.ends_with('Z'));
         Ok(())
     }
 }

@@ -67,6 +67,8 @@ fn test_manifest_serialization_and_routing() {
         channels,
         signature: None,
         rollout_percentage: None,
+        expires_at: None,
+        version_seq: None,
     };
 
     // 序列化为 JSON

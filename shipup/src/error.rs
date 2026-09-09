@@ -112,6 +112,14 @@ pub enum UpdateError {
     /// 未找到指定的历史回滚版本或备份物理文件已丢失
     #[error("未找到可用的历史回滚版本 ({0}) 或物理备份文件已丢失")]
     RollbackVersionNotFound(String),
+
+    /// Manifest 元数据已过期
+    #[error("Manifest 清单已过期失效: 过期时间为 {0}")]
+    ManifestExpired(String),
+
+    /// Manifest 版本序号低于客户端已知序号（疑似重放攻击）
+    #[error("检测到 Manifest 重放攻击风险: 远端版本序号 ({remote}) 低于本地已知序号 ({current})")]
+    StaleManifestVersion { current: u64, remote: u64 },
 }
 
 impl From<semver::Error> for UpdateError {
