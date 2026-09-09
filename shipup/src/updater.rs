@@ -13,6 +13,7 @@ use crate::platform::{
 };
 use crate::restart::{RestartContext, restart_with};
 use crate::signature::{verify_ed25519_file_any_key, verify_sha256_file};
+use crate::template::{TemplateContext, resolve_url_template};
 use semver::Version;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -140,8 +141,15 @@ impl Updater {
             self.inner.config.proxy.as_deref(),
         )?;
 
+        let template_ctx = TemplateContext {
+            target: &self.inner.target,
+            current_version: &self.inner.current_version,
+            channel: self.inner.channel.as_deref(),
+        };
+
         let mut last_error = None;
-        for (idx, endpoint) in self.inner.endpoints.iter().enumerate() {
+        for (idx, raw_endpoint) in self.inner.endpoints.iter().enumerate() {
+            let endpoint = resolve_url_template(raw_endpoint, &template_ctx);
             log::info!(
                 "发起更新检查端点 [{}/{}]: {}",
                 idx + 1,
@@ -149,7 +157,7 @@ impl Updater {
                 endpoint
             );
 
-            match fetch_manifest_blocking(&client, endpoint) {
+            match fetch_manifest_blocking(&client, &endpoint) {
                 Ok(body) => match self.evaluate_manifest(&body) {
                     Ok(res) => return Ok(res),
                     Err(e) => {
@@ -174,7 +182,7 @@ impl Updater {
     }
 
     #[cfg(feature = "async")]
-    /// 异步检查是否有可用更新（支持多端点自动故障转移）
+    /// 异步检查是否有可用更新（支持多端点自动故障转移与 URL 模板渲染）
     ///
     /// # 设计原理
     /// - **实现初衷**：契合 Tokio 异步运行时，无需派生额外线程即可非阻塞拉取远端 Manifest。
@@ -190,8 +198,15 @@ impl Updater {
             self.inner.config.proxy.as_deref(),
         )?;
 
+        let template_ctx = TemplateContext {
+            target: &self.inner.target,
+            current_version: &self.inner.current_version,
+            channel: self.inner.channel.as_deref(),
+        };
+
         let mut last_error = None;
-        for (idx, endpoint) in self.inner.endpoints.iter().enumerate() {
+        for (idx, raw_endpoint) in self.inner.endpoints.iter().enumerate() {
+            let endpoint = resolve_url_template(raw_endpoint, &template_ctx);
             log::info!(
                 "发起异步更新检查端点 [{}/{}]: {}",
                 idx + 1,
@@ -199,7 +214,7 @@ impl Updater {
                 endpoint
             );
 
-            match fetch_manifest_async(&client, endpoint).await {
+            match fetch_manifest_async(&client, &endpoint).await {
                 Ok(body) => match self.evaluate_manifest(&body) {
                     Ok(res) => return Ok(res),
                     Err(e) => {

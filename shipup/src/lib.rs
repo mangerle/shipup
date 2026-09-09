@@ -23,6 +23,7 @@ pub(crate) mod poller;
 pub(crate) mod recovery;
 pub(crate) mod restart;
 pub mod signature;
+pub mod template;
 pub(crate) mod updater;
 
 // 常用核心类型直接重导出
@@ -40,4 +41,5 @@ pub use recovery::{
     confirm_update_success_in_dir,
 };
 pub use restart::{RestartContext, SHIPUP_RESTARTED_ARG, is_restarted_by_shipup, restart_with};
+pub use template::{TemplateContext, resolve_url_template};
 pub use updater::{Update, Updater};
