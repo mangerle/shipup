@@ -150,7 +150,6 @@ fn execute_rollback(state: &UpdateState, current_exe: &Path, state_file: &Path) 
             current_exe.display()
         );
         if let Err(e) = self_replace::self_replace(&state.backup_path) {
-            log::error!("执行自动回滚覆盖失败: {}", e);
             return Err(UpdateError::SelfReplace(format!("执行自愈回滚失败: {}", e)));
         }
         let _ = fs::remove_file(&state.backup_path);
