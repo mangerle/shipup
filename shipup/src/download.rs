@@ -162,9 +162,20 @@ pub(crate) fn is_retryable_error(err: &UpdateError) -> bool {
     match err {
         UpdateError::Cancelled => false,
         UpdateError::HttpStatus { status_code, .. } => {
-            *status_code == 408 || *status_code == 429 || *status_code >= 500
+            *status_code == 408
+                || *status_code == 429
+                || (*status_code >= 500 && *status_code <= 599)
         }
-        _ => true,
+        UpdateError::Network(_) => true,
+        UpdateError::Io(io_err) => matches!(
+            io_err.kind(),
+            std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+        ),
+        _ => false,
     }
 }
 
@@ -616,6 +627,21 @@ mod tests {
         assert!(is_retryable_error(&UpdateError::Network(
             "连接超时重置".to_string()
         )));
+
+        // 校验和不匹配不可重试
+        assert!(!is_retryable_error(&UpdateError::ChecksumMismatch {
+            expected: "sha256:aaa".to_string(),
+            actual: "bbb".to_string(),
+        }));
+
+        // 签名无效不可重试
+        assert!(!is_retryable_error(&UpdateError::InvalidSignature));
+
+        // 权限拒绝 IO 错误不可重试
+        assert!(!is_retryable_error(&UpdateError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "拒绝访问"
+        ))));
     }
 
     #[test]
