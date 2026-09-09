@@ -175,19 +175,40 @@ pub fn verify_ed25519_any_key(
     Err(UpdateError::InvalidSignature)
 }
 
+/// 允许一次性读入内存执行 Ed25519 签名验证的最大文件体积上限（512MB）
+pub const MAX_SIGNATURE_PAYLOAD_SIZE: u64 = 512 * 1024 * 1024;
+
 /// 针对本地文件路径使用候选公钥列表执行 Ed25519 数字签名验证
 ///
 /// # 设计原理
 /// - **实现初衷**：将下载完成的临时物理文件与配置的公钥环进行整体真实性校验，只要通过任一公钥验证即放行。
+/// - **核心优势**：读取前检查元数据文件大小，限制单次最大读取为 512MB，并预分配精准容量，彻底消除大包无界内存分配造成的 OOM 崩溃。
+/// - **代价与局限**：若目标包体超过 512MB，必须依赖流式分块 SHA-256 进行完整性保障。
 ///
 /// # Errors
-/// 当底层文件读取失败或所有候选公钥均验证失败时返回对应错误。
+/// 当底层文件读取失败、文件体积超限或所有候选公钥均验证失败时返回对应错误。
 pub fn verify_ed25519_file_any_key(
     file_path: &Path,
     base64_signature: &str,
     base64_public_keys: &[impl AsRef<str>],
 ) -> Result<()> {
-    let data = std::fs::read(file_path)?;
+    let metadata = std::fs::metadata(file_path)?;
+    if metadata.len() > MAX_SIGNATURE_PAYLOAD_SIZE {
+        return Err(UpdateError::Io(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!(
+                "目标文件大小 ({} 字节) 超出 Ed25519 签名直接读取内存安全上限 ({} 字节)",
+                metadata.len(),
+                MAX_SIGNATURE_PAYLOAD_SIZE
+            ),
+        )));
+    }
+
+    let file_len = metadata.len() as usize;
+    let mut file = File::open(file_path)?;
+    let mut data = Vec::with_capacity(file_len);
+    file.read_to_end(&mut data)?;
+
     verify_ed25519_any_key(&data, base64_signature, base64_public_keys)
 }
 
