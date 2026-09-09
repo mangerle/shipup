@@ -214,12 +214,22 @@ pub fn verify_ed25519_file_any_key(
     }
 
     // 2. 向前兼容回退：若摘要验签未通过，尝试对全文字节进行兼容验证（限制 <= 512MB 安全上限）
-    let metadata = std::fs::metadata(file_path)?;
+    // 消除 TOCTOU 竞态：先打开句柄，基于同一文件句柄查询元数据并执行读取，杜绝路径替换与竞态攻击
+    let mut file = File::open(file_path)?;
+    let metadata = file.metadata()?;
     if metadata.len() <= MAX_SIGNATURE_PAYLOAD_SIZE {
         let file_len = metadata.len() as usize;
-        let mut file = File::open(file_path)?;
         let mut data = Vec::with_capacity(file_len);
-        file.read_to_end(&mut data)?;
+        let bytes_read = file.read_to_end(&mut data)?;
+        if bytes_read != file_len {
+            return Err(UpdateError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "读取文件字节长度与元数据不一致: 期望 {} 字节，实际读取 {} 字节",
+                    file_len, bytes_read
+                ),
+            )));
+        }
 
         if verify_ed25519_any_key(&data, base64_signature, base64_public_keys).is_ok() {
             return Ok(());
