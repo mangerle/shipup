@@ -32,20 +32,30 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 /// - **实现初衷**：作为客户端更新系统的统一生命周期管理器，封装检查元数据、路由选择及防降级判断。
 /// - **核心优势**：在初始化时自动静默清理 Windows 旧副本锁残留，状态内聚且无全局可变状态污染。
 /// - **代价与局限**：实例不可变借用，配置在构建完成后不可动态篡改。
-#[derive(Debug, Clone)]
-pub struct Updater {
+#[derive(Debug)]
+pub(crate) struct NetworkSecurityConfig {
+    pub public_key: Option<String>,
+    pub timeout: Duration,
+    pub user_agent: Option<String>,
+    pub headers: HashMap<String, String>,
+    pub proxy: Option<String>,
+    pub max_retries: u32,
+    pub retry_delay: Duration,
+}
+
+#[derive(Debug)]
+struct UpdaterInner {
     current_version: Version,
     manifest_url: String,
     channel: Option<String>,
-    public_key: Option<String>,
-    timeout: Duration,
-    user_agent: Option<String>,
-    headers: HashMap<String, String>,
-    proxy: Option<String>,
-    max_retries: u32,
-    retry_delay: Duration,
     target: String,
     allow_downgrade: bool,
+    config: Arc<NetworkSecurityConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Updater {
+    inner: Arc<UpdaterInner>,
 }
 
 impl Updater {
@@ -78,18 +88,22 @@ impl Updater {
         }
 
         Self {
-            current_version: config.current_version,
-            manifest_url: config.manifest_url,
-            channel: config.channel,
-            public_key: config.public_key,
-            timeout: config.timeout,
-            user_agent: config.user_agent,
-            headers: config.headers,
-            proxy: config.proxy,
-            max_retries: config.max_retries,
-            retry_delay: config.retry_delay,
-            target: config.target,
-            allow_downgrade: config.allow_downgrade,
+            inner: Arc::new(UpdaterInner {
+                current_version: config.current_version,
+                manifest_url: config.manifest_url,
+                channel: config.channel,
+                target: config.target,
+                allow_downgrade: config.allow_downgrade,
+                config: Arc::new(NetworkSecurityConfig {
+                    public_key: config.public_key,
+                    timeout: config.timeout,
+                    user_agent: config.user_agent,
+                    headers: config.headers,
+                    proxy: config.proxy,
+                    max_retries: config.max_retries,
+                    retry_delay: config.retry_delay,
+                }),
+            }),
         }
     }
 
@@ -102,16 +116,16 @@ impl Updater {
     /// # Errors
     /// 当网络请求失败、HTTP 响应非 2xx 或 JSON 反序列化失败时返回对应错误。
     pub fn check(&self) -> Result<Option<Update>> {
-        log::info!("正在发起同步更新检查，远端地址: {}", self.manifest_url);
+        log::info!("正在发起同步更新检查，远端地址: {}", self.inner.manifest_url);
         let client = build_blocking_http_client(
-            self.timeout,
-            self.user_agent.as_deref(),
-            &self.headers,
-            self.proxy.as_deref(),
+            self.inner.config.timeout,
+            self.inner.config.user_agent.as_deref(),
+            &self.inner.config.headers,
+            self.inner.config.proxy.as_deref(),
         )?;
 
         let response = client
-            .get(&self.manifest_url)
+            .get(&self.inner.manifest_url)
             .send()
             .map_err(|e| UpdateError::Network(format!("获取 Manifest 失败: {}", e)))?;
 
@@ -139,16 +153,16 @@ impl Updater {
     /// # Errors
     /// 当异步网络请求失败或 Manifest 解析错误时返回相应错误。
     pub async fn check_async(&self) -> Result<Option<Update>> {
-        log::info!("正在发起异步更新检查，远端地址: {}", self.manifest_url);
+        log::info!("正在发起异步更新检查，远端地址: {}", self.inner.manifest_url);
         let client = build_async_http_client(
-            self.timeout,
-            self.user_agent.as_deref(),
-            &self.headers,
-            self.proxy.as_deref(),
+            self.inner.config.timeout,
+            self.inner.config.user_agent.as_deref(),
+            &self.inner.config.headers,
+            self.inner.config.proxy.as_deref(),
         )?;
 
         let response = client
-            .get(&self.manifest_url)
+            .get(&self.inner.manifest_url)
             .send()
             .await
             .map_err(|e| UpdateError::Network(format!("异步获取 Manifest 失败: {}", e)))?;
@@ -173,32 +187,26 @@ impl Updater {
     fn evaluate_manifest(&self, manifest_json: &str) -> Result<Option<Update>> {
         let manifest = Manifest::from_json_str(manifest_json)?;
         let options = ResolveOptions {
-            channel: self.channel.as_deref(),
-            target: &self.target,
-            current_version: &self.current_version,
+            channel: self.inner.channel.as_deref(),
+            target: &self.inner.target,
+            current_version: &self.inner.current_version,
         };
         let release = manifest.resolve(&options)?;
 
-        if !self.allow_downgrade && release.version <= self.current_version {
+        if !self.inner.allow_downgrade && release.version <= self.inner.current_version {
             log::info!(
                 "远端版本 ({}) 未高于本地当前版本 ({})，忽略更新",
                 release.version,
-                self.current_version
+                self.inner.current_version
             );
             return Ok(None);
         }
 
         log::info!("发现可用更新版本: {}", release.version);
         Ok(Some(Update {
-            current_version: self.current_version.clone(),
+            current_version: self.inner.current_version.clone(),
             release,
-            public_key: self.public_key.clone(),
-            timeout: self.timeout,
-            user_agent: self.user_agent.clone(),
-            headers: self.headers.clone(),
-            proxy: self.proxy.clone(),
-            max_retries: self.max_retries,
-            retry_delay: self.retry_delay,
+            config: Arc::clone(&self.inner.config),
         }))
     }
 
@@ -241,13 +249,7 @@ impl Updater {
 pub struct Update {
     current_version: Version,
     release: ResolvedRelease,
-    public_key: Option<String>,
-    timeout: Duration,
-    user_agent: Option<String>,
-    headers: HashMap<String, String>,
-    proxy: Option<String>,
-    max_retries: u32,
-    retry_delay: Duration,
+    config: Arc<NetworkSecurityConfig>,
 }
 
 impl Update {
@@ -307,10 +309,10 @@ impl Update {
         F: FnMut(UpdateEvent),
     {
         let client = build_blocking_http_client(
-            self.timeout,
-            self.user_agent.as_deref(),
-            &self.headers,
-            self.proxy.as_deref(),
+            self.config.timeout,
+            self.config.user_agent.as_deref(),
+            &self.config.headers,
+            self.config.proxy.as_deref(),
         )?;
 
         let temp_download_path =
@@ -319,8 +321,8 @@ impl Update {
             url: &self.release.package.url,
             target_path: &temp_download_path,
             cancel_flag,
-            max_retries: self.max_retries,
-            retry_delay: self.retry_delay,
+            max_retries: self.config.max_retries,
+            retry_delay: self.config.retry_delay,
             expected_checksum: self.release.package.checksum.as_deref(),
         };
 
@@ -355,10 +357,10 @@ impl Update {
         F: FnMut(UpdateEvent) + Send,
     {
         let client = build_async_http_client(
-            self.timeout,
-            self.user_agent.as_deref(),
-            &self.headers,
-            self.proxy.as_deref(),
+            self.config.timeout,
+            self.config.user_agent.as_deref(),
+            &self.config.headers,
+            self.config.proxy.as_deref(),
         )?;
 
         let temp_download_path =
@@ -367,8 +369,8 @@ impl Update {
             url: &self.release.package.url,
             target_path: &temp_download_path,
             cancel_flag,
-            max_retries: self.max_retries,
-            retry_delay: self.retry_delay,
+            max_retries: self.config.max_retries,
+            retry_delay: self.config.retry_delay,
             expected_checksum: self.release.package.checksum.as_deref(),
         };
 
@@ -418,7 +420,7 @@ impl Update {
             }
         }
 
-        if let Some(ref pub_key) = self.public_key {
+        if let Some(ref pub_key) = self.config.public_key {
             callback(UpdateEvent::VerifyingSignature);
             match self.release.package.signature {
                 Some(ref sig) => {
