@@ -517,21 +517,94 @@ shipup-cli release \
 
 ---
 
-## 五、 常见问题排查 (FAQ)
+## 五、 故障排查手册与安全生产最佳实践 (Troubleshooting & Best Practices)
 
-### Q1: 在 Windows 上更新报错 `PermissionDenied` 或无法重命名？
-- **排查步骤**：
-  1. 如果应用安装在需要管理员提权的目录（如 `C:\Program Files`），原地替换由于受 Windows UAC 保护无法直接写入文件。建议将 `package_type` 设置为 `installer`，并在 Manifest 中声明 `require_elevation: true`，通过外部安装程序完成权限提权覆盖。
-  2. 确保更新包未被杀毒软件实时独占拦截。
+### 1. 数字签名与验签失败诊断指南
 
-### Q2: 为什么下载解压后在 macOS 上提示“文件已损坏，无法打开”？
-- 这是由于 macOS Gatekeeper 对公网下载解压的文件附加了 `com.apple.quarantine` 隔离扩展属性。`shipup` 在替换安装时会自动调用 `xattr -cr` 递归清除该属性。若您是手动解压测试，请执行 `xattr -cr /Applications/MyApp.app`。
+#### (1) 多公钥验签失败 (`MultiKeyVerificationFailed`)
+- **错误表现**：`多候选公钥验签全部失败（共尝试 N 个候选公钥）: [公钥 #1: ...; 公钥 #2: ...]`。
+- **诊断方法**：`shipup` 在所有候选公钥均验证失败时，会在错误信息中详尽聚合每一个候选公钥的具体失败原因：
+  1. 若提示 `Base64 解码错误`：检查客户端配置的公钥字符串是否包含换行符、首尾多余空格或错误截断。
+  2. 若提示 `Ed25519 公钥格式非法（必须为 32 字节）`：说明公钥长度不正确，应重新通过 `shipup-cli keygen` 生成并比对。
+  3. 若提示 `数字签名无效或文件已被篡改`：说明该候选公钥与签名私钥不配对，或待验签数据被篡改。
+- **应对方案**：在公钥平滑轮换期间，确保客户端公钥列表同时包含**当前正在使用的旧公钥**与**计划上线的新公钥**。
 
-### Q3: 验签时报错 `InvalidSignature`？
-- **排查步骤**：
-  1. 确认发布时计算签名的文件字节与客户端下载完成的物理文件完全一致（可先比对 SHA-256 哈希值）。
-  2. 确认客户端配置的 `public_key` 与签名时使用的 `ed25519.key` 私钥严格配对。
-  3. 确认签名未被 CDN 压缩算法（如 Gzip / Brotli）在中间层动态篡改转码。建议对更新包静态资源配置 `Cache-Control: no-transform`。
+#### (2) 签名配置缺失 (`MissingSignature`)
+- **错误表现**：`签名配置缺失: 客户端启用了验签但 Manifest 未包含签名`。
+- **根本原因**：`shipup` 默认强制开启数字签名验证（`require_signature: true`），若远端 `manifest.json` 未包含顶层 `signature` 字段或目标安装包缺失 `signature`，更新将被阻断以防机会性降级投毒。
+- **应对方案**：在发布流水线中必须使用 `shipup-cli release --key <path>` 完成清单与发布包签署。本地测试若明确不需要签名，可通过 `.require_signature(false)` 显式关闭。
 
-### Q4: 如何在内网私有源使用 HTTP 调试？
-- 在客户端构建器中显式调用 `.dangerous_insecure_transport_protocol(true)`。请注意此选项仅可在本地联调中使用，严禁带入正式生产发布。
+#### (3) 重放攻击与过期拒绝 (`ManifestExpired` / `StaleManifestVersion`)
+- **错误表现**：`Manifest 已于 ... 过期失效` 或 `清单版本序号滞后`。
+- **安全机制**：若 Manifest 声明了 `expires_at` 或 `version_seq`，客户端在验签成功后强制核验时间戳与序号单调递增性。
+- **应对方案**：发布新版本时确保系统时间与 UTC 保持同步，且 `version_seq` 严格单调递增；更新 CDN 缓存策略，杜绝长期缓存过期的 `latest.json`。
+
+---
+
+### 2. 企业内网私有 CA 与证书固定 (Certificate Pinning)
+
+在金融、政企或内网私有源环境下，远端服务器往往采用自签名证书或私有企业根 CA。此时系统默认证书库可能抛出 `PKIX path building failed` 或 TLS 握手异常。
+
+#### 配置自定义 PEM 根证书
+`shipup` 允许调用方在不修改操作系统全局证书信任库的前提下，为更新器专属注入受信任 PEM 证书：
+
+```rust
+let ca_pem = include_bytes!("../certs/company_internal_ca.pem");
+
+let updater = UpdaterBuilder::new()
+    .current_version("1.0.0")?
+    .manifest_url("https://internal-repo.corp.com/releases/latest.json")
+    .add_root_certificate_pem(ca_pem) // 注入企业自建 CA
+    .build()?;
+```
+
+#### TLS 安全基线保证
+- `shipup` 同步与异步 HTTP 客户端均在传输层硬性约束最低 **TLS 1.2+** 协议版本，杜绝 SSL 3.0、TLS 1.0、TLS 1.1 的中间人降级利用。
+- 若需要完全脱离平台 OpenSSL 动态依赖，可在 `Cargo.toml` 中切换为纯 Rust 静态编译的 `rustls-tls` 特性：
+  ```toml
+  shipup = { version = "0.3.0", default-features = false, features = ["blocking", "rustls-tls", "archive"] }
+  ```
+
+---
+
+### 3. 企业代理与受限网络穿透指南
+
+针对内网隔离、透明代理或网关鉴权环境：
+
+```rust
+let updater = UpdaterBuilder::new()
+    .current_version("1.0.0")?
+    .manifest_url("https://updates.example.com/manifest.json")
+    // 配置 HTTP / SOCKS5 代理网关
+    .proxy("http://proxy.corp.com:8080")
+    // 注入自定义网关鉴权令牌
+    .header("Authorization", "Bearer eyJhbGciOi...")
+    // 注入自定义租户与客户端版本标识
+    .header("X-Client-Tenant", "finance-dept")
+    .timeout(std::time::Duration::from_secs(30))
+    .build()?;
+```
+
+---
+
+### 4. 本地持久化与回滚目录布局说明
+
+`shipup` 采取严格的防御性与同卷写入设计，各物理文件在磁盘上的分布拓扑如下：
+
+```
+[可执行程序同级目录]
+├── myapp.exe                     # 当前运行的主程序二进制
+├── myapp.exe.shipup.old           # 物理替换前备份的旧版本（用于自愈回滚与文件锁绕过，由 cleanup_old_backups 回收）
+├── myapp.exe.{token}.{rnd}.shipup.tmp # 同卷临时写入切片（带高熵随机数防预测与预占投毒）
+├── shipup.recovery.json           # 启动观察期健康状态机与自愈回滚历史持久化（受 max_rollback_entries 限制）
+└── shipup.preferences.json        # 用户偏好状态（跳过版本、稍后提醒时间戳与客户端唯一匿名 UUID）
+
+[系统通用临时目录 (如 /tmp 或 %TEMP%)]
+└── shipup_installer_{token}_{rnd}/ # 安装器专用隔离目录（Unix 权限严格限制为 0700 私有模式）
+    └── installer.exe              # 待拉起的完整物理安装程序
+```
+
+- **备份生命周期**：`.shipup.old` 会在下一次应用程序初始化并确认新版本运行稳定后由 `cleanup_old_backups()` 自动销毁。
+- **孤儿临时切片防泄露**：Windows 与 Unix 下若遇到下载断电或进程强退，修改时间超过 24 小时的孤儿临时切片会在下次程序启动时静默回收。
+- **回滚历史保护**：`shipup.recovery.json` 记录了最近多次升级的版本号与备份文件路径。若连续崩溃次数达到触发阈值（默认 3 次），系统将在无需人工干预的情况下原子恢复至上一版本。
+
