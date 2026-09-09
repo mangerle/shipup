@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 更新过程状态持久化文件名
@@ -235,6 +236,23 @@ pub fn check_and_recover_current(max_allowed_crashes: u32) -> Result<HealthCheck
     let current_exe = env::current_exe()?;
     let state_dir = current_exe.parent().unwrap_or_else(|| Path::new("."));
     check_and_recover(state_dir, &current_exe, max_allowed_crashes)
+}
+
+static RECOVERY_ONCE_GUARD: AtomicBool = AtomicBool::new(false);
+
+/// 在当前进程生命周期内仅执行一次启动健康检查与自愈
+///
+/// # 设计原理
+/// - **实现初衷**：防止应用内多次实例化更新器时重复累加启动崩溃计数触发误回滚。
+/// - **核心优势**：基于原子布尔标志位保障线程安全，后续调用直接返回健康状态且不产生文件 I/O。
+///
+/// # Errors
+/// 当底层执行回滚覆盖可执行文件失败时返回对应错误。
+pub fn check_and_recover_once(max_allowed_crashes: u32) -> Result<HealthCheckStatus> {
+    if RECOVERY_ONCE_GUARD.swap(true, Ordering::SeqCst) {
+        return Ok(HealthCheckStatus::Normal);
+    }
+    check_and_recover_current(max_allowed_crashes)
 }
 
 #[cfg(test)]

@@ -37,6 +37,8 @@ pub struct UpdaterConfig {
     pub target: String,
     /// 是否允许降级升级
     pub allow_downgrade: bool,
+    /// 是否在构造 Updater 时自动执行启动自愈检查（默认为 false）
+    pub auto_recover_on_init: bool,
 }
 
 /// 更新器链式构建器
@@ -59,6 +61,7 @@ pub struct UpdaterBuilder {
     pub(crate) retry_delay: Duration,
     pub(crate) target: String,
     pub(crate) allow_downgrade: bool,
+    pub(crate) auto_recover_on_init: bool,
 }
 
 impl Default for UpdaterBuilder {
@@ -76,6 +79,7 @@ impl Default for UpdaterBuilder {
             retry_delay: Duration::from_secs(1),
             target: current_target_triple().to_string(),
             allow_downgrade: false,
+            auto_recover_on_init: false,
         }
     }
 }
@@ -135,6 +139,16 @@ impl UpdaterBuilder {
         self
     }
 
+    /// 设置是否在构造 Updater 实例时自动执行崩溃自愈检查（默认为 false）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：避免在多实例构建或多次触发更新检查时隐式自增崩溃计数造成误回滚。
+    /// - **最佳实践**：推荐在宿主应用入口（如 `main` 函数首行）显式调用 [`crate::check_and_recover_current`]。
+    pub fn auto_recover_on_init(mut self, auto_recover: bool) -> Self {
+        self.auto_recover_on_init = auto_recover;
+        self
+    }
+
     /// 添加单个自定义 HTTP 请求头（可多次调用以添加多个，如 Authorization 凭证）
     pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(key.into(), value.into());
@@ -191,6 +205,7 @@ impl UpdaterBuilder {
             retry_delay: self.retry_delay,
             target: self.target,
             allow_downgrade: self.allow_downgrade,
+            auto_recover_on_init: self.auto_recover_on_init,
         };
 
         Ok(Updater::new(config))
@@ -252,5 +267,18 @@ mod tests {
             .build();
 
         assert!(updater.is_ok());
+    }
+
+    #[test]
+    fn test_updater_new_does_not_mutate_recovery_state() {
+        // 多次构造 Updater 实例，确保默认情况下不产生隐式崩溃自愈累加副作用
+        for _ in 0..5 {
+            let res = UpdaterBuilder::new()
+                .current_version("1.0.0")
+                .unwrap()
+                .manifest_url("https://example.com/manifest.json")
+                .build();
+            assert!(res.is_ok());
+        }
     }
 }

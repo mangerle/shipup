@@ -36,7 +36,7 @@ pub use manifest::{
 pub use platform::{cleanup_old_backups, get_same_volume_temp_path, get_temp_download_path};
 pub use poller::{AutoPollEvent, AutoPollOptions, AutoPollerHandle};
 pub use recovery::{
-    HealthCheckStatus, check_and_recover_current, confirm_update_success,
+    HealthCheckStatus, check_and_recover_current, check_and_recover_once, confirm_update_success,
     confirm_update_success_in_dir,
 };
 pub use restart::{RestartContext, SHIPUP_RESTARTED_ARG, is_restarted_by_shipup, restart_with};

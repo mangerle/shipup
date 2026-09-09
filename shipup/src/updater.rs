@@ -66,25 +66,30 @@ impl Updater {
     }
 
     pub(crate) fn new(config: UpdaterConfig) -> Self {
-        // 执行启动健康检查与连续崩溃异常自愈
-        if let Ok(status) =
-            crate::recovery::check_and_recover_current(crate::recovery::DEFAULT_MAX_CRASH_ATTEMPTS)
-        {
-            match status {
-                crate::recovery::HealthCheckStatus::RolledBack { from_version } => {
-                    log::warn!(
-                        "检测到新版本 ({}) 启动多次异常崩溃，已触发自愈并回滚至历史正常版本",
-                        from_version
-                    );
+        if config.auto_recover_on_init {
+            // 仅在显式声明时执行单次启动自愈检查，防止多实例重复自增计数误触发回滚
+            if let Ok(status) =
+                crate::recovery::check_and_recover_once(crate::recovery::DEFAULT_MAX_CRASH_ATTEMPTS)
+            {
+                match status {
+                    crate::recovery::HealthCheckStatus::RolledBack { from_version } => {
+                        log::warn!(
+                            "检测到新版本 ({}) 启动多次异常崩溃，已触发自愈并回滚至历史正常版本",
+                            from_version
+                        );
+                    }
+                    crate::recovery::HealthCheckStatus::PendingConfirmation { attempts } => {
+                        log::info!("当前版本处于更新健康确认观察期，启动计数: {}", attempts);
+                    }
+                    crate::recovery::HealthCheckStatus::Normal => {
+                        cleanup_old_backups();
+                    }
                 }
-                crate::recovery::HealthCheckStatus::PendingConfirmation { attempts } => {
-                    log::info!("当前版本处于更新健康确认观察期，启动计数: {}", attempts);
-                }
-                crate::recovery::HealthCheckStatus::Normal => {
-                    cleanup_old_backups();
-                }
+            } else {
+                cleanup_old_backups();
             }
         } else {
+            // 默认构造器保持纯净无副作用，仅清理历史备份锁残留
             cleanup_old_backups();
         }
 
