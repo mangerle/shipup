@@ -13,17 +13,17 @@
 //! - 自动绕过 Windows 文件锁并完成启动自清理闭环
 
 pub mod archive;
-pub mod builder;
-pub mod download;
+pub(crate) mod builder;
+pub(crate) mod download;
 pub mod error;
 pub mod event;
 pub mod manifest;
-pub mod platform;
-pub mod poller;
-pub mod recovery;
-pub mod restart;
+pub(crate) mod platform;
+pub(crate) mod poller;
+pub(crate) mod recovery;
+pub(crate) mod restart;
 pub mod signature;
-pub mod updater;
+pub(crate) mod updater;
 
 // 常用核心类型直接重导出
 pub use builder::{UpdaterBuilder, UpdaterConfig};
