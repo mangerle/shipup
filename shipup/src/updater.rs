@@ -870,9 +870,10 @@ where
     match release.package.package_type {
         PackageType::Binary => {
             callback(UpdateEvent::Installing);
+            let backup_path = prepare_backup_before_replace()?;
             replace_binary(temp_path)?;
             let _ = fs::remove_file(temp_path);
-            record_state_if_possible(&release.version);
+            record_state_if_possible(&release.version, backup_path.as_deref());
             callback(UpdateEvent::ReadyToRestart);
         }
         PackageType::Archive => {
@@ -887,7 +888,7 @@ where
                 .unwrap_or_else(|| Path::new("."))
                 .join(sandbox_name);
 
-            let apply_result = (|| -> Result<()> {
+            let apply_result = (|| -> Result<Option<PathBuf>> {
                 let extracted_binary = extract_archive(
                     temp_path,
                     &sandbox_dir,
@@ -903,15 +904,16 @@ where
                     sync_extracted_payload(payload_dir, target_dir, &extracted_binary)?;
                 }
 
+                let backup_path = prepare_backup_before_replace()?;
                 replace_binary(&extracted_binary)?;
-                Ok(())
+                Ok(backup_path)
             })();
 
             let _ = fs::remove_dir_all(&sandbox_dir);
             let _ = fs::remove_file(temp_path);
-            apply_result?;
+            let backup_path = apply_result?;
 
-            record_state_if_possible(&release.version);
+            record_state_if_possible(&release.version, backup_path.as_deref());
             callback(UpdateEvent::ReadyToRestart);
         }
         PackageType::Installer => {
@@ -929,22 +931,55 @@ where
     Ok(())
 }
 
-fn record_state_if_possible(target_version: &Version) {
+fn prepare_backup_before_replace() -> Result<Option<PathBuf>> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(bundle) = crate::platform::macos::find_current_app_bundle() {
+            if let Some(parent) = bundle.parent() {
+                let bundle_name = bundle
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("app.app");
+                let backup_bundle = parent.join(format!(
+                    "{}{}",
+                    bundle_name,
+                    crate::platform::macos::OLD_BACKUP_SUFFIX
+                ));
+                return Ok(Some(backup_bundle));
+            }
+        }
+    }
+
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        let exe_name = current_exe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("app");
+        let backup_path = parent.join(format!("{}.shipup.old", exe_name));
+        if backup_path.exists() {
+            let _ = fs::remove_file(&backup_path);
+        }
+        if let Err(e) = fs::copy(&current_exe, &backup_path) {
+            log::warn!("创建当前可执行文件物理备份失败: {}", e);
+            return Ok(None);
+        }
+        log::info!("已创建历史可执行文件物理备份: {}", backup_path.display());
+        return Ok(Some(backup_path));
+    }
+
+    Ok(None)
+}
+
+fn record_state_if_possible(target_version: &Version, backup_path: Option<&Path>) {
     if let Ok(current_exe) = std::env::current_exe()
         && let Some(target_dir) = current_exe.parent()
+        && let Some(backup) = backup_path
+        && backup.exists()
     {
-        let backup_path = target_dir.join(format!(
-            "{}.shipup.old",
-            current_exe
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-        ));
-        let _ = crate::recovery::record_update_state(
-            target_dir,
-            &target_version.to_string(),
-            &backup_path,
-        );
+        let _ =
+            crate::recovery::record_update_state(target_dir, &target_version.to_string(), backup);
     }
 }
 

@@ -113,7 +113,7 @@ pub fn replace_current_bundle(new_bundle_path: &Path) -> Result<()> {
         log::warn!("清除新 .app 隔离属性失败: {}", e);
     }
 
-    let _ = fs::remove_dir_all(&backup_bundle);
+    // 保留旧版本 Bundle 备份供启动健康观察期与自愈回滚使用，待新版本确认成功后再清理
     Ok(())
 }
 

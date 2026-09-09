@@ -160,32 +160,44 @@ fn execute_rollback(state: &UpdateState, current_exe: &Path, state_file: &Path) 
             current_exe.display()
         );
 
-        let is_running_exe = env::current_exe()
-            .map(
-                |running| match (running.canonicalize(), current_exe.canonicalize()) {
-                    (Ok(p1), Ok(p2)) => p1 == p2,
-                    _ => running == current_exe,
-                },
-            )
-            .unwrap_or(false);
-
-        if is_running_exe {
-            if let Err(e) = self_replace::self_replace(&state.backup_path) {
-                return Err(UpdateError::SelfReplace(format!("执行自愈回滚失败: {}", e)));
-            }
-        } else {
-            // 当目标并非当前正在运行的进程二进制（例如测试或外部托管沙箱）时，直接安全覆盖目标文件
+        if state.backup_path.is_dir() {
             if current_exe.exists() {
-                let _ = fs::remove_file(current_exe);
+                let _ = fs::remove_dir_all(current_exe);
             }
-            if let Err(e) = fs::copy(&state.backup_path, current_exe) {
+            if let Err(e) = fs::rename(&state.backup_path, current_exe) {
                 return Err(UpdateError::SelfReplace(format!(
-                    "还原备份文件到目标可执行文件失败: {}",
+                    "还原历史 Bundle 备份失败: {}",
                     e
                 )));
             }
+        } else {
+            let is_running_exe = env::current_exe()
+                .map(
+                    |running| match (running.canonicalize(), current_exe.canonicalize()) {
+                        (Ok(p1), Ok(p2)) => p1 == p2,
+                        _ => running == current_exe,
+                    },
+                )
+                .unwrap_or(false);
+
+            if is_running_exe {
+                if let Err(e) = self_replace::self_replace(&state.backup_path) {
+                    return Err(UpdateError::SelfReplace(format!("执行自愈回滚失败: {}", e)));
+                }
+            } else {
+                // 当目标并非当前正在运行的进程二进制（例如测试或外部托管沙箱）时，直接安全覆盖目标文件
+                if current_exe.exists() {
+                    let _ = fs::remove_file(current_exe);
+                }
+                if let Err(e) = fs::copy(&state.backup_path, current_exe) {
+                    return Err(UpdateError::SelfReplace(format!(
+                        "还原备份文件到目标可执行文件失败: {}",
+                        e
+                    )));
+                }
+            }
+            let _ = fs::remove_file(&state.backup_path);
         }
-        let _ = fs::remove_file(&state.backup_path);
     } else {
         log::error!(
             "无法执行自愈回滚: 未找到历史备份文件: {}",
@@ -216,7 +228,11 @@ pub fn confirm_update_success_in_dir(state_dir: &Path) -> Result<bool> {
         && let Ok(state) = serde_json::from_str::<UpdateState>(&content)
         && state.backup_path.exists()
     {
-        let _ = fs::remove_file(&state.backup_path);
+        if state.backup_path.is_dir() {
+            let _ = fs::remove_dir_all(&state.backup_path);
+        } else {
+            let _ = fs::remove_file(&state.backup_path);
+        }
         log::info!(
             "升级确认完成，已删除历史备份: {}",
             state.backup_path.display()
