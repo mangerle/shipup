@@ -39,6 +39,8 @@ pub struct UpdaterConfig {
     pub allow_downgrade: bool,
     /// 是否在构造 Updater 时自动执行启动自愈检查（默认为 false）
     pub auto_recover_on_init: bool,
+    /// 是否允许不安全的明文 HTTP 传输协议（默认为 false）
+    pub dangerous_insecure_transport_protocol: bool,
 }
 
 /// 更新器链式构建器
@@ -62,6 +64,7 @@ pub struct UpdaterBuilder {
     pub(crate) target: String,
     pub(crate) allow_downgrade: bool,
     pub(crate) auto_recover_on_init: bool,
+    pub(crate) dangerous_insecure_transport_protocol: bool,
 }
 
 impl Default for UpdaterBuilder {
@@ -80,6 +83,7 @@ impl Default for UpdaterBuilder {
             target: current_target_triple().to_string(),
             allow_downgrade: false,
             auto_recover_on_init: false,
+            dangerous_insecure_transport_protocol: false,
         }
     }
 }
@@ -149,6 +153,16 @@ impl UpdaterBuilder {
         self
     }
 
+    /// 设置是否允许使用不安全的明文传输协议（HTTP）（默认为 false）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：生产环境中强制执行 HTTPS 传输校验，防范中间人攻击者篡改更新清单或重定向安装包下载。
+    /// - **安全警示**：非调试或局域网受控测试场景严禁开启此选项。
+    pub fn dangerous_insecure_transport_protocol(mut self, allow: bool) -> Self {
+        self.dangerous_insecure_transport_protocol = allow;
+        self
+    }
+
     /// 添加单个自定义 HTTP 请求头（可多次调用以添加多个，如 Authorization 凭证）
     pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(key.into(), value.into());
@@ -192,6 +206,10 @@ impl UpdaterBuilder {
             UpdateError::ManifestParse("构建 Updater 必须提供 manifest_url".to_string())
         })?;
 
+        if !self.dangerous_insecure_transport_protocol && manifest_url.starts_with("http://") {
+            return Err(UpdateError::InsecureTransportProtocol(manifest_url));
+        }
+
         let config = UpdaterConfig {
             current_version,
             manifest_url,
@@ -206,6 +224,7 @@ impl UpdaterBuilder {
             target: self.target,
             allow_downgrade: self.allow_downgrade,
             auto_recover_on_init: self.auto_recover_on_init,
+            dangerous_insecure_transport_protocol: self.dangerous_insecure_transport_protocol,
         };
 
         Ok(Updater::new(config))
@@ -280,5 +299,28 @@ mod tests {
                 .build();
             assert!(res.is_ok());
         }
+    }
+
+    #[test]
+    fn test_insecure_transport_protocol_rejection_and_override() {
+        // 1. 默认情况下，明文 HTTP 地址必须被严格拦截拒绝
+        let insecure_err = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .manifest_url("http://insecure.example.com/manifest.json")
+            .build();
+        assert!(matches!(
+            insecure_err,
+            Err(UpdateError::InsecureTransportProtocol(_))
+        ));
+
+        // 2. 显式开启危险明文协议开关后放行
+        let insecure_allowed = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .manifest_url("http://insecure.example.com/manifest.json")
+            .dangerous_insecure_transport_protocol(true)
+            .build();
+        assert!(insecure_allowed.is_ok());
     }
 }

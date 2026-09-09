@@ -84,6 +84,12 @@ pub enum UpdateError {
     /// 底层 IO 错误
     #[error("输入输出错误: {0}")]
     Io(#[from] io::Error),
+
+    /// 传输协议不安全拦截（如明文 HTTP）
+    #[error(
+        "不安全传输协议: 地址 '{0}' 采用明文 HTTP 协议，默认被拒绝。如需强制允许请开启 dangerous_insecure_transport_protocol"
+    )]
+    InsecureTransportProtocol(String),
 }
 
 impl From<semver::Error> for UpdateError {

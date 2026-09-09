@@ -42,6 +42,7 @@ pub(crate) struct NetworkSecurityConfig {
     pub proxy: Option<String>,
     pub max_retries: u32,
     pub retry_delay: Duration,
+    pub dangerous_insecure_transport_protocol: bool,
 }
 
 #[derive(Debug)]
@@ -108,6 +109,8 @@ impl Updater {
                     proxy: config.proxy,
                     max_retries: config.max_retries,
                     retry_delay: config.retry_delay,
+                    dangerous_insecure_transport_protocol: config
+                        .dangerous_insecure_transport_protocol,
                 }),
             }),
         }
@@ -320,6 +323,14 @@ impl Update {
     where
         F: FnMut(UpdateEvent),
     {
+        if !self.config.dangerous_insecure_transport_protocol
+            && self.release.package.url.starts_with("http://")
+        {
+            return Err(UpdateError::InsecureTransportProtocol(
+                self.release.package.url.clone(),
+            ));
+        }
+
         let client = build_blocking_http_client(
             self.config.timeout,
             self.config.user_agent.as_deref(),
@@ -368,6 +379,14 @@ impl Update {
     where
         F: FnMut(UpdateEvent) + Send,
     {
+        if !self.config.dangerous_insecure_transport_protocol
+            && self.release.package.url.starts_with("http://")
+        {
+            return Err(UpdateError::InsecureTransportProtocol(
+                self.release.package.url.clone(),
+            ));
+        }
+
         let client = build_async_http_client(
             self.config.timeout,
             self.config.user_agent.as_deref(),
