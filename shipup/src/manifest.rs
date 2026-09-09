@@ -247,8 +247,17 @@ impl Manifest {
     /// # Errors
     /// 当 JSON 文本不符合规范格式时，返回 [`UpdateError::ManifestParse`]。
     pub fn from_json_str(content: &str) -> Result<Self> {
-        serde_json::from_str(content)
-            .map_err(|e| UpdateError::ManifestParse(format!("JSON 结构解析失败: {}", e)))
+        let manifest: Self = serde_json::from_str(content)
+            .map_err(|e| UpdateError::ManifestParse(format!("JSON 结构解析失败: {}", e)))?;
+        if let Some(ref exp) = manifest.expires_at
+            && parse_rfc3339_to_unix(exp).is_none()
+        {
+            return Err(UpdateError::ManifestParse(format!(
+                "Manifest expires_at 时间戳格式非法: {}",
+                exp
+            )));
+        }
+        Ok(manifest)
     }
 
     /// 提取 Manifest 规范化字节数据（排除 signature 字段本身），供生成与校验数字签名使用
