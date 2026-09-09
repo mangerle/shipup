@@ -170,3 +170,98 @@ fn test_updater_builder_configuration() {
     // 验证构建成功
     drop(updater);
 }
+
+#[test]
+fn test_zip_slip_attack_prevention() {
+    use std::fs::{self, File};
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let temp_dir = std::env::temp_dir().join(format!("shipup_zip_slip_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let malicious_zip = temp_dir.join("malicious.zip");
+    let sandbox = temp_dir.join("sandbox");
+    fs::create_dir_all(&sandbox).unwrap();
+
+    // 构造包含路径逃逸的 Zip 文件
+    {
+        let file = File::create(&malicious_zip).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        zip.start_file("../evil.exe", options).unwrap();
+        zip.write_all(b"malicious payload").unwrap();
+        zip.finish().unwrap();
+    }
+
+    // 尝试解压恶意 Zip，验证 Zip Slip 防护生效
+    let res = shipup::archive::extract_archive(&malicious_zip, &sandbox, Some("evil.exe"));
+    assert!(res.is_err());
+    match res {
+        Err(shipup::UpdateError::ZipSlipViolation(path)) => {
+            assert!(path.contains("evil.exe"));
+        }
+        other => panic!("期望 ZipSlipViolation 错误，实际为: {:?}", other),
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_decompression_bomb_mitigation() {
+    use std::fs::{self, File};
+    use std::io::Write;
+    use zip::CompressionMethod;
+    use zip::write::SimpleFileOptions;
+
+    let temp_dir = std::env::temp_dir().join(format!("shipup_bomb_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let bomb_zip = temp_dir.join("bomb.zip");
+    let sandbox = temp_dir.join("sandbox");
+    fs::create_dir_all(&sandbox).unwrap();
+
+    // 构造高压缩比的解压炸弹（500KB 重复数据）
+    {
+        let file = File::create(&bomb_zip).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        zip.start_file("large.bin", options).unwrap();
+        let zero_buffer = [0u8; 1024];
+        for _ in 0..500 {
+            zip.write_all(&zero_buffer).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    // 解压时体积膨胀倍率将超过 10 倍的安全上限，触发熔断
+    let res = shipup::archive::extract_archive(&bomb_zip, &sandbox, Some("large.bin"));
+    assert!(res.is_err());
+    match res {
+        Err(shipup::UpdateError::ArchiveExtract(msg)) => {
+            assert!(msg.contains("防解压炸弹机制已熔断"));
+        }
+        other => panic!("期望解压炸弹熔断错误，实际为: {:?}", other),
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_invalid_signature_and_checksum_mismatch() {
+    use shipup::UpdateError;
+
+    let payload = b"legitimate application data";
+    // 篡改校验值
+    let invalid_checksum = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    let chk_res = verify_sha256(payload, invalid_checksum);
+    assert!(matches!(chk_res, Err(UpdateError::ChecksumMismatch { .. })));
+
+    // 伪造公钥或篡改签名内容
+    let dummy_sig = BASE64.encode([1u8; 64]);
+    let dummy_pub = BASE64.encode([2u8; 32]);
+    let sig_res = verify_ed25519(payload, &dummy_sig, &dummy_pub);
+    assert!(matches!(sig_res, Err(UpdateError::InvalidSignature)));
+}
