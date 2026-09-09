@@ -36,32 +36,78 @@ enum Commands {
         out_dir: PathBuf,
     },
 
-    /// 签名更新包并自动创建或合并 Manifest 元数据文件
+    /// 签名更新包并自动创建或合并 Manifest 元数据文件（支持单包参数或 --config 批量发布）
     Release(Box<ReleaseArgs>),
+
+    /// 校验 Manifest 元数据与本地物理更新包的匹配性（SHA-256、文件大小与数字签名）
+    Verify(VerifyArgs),
+
+    /// 查看并格式化解析 Manifest 元数据详情
+    Inspect(InspectArgs),
+}
+
+/// 批量发布配置文件结构
+#[derive(Debug, serde::Deserialize)]
+struct BatchReleaseConfig {
+    version: String,
+    notes: Option<String>,
+    pub_date: Option<String>,
+    min_supported_version: Option<String>,
+    #[serde(default)]
+    force_update: bool,
+    channel: Option<String>,
+    rollout_percentage: Option<u8>,
+    manifest: Option<PathBuf>,
+    key: Option<PathBuf>,
+    packages: Vec<BatchPackageConfig>,
+}
+
+/// 批量发布单个平台配置
+#[derive(Debug, serde::Deserialize)]
+struct BatchPackageConfig {
+    target: String,
+    package: PathBuf,
+    package_type: String,
+    url: String,
+    executable_path: Option<String>,
+    install_mode: Option<String>,
+    #[serde(default)]
+    install_args: Vec<String>,
+    #[serde(default)]
+    require_elevation: bool,
+    key: Option<PathBuf>,
 }
 
 /// 发布签名与元数据合并参数结构体
-#[derive(clap::Args)]
+#[derive(clap::Args, Debug, Clone)]
 struct ReleaseArgs {
+    /// 批量发布配置文件路径（例如 shipup.toml），若指定则批量发布 packages 中定义的所有架构
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+
     /// 发布版本号（遵循 SemVer 2.0，例如 1.2.0）
-    #[arg(long)]
-    version: String,
+    #[arg(long, required_unless_present = "config")]
+    version: Option<String>,
 
     /// 目标操作系统与架构 Target Triple（例如 x86_64-pc-windows-msvc）
-    #[arg(long)]
-    target: String,
+    #[arg(long, required_unless_present = "config")]
+    target: Option<String>,
 
     /// 更新包物理文件路径（例如 ./dist/myapp-1.2.0-setup.exe）
-    #[arg(long, visible_alias = "package-path")]
-    package: PathBuf,
+    #[arg(
+        long,
+        visible_alias = "package-path",
+        required_unless_present = "config"
+    )]
+    package: Option<PathBuf>,
 
     /// 更新包类型（binary / archive / installer）
-    #[arg(long)]
-    package_type: String,
+    #[arg(long, required_unless_present = "config")]
+    package_type: Option<String>,
 
     /// 下载直链地址
-    #[arg(long)]
-    url: String,
+    #[arg(long, required_unless_present = "config")]
+    url: Option<String>,
 
     /// Ed25519 私钥文件路径（若不提供则跳过数字签名）
     #[arg(short, long, visible_alias = "key-path")]
@@ -112,6 +158,46 @@ struct ReleaseArgs {
     manifest: PathBuf,
 }
 
+/// 校验 Manifest 与发布包匹配性参数结构体
+#[derive(clap::Args, Debug, Clone)]
+struct VerifyArgs {
+    /// Manifest JSON 元数据文件路径（默认为 latest.json）
+    #[arg(short, long, default_value = "latest.json")]
+    manifest: PathBuf,
+
+    /// 待校验的本地物理安装包路径
+    #[arg(short, long)]
+    package: PathBuf,
+
+    /// 目标平台 Target Triple（若未提供则自动探测当前机器平台）
+    #[arg(short, long)]
+    target: Option<String>,
+
+    /// 发布通道标识（可选，默认稳定主通道）
+    #[arg(short, long)]
+    channel: Option<String>,
+
+    /// Ed25519 验签公钥文件路径（可选）
+    #[arg(long)]
+    public_key_file: Option<PathBuf>,
+
+    /// Ed25519 验签公钥 Base64 字符串（可选）
+    #[arg(long)]
+    public_key: Option<String>,
+}
+
+/// 查看解析 Manifest 详情参数结构体
+#[derive(clap::Args, Debug, Clone)]
+struct InspectArgs {
+    /// Manifest JSON 元数据文件路径（默认为 latest.json）
+    #[arg(short, long, default_value = "latest.json")]
+    manifest: PathBuf,
+
+    /// 过滤查看的通道标识（可选）
+    #[arg(short, long)]
+    channel: Option<String>,
+}
+
 fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
@@ -122,6 +208,12 @@ fn main() -> Result<()> {
         }
         Commands::Release(args) => {
             handle_release(&args)?;
+        }
+        Commands::Verify(args) => {
+            handle_verify(&args)?;
+        }
+        Commands::Inspect(args) => {
+            handle_inspect(&args)?;
         }
     }
 
@@ -314,6 +406,7 @@ struct ManifestReleaseEntry {
 ///   低版本包合并时仅追加目标平台包矩阵，保留清单中更高版本的元数据（version、pub_date、notes 等）。
 fn update_manifest_entries(
     manifest: &mut Manifest,
+    target: &str,
     args: &ReleaseArgs,
     entry: ManifestReleaseEntry,
 ) {
@@ -372,7 +465,7 @@ fn update_manifest_entries(
         }
         ch_entry
             .packages
-            .insert(args.target.clone(), entry.package_info);
+            .insert(target.to_string(), entry.package_info);
     } else {
         if entry.version > manifest.version {
             manifest.version = entry.version;
@@ -414,11 +507,29 @@ fn update_manifest_entries(
         }
         manifest
             .packages
-            .insert(args.target.clone(), entry.package_info);
+            .insert(target.to_string(), entry.package_info);
     }
 
     // 清单内容变更后，原有的全局签名已失效，予以重置
     manifest.signature = None;
+}
+
+/// 将字节数值转换为人类易读格式（如 12.34 MB）
+fn format_human_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB ({} 字节)", b / GB, bytes)
+    } else if b >= MB {
+        format!("{:.2} MB ({} 字节)", b / MB, bytes)
+    } else if b >= KB {
+        format!("{:.2} KB ({} 字节)", b / KB, bytes)
+    } else {
+        format!("{} 字节", bytes)
+    }
 }
 
 /// 执行发布包签名与 Manifest 清单合并
@@ -427,16 +538,41 @@ fn update_manifest_entries(
 /// - **实现初衷**：支持流水线持续集成（CI/CD）中跨 Windows、macOS、Linux 多 Job 逐步合并发布成果物至单份 Manifest 中。
 /// - **核心优势**：若目标清单文件已存在，将自动保留已有平台的发布包配置，实现平台矩阵安全增量追加。
 fn handle_release(args: &ReleaseArgs) -> Result<()> {
-    let version = Version::parse(&args.version).with_context(|| {
+    if let Some(ref config_path) = args.config {
+        return handle_batch_release(config_path, &args.manifest);
+    }
+
+    let version_str = args
+        .version
+        .as_deref()
+        .ok_or_else(|| anyhow!("未指定 --config 时必须提供 --version 参数"))?;
+    let target = args
+        .target
+        .as_deref()
+        .ok_or_else(|| anyhow!("未指定 --config 时必须提供 --target 参数"))?;
+    let package_path = args
+        .package
+        .as_ref()
+        .ok_or_else(|| anyhow!("未指定 --config 时必须提供 --package 参数"))?;
+    let package_type_str = args
+        .package_type
+        .as_deref()
+        .ok_or_else(|| anyhow!("未指定 --config 时必须提供 --package-type 参数"))?;
+    let url = args
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow!("未指定 --config 时必须提供 --url 参数"))?;
+
+    let version = Version::parse(version_str).with_context(|| {
         format!(
             "解析目标版本号 '{}' 失败，请确保符合 SemVer 规范",
-            args.version
+            version_str
         )
     })?;
-    let parsed_pkg_type = PackageType::from_str(&args.package_type).with_context(|| {
+    let parsed_pkg_type = PackageType::from_str(package_type_str).with_context(|| {
         format!(
             "解析更新包类型 '{}' 失败，可选: binary, archive, installer",
-            args.package_type
+            package_type_str
         )
     })?;
 
@@ -447,7 +583,7 @@ fn handle_release(args: &ReleaseArgs) -> Result<()> {
         None => None,
     };
 
-    let (checksum, signature) = compute_payload_integrity(&args.package, args.key.as_deref())?;
+    let (checksum, signature) = compute_payload_integrity(package_path, args.key.as_deref())?;
 
     let parsed_install_mode = match args.install_mode {
         Some(ref mode) => match mode.to_ascii_lowercase().as_str() {
@@ -462,12 +598,12 @@ fn handle_release(args: &ReleaseArgs) -> Result<()> {
         None => None,
     };
 
-    let package_size = fs::metadata(&args.package)
-        .with_context(|| format!("获取发布包元数据失败: {}", args.package.display()))?
+    let package_size = fs::metadata(package_path)
+        .with_context(|| format!("获取发布包元数据失败: {}", package_path.display()))?
         .len();
 
     let package_info = PackageInfo {
-        url: args.url.clone(),
+        url: url.to_string(),
         signature,
         checksum: Some(checksum),
         package_type: parsed_pkg_type,
@@ -488,13 +624,411 @@ fn handle_release(args: &ReleaseArgs) -> Result<()> {
     };
 
     let mut manifest = load_or_init_manifest(&args.manifest, args, &entry)?;
-    update_manifest_entries(&mut manifest, args, entry);
+    update_manifest_entries(&mut manifest, target, args, entry);
 
     save_manifest_file(&args.manifest, &manifest)?;
     log::info!(
         "发布信息已成功合并并写入 Manifest：{}",
         args.manifest.display()
     );
+    Ok(())
+}
+
+/// 执行基于 TOML 配置文件的跨平台批量发布合并
+fn handle_batch_release(config_path: &Path, default_manifest_path: &Path) -> Result<()> {
+    let toml_content = fs::read_to_string(config_path)
+        .with_context(|| format!("读取批量发布配置文件失败: {}", config_path.display()))?;
+    let batch_config: BatchReleaseConfig = toml::from_str(&toml_content)
+        .with_context(|| format!("解析批量发布配置 TOML 失败: {}", config_path.display()))?;
+
+    let version = Version::parse(&batch_config.version).with_context(|| {
+        format!(
+            "解析配置文件中的目标版本号 '{}' 失败，请确保符合 SemVer 规范",
+            batch_config.version
+        )
+    })?;
+
+    let min_supported_version = match batch_config.min_supported_version {
+        Some(ref v) => {
+            Some(Version::parse(v).with_context(|| format!("解析最低支持版本号 '{}' 失败", v))?)
+        }
+        None => None,
+    };
+
+    let pub_date = batch_config
+        .pub_date
+        .clone()
+        .unwrap_or_else(current_utc_rfc3339);
+
+    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+
+    let manifest_path = batch_config
+        .manifest
+        .as_ref()
+        .map(|p| {
+            if p.is_relative() {
+                config_dir.join(p)
+            } else {
+                p.clone()
+            }
+        })
+        .unwrap_or_else(|| default_manifest_path.to_path_buf());
+
+    let mut manifest = if manifest_path.exists() {
+        let content = fs::read_to_string(&manifest_path)
+            .with_context(|| format!("读取已有 Manifest 文件失败: {}", manifest_path.display()))?;
+        serde_json::from_str::<Manifest>(&content)
+            .with_context(|| format!("反序列化 Manifest JSON 失败: {}", manifest_path.display()))?
+    } else {
+        Manifest {
+            version: version.clone(),
+            min_supported_version: min_supported_version.clone(),
+            force_update: batch_config.force_update,
+            pub_date: Some(pub_date.clone()),
+            notes: batch_config.notes.clone(),
+            packages: HashMap::new(),
+            channels: HashMap::new(),
+            signature: None,
+            rollout_percentage: batch_config.rollout_percentage,
+        }
+    };
+
+    let mut success_count = 0usize;
+
+    for pkg in &batch_config.packages {
+        let pkg_path = if pkg.package.is_relative() {
+            config_dir.join(&pkg.package)
+        } else {
+            pkg.package.clone()
+        };
+
+        if !pkg_path.exists() {
+            anyhow::bail!(
+                "平台 '{}' 对应的发布包文件不存在: {}",
+                pkg.target,
+                pkg_path.display()
+            );
+        }
+
+        let key_path = pkg.key.as_ref().or(batch_config.key.as_ref()).map(|kp| {
+            if kp.is_relative() {
+                config_dir.join(kp)
+            } else {
+                kp.clone()
+            }
+        });
+
+        let (checksum, signature) = compute_payload_integrity(&pkg_path, key_path.as_deref())?;
+
+        let parsed_pkg_type = PackageType::from_str(&pkg.package_type).with_context(|| {
+            format!(
+                "平台 '{}' 的包类型 '{}' 无效，可选: binary, archive, installer",
+                pkg.target, pkg.package_type
+            )
+        })?;
+
+        let parsed_install_mode = match pkg.install_mode {
+            Some(ref mode) => match mode.to_ascii_lowercase().as_str() {
+                "passive" => Some(InstallMode::Passive),
+                "quiet" => Some(InstallMode::Quiet),
+                "basicui" | "basic-ui" => Some(InstallMode::BasicUi),
+                other => anyhow::bail!(
+                    "平台 '{}' 不支持的安装模式: {}，可选值为 passive / quiet / basicUi",
+                    pkg.target,
+                    other
+                ),
+            },
+            None => None,
+        };
+
+        let package_size = fs::metadata(&pkg_path)
+            .with_context(|| format!("获取发布包元数据失败: {}", pkg_path.display()))?
+            .len();
+
+        let package_info = PackageInfo {
+            url: pkg.url.clone(),
+            signature,
+            checksum: Some(checksum),
+            package_type: parsed_pkg_type,
+            install_mode: parsed_install_mode,
+            install_args: pkg.install_args.clone(),
+            executable_path: pkg.executable_path.clone(),
+            require_elevation: pkg.require_elevation,
+            size: Some(package_size),
+        };
+
+        let entry = ManifestReleaseEntry {
+            version: version.clone(),
+            min_supported_version: min_supported_version.clone(),
+            pub_date: pub_date.clone(),
+            package_info,
+        };
+
+        let release_args_for_update = ReleaseArgs {
+            config: None,
+            version: Some(batch_config.version.clone()),
+            target: Some(pkg.target.clone()),
+            package: Some(pkg_path),
+            package_type: Some(pkg.package_type.clone()),
+            url: Some(pkg.url.clone()),
+            key: key_path,
+            notes: batch_config.notes.clone(),
+            pub_date: Some(pub_date.clone()),
+            min_supported_version: batch_config.min_supported_version.clone(),
+            force_update: batch_config.force_update,
+            install_mode: pkg.install_mode.clone(),
+            install_args: pkg.install_args.clone(),
+            executable_path: pkg.executable_path.clone(),
+            channel: batch_config.channel.clone(),
+            require_elevation: pkg.require_elevation,
+            rollout_percentage: batch_config.rollout_percentage,
+            manifest: manifest_path.clone(),
+        };
+
+        update_manifest_entries(&mut manifest, &pkg.target, &release_args_for_update, entry);
+        success_count += 1;
+        log::info!("  已完成平台 '{}' 的包签名与清单合并", pkg.target);
+    }
+
+    save_manifest_file(&manifest_path, &manifest)?;
+    log::info!(
+        "批量发布成功！已合并 {} 个平台的包元数据并写入 Manifest：{}",
+        success_count,
+        manifest_path.display()
+    );
+    Ok(())
+}
+
+/// 执行 Manifest 元数据与本地物理包核验
+fn handle_verify(args: &VerifyArgs) -> Result<()> {
+    if !args.manifest.exists() {
+        anyhow::bail!("Manifest 清单文件不存在: {}", args.manifest.display());
+    }
+    if !args.package.exists() {
+        anyhow::bail!("待校验的物理发布包文件不存在: {}", args.package.display());
+    }
+
+    let content = fs::read_to_string(&args.manifest)
+        .with_context(|| format!("读取 Manifest 清单文件失败: {}", args.manifest.display()))?;
+    let manifest = serde_json::from_str::<Manifest>(&content)
+        .with_context(|| "反序列化 Manifest JSON 失败")?;
+
+    let target = args
+        .target
+        .clone()
+        .unwrap_or_else(|| shipup::current_target_triple().to_string());
+
+    let (version, pkg_info) = if let Some(ref ch) = args.channel {
+        let channel_info = manifest
+            .channels
+            .get(ch)
+            .ok_or_else(|| anyhow!("在 Manifest 中未找到指定的通道 '{}'", ch))?;
+        let pkg = channel_info.packages.get(&target).ok_or_else(|| {
+            anyhow!(
+                "在 Manifest 通道 '{}' 中未找到平台 '{}' 的包配置",
+                ch,
+                target
+            )
+        })?;
+        (&channel_info.version, pkg)
+    } else {
+        let pkg = manifest
+            .packages
+            .get(&target)
+            .ok_or_else(|| anyhow!("在 Manifest 中未找到平台 '{}' 的包配置", target))?;
+        (&manifest.version, pkg)
+    };
+
+    // 1. 校验文件大小
+    let actual_size = fs::metadata(&args.package)
+        .with_context(|| format!("获取发布包文件元数据失败: {}", args.package.display()))?
+        .len();
+
+    if let Some(expected_size) = pkg_info.size
+        && actual_size != expected_size
+    {
+        anyhow::bail!(
+            "发布包体积不匹配！期望大小: {} ({} 字节)，实际文件大小: {} ({} 字节)",
+            format_human_size(expected_size),
+            expected_size,
+            format_human_size(actual_size),
+            actual_size
+        );
+    }
+
+    // 2. 校验 SHA-256
+    let (computed_checksum, _) = compute_payload_integrity(&args.package, None)?;
+    if let Some(ref expected_checksum) = pkg_info.checksum {
+        let exp_clean = expected_checksum
+            .strip_prefix("sha256:")
+            .unwrap_or(expected_checksum);
+        let comp_clean = computed_checksum
+            .strip_prefix("sha256:")
+            .unwrap_or(&computed_checksum);
+        if !exp_clean.eq_ignore_ascii_case(comp_clean) {
+            anyhow::bail!(
+                "发布包 SHA-256 校验和不匹配！\n  期望值: {}\n  计算值: {}",
+                expected_checksum,
+                computed_checksum
+            );
+        }
+    } else {
+        log::warn!("Manifest 中未包含该包的 checksum 校验和字段");
+    }
+
+    // 3. 校验 Ed25519 签名
+    let public_key_b64 = if let Some(ref key_str) = args.public_key {
+        Some(key_str.trim().to_string())
+    } else if let Some(ref key_file) = args.public_key_file {
+        let s = fs::read_to_string(key_file)
+            .with_context(|| format!("读取公钥文件失败: {}", key_file.display()))?;
+        Some(s.trim().to_string())
+    } else {
+        None
+    };
+
+    let sig_status = match (public_key_b64, pkg_info.signature.as_deref()) {
+        (Some(ref pk_b64), Some(sig_b64)) => {
+            let pk_bytes = BASE64.decode(pk_b64).context("解码 Base64 格式公钥失败")?;
+            let pk_arr: [u8; 32] = pk_bytes.as_slice().try_into().map_err(|_| {
+                anyhow!("公钥长度不正确，期望 32 字节，实际 {} 字节", pk_bytes.len())
+            })?;
+            let sig_bytes = BASE64
+                .decode(sig_b64)
+                .context("解码 Manifest 中的 Base64 签名失败")?;
+            let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| {
+                anyhow!(
+                    "签名长度不正确，期望 64 字节，实际 {} 字节",
+                    sig_bytes.len()
+                )
+            })?;
+
+            let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_arr)
+                .map_err(|e| anyhow!("无效的 Ed25519 公钥格式: {}", e))?;
+            let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
+
+            let payload_bytes = fs::read(&args.package)
+                .with_context(|| format!("读取发布包以验签失败: {}", args.package.display()))?;
+            verifying_key
+                .verify_strict(&payload_bytes, &signature)
+                .map_err(|_| anyhow!("Ed25519 数字签名校验未通过：发布包已被篡改或公钥不匹配"))?;
+
+            "已验证通过 (合法数字签名)"
+        }
+        (None, Some(_)) => {
+            log::warn!(
+                "发布包包含数字签名，但本次未提供公钥参数进行验签 (--public-key 或 --public-key-file)"
+            );
+            "包含签名 (未提供公钥，已跳过验签)"
+        }
+        (Some(_), None) => {
+            anyhow::bail!("提供了公钥进行验证，但 Manifest 中该平台发布包未配置 signature 签名");
+        }
+        (None, None) => "无签名配置",
+    };
+
+    println!("==================== 发布包校验通过 ====================");
+    println!("Manifest 文件:    {}", args.manifest.display());
+    println!("发布版本号:        {}", version);
+    println!("目标平台架构:      {}", target);
+    println!("发布包路径:        {}", args.package.display());
+    println!("包体积大小:        {}", format_human_size(actual_size));
+    println!("SHA-256 校验和:    {} (完全匹配)", computed_checksum);
+    println!("Ed25519 数字签名:  {}", sig_status);
+    println!("========================================================");
+
+    Ok(())
+}
+
+/// 执行 Manifest 元数据内容结构化展示
+fn handle_inspect(args: &InspectArgs) -> Result<()> {
+    if !args.manifest.exists() {
+        anyhow::bail!("Manifest 文件不存在: {}", args.manifest.display());
+    }
+
+    let content = fs::read_to_string(&args.manifest)
+        .with_context(|| format!("读取 Manifest 文件失败: {}", args.manifest.display()))?;
+    let manifest = serde_json::from_str::<Manifest>(&content)
+        .with_context(|| "反序列化 Manifest JSON 失败")?;
+
+    println!("==================== Manifest 清单信息 ====================");
+    println!("文件路径:          {}", args.manifest.display());
+    println!("主通道版本:        {}", manifest.version);
+    if let Some(ref notes) = manifest.notes {
+        println!("版本更新日志:\n{}", notes);
+    }
+    if let Some(ref pub_date) = manifest.pub_date {
+        println!("发布时间 (UTC):    {}", pub_date);
+    }
+    if let Some(ref min_v) = manifest.min_supported_version {
+        println!("最低支持版本:      {}", min_v);
+    }
+    println!(
+        "强制更新 (Force):  {}",
+        if manifest.force_update { "是" } else { "否" }
+    );
+    if let Some(pct) = manifest.rollout_percentage {
+        println!("灰度放量比例:      {}%", pct);
+    } else {
+        println!("灰度放量比例:      100% (全量发布)");
+    }
+    println!(
+        "全局签名:          {}",
+        if manifest.signature.is_some() {
+            "已配置"
+        } else {
+            "无"
+        }
+    );
+
+    println!("\n[主通道平台包矩阵 (共 {} 个)]", manifest.packages.len());
+    for (target, pkg) in &manifest.packages {
+        println!("  - Target 平台:     {}", target);
+        println!("    包形态类型:      {:?}", pkg.package_type);
+        println!("    下载地址:        {}", pkg.url);
+        if let Some(sz) = pkg.size {
+            println!("    包体积大小:      {}", format_human_size(sz));
+        }
+        if let Some(ref chk) = pkg.checksum {
+            println!("    SHA-256 校验和:  {}", chk);
+        }
+        println!(
+            "    数字签名状态:    {}",
+            if pkg.signature.is_some() {
+                "已签名"
+            } else {
+                "未签名"
+            }
+        );
+        if let Some(ref exec) = pkg.executable_path {
+            println!("    归档可执行路径:  {}", exec);
+        }
+        if let Some(ref mode) = pkg.install_mode {
+            println!("    安装器模式:      {:?}", mode);
+        }
+        if pkg.require_elevation {
+            println!("    提权要求:        需要管理员提权 (UAC/Sudo)");
+        }
+    }
+
+    if !manifest.channels.is_empty() {
+        println!("\n[独立多通道列表 (共 {} 个)]", manifest.channels.len());
+        for (ch_name, ch_info) in &manifest.channels {
+            if let Some(ref filter_ch) = args.channel
+                && filter_ch != ch_name
+            {
+                continue;
+            }
+            println!("  * 通道标识:        {}", ch_name);
+            println!("    通道版本:        {}", ch_info.version);
+            if let Some(pct) = ch_info.rollout_percentage {
+                println!("    灰度放量比例:    {}%", pct);
+            }
+            println!("    支持平台数:      {}", ch_info.packages.len());
+        }
+    }
+    println!("===========================================================");
+
     Ok(())
 }
 
@@ -617,11 +1151,12 @@ mod tests {
         };
 
         let args_old = ReleaseArgs {
-            version: "1.1.0".to_string(),
-            target: "x86_64-pc-windows-msvc".to_string(),
-            package: PathBuf::from("dummy"),
-            package_type: "binary".to_string(),
-            url: "https://example.com/win-1.1.0.exe".to_string(),
+            config: None,
+            version: Some("1.1.0".to_string()),
+            target: Some("x86_64-pc-windows-msvc".to_string()),
+            package: Some(PathBuf::from("dummy")),
+            package_type: Some("binary".to_string()),
+            url: Some("https://example.com/win-1.1.0.exe".to_string()),
             key: None,
             notes: Some("旧版 1.1.0".to_string()),
             pub_date: None,
@@ -636,7 +1171,12 @@ mod tests {
             manifest: PathBuf::from("latest.json"),
         };
 
-        update_manifest_entries(&mut manifest, &args_old, entry_old);
+        update_manifest_entries(
+            &mut manifest,
+            "x86_64-pc-windows-msvc",
+            &args_old,
+            entry_old,
+        );
 
         // 验证：主版本依然保持 1.2.0，notes 依然保持 1.2.0，未被逆向降级！
         assert_eq!(manifest.version, Version::parse("1.2.0").unwrap());
@@ -663,11 +1203,12 @@ mod tests {
         };
 
         let args_new = ReleaseArgs {
-            version: "1.3.0".to_string(),
-            target: "aarch64-apple-darwin".to_string(),
-            package: PathBuf::from("dummy"),
-            package_type: "archive".to_string(),
-            url: "https://example.com/mac-1.3.0.tar.gz".to_string(),
+            config: None,
+            version: Some("1.3.0".to_string()),
+            target: Some("aarch64-apple-darwin".to_string()),
+            package: Some(PathBuf::from("dummy")),
+            package_type: Some("archive".to_string()),
+            url: Some("https://example.com/mac-1.3.0.tar.gz".to_string()),
             key: None,
             notes: Some("全新 1.3.0".to_string()),
             pub_date: Some("2026-10-01T00:00:00Z".to_string()),
@@ -682,7 +1223,7 @@ mod tests {
             manifest: PathBuf::from("latest.json"),
         };
 
-        update_manifest_entries(&mut manifest, &args_new, entry_new);
+        update_manifest_entries(&mut manifest, "aarch64-apple-darwin", &args_new, entry_new);
 
         // 验证：升级为主版本 1.3.0，灰度比例设置为 30%
         assert_eq!(manifest.version, Version::parse("1.3.0").unwrap());
@@ -692,5 +1233,104 @@ mod tests {
         assert!(manifest.force_update);
         assert!(manifest.packages.contains_key("x86_64-pc-windows-msvc"));
         assert!(manifest.packages.contains_key("aarch64-apple-darwin"));
+    }
+
+    #[test]
+    fn test_batch_release_verify_and_inspect_flow() -> Result<()> {
+        let temp_dir =
+            std::env::temp_dir().join(format!("shipup_cli_batch_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir)?;
+
+        // 1. 生成密钥对
+        handle_keygen(&temp_dir)?;
+        let key_file = temp_dir.join("ed25519.key");
+        let pub_file = temp_dir.join("ed25519.pub");
+        assert!(key_file.exists());
+        assert!(pub_file.exists());
+
+        // 2. 准备两个发布包
+        let win_pkg = temp_dir.join("myapp-windows.exe");
+        let mac_pkg = temp_dir.join("myapp-macos.tar.gz");
+        fs::write(&win_pkg, b"binary for windows x64 target payload")?;
+        fs::write(&mac_pkg, b"archive for macos arm64 target payload")?;
+
+        let manifest_file = temp_dir.join("latest.json");
+
+        // 3. 编写 shipup.toml 配置文件
+        let toml_path = temp_dir.join("shipup.toml");
+        let toml_content = r#"
+version = "2.0.0"
+notes = "跨平台批量发布测试"
+pub_date = "2026-09-09T20:00:00Z"
+key = "ed25519.key"
+manifest = "latest.json"
+rollout_percentage = 40
+
+[[packages]]
+target = "x86_64-pc-windows-msvc"
+package = "myapp-windows.exe"
+package_type = "binary"
+url = "https://example.com/myapp-windows.exe"
+
+[[packages]]
+target = "aarch64-apple-darwin"
+package = "myapp-macos.tar.gz"
+package_type = "archive"
+url = "https://example.com/myapp-macos.tar.gz"
+executable_path = "myapp"
+"#;
+        fs::write(&toml_path, toml_content)?;
+
+        // 4. 执行批量发布
+        handle_batch_release(&toml_path, &manifest_file)?;
+        assert!(manifest_file.exists());
+
+        // 5. 校验 inspect 功能无异常
+        let inspect_args = InspectArgs {
+            manifest: manifest_file.clone(),
+            channel: None,
+        };
+        handle_inspect(&inspect_args)?;
+
+        // 6. 校验 verify 功能（正常情况）
+        let verify_win = VerifyArgs {
+            manifest: manifest_file.clone(),
+            package: win_pkg.clone(),
+            target: Some("x86_64-pc-windows-msvc".to_string()),
+            channel: None,
+            public_key_file: Some(pub_file.clone()),
+            public_key: None,
+        };
+        handle_verify(&verify_win)?;
+
+        let verify_mac = VerifyArgs {
+            manifest: manifest_file.clone(),
+            package: mac_pkg.clone(),
+            target: Some("aarch64-apple-darwin".to_string()),
+            channel: None,
+            public_key_file: Some(pub_file),
+            public_key: None,
+        };
+        handle_verify(&verify_mac)?;
+
+        // 7. 校验 verify 防篡改拦截（修改包文件导致 SHA-256 不一致）
+        let tampered_pkg = temp_dir.join("tampered.exe");
+        fs::write(&tampered_pkg, b"tampered corrupt content")?;
+        let verify_tampered = VerifyArgs {
+            manifest: manifest_file.clone(),
+            package: tampered_pkg,
+            target: Some("x86_64-pc-windows-msvc".to_string()),
+            channel: None,
+            public_key_file: None,
+            public_key: None,
+        };
+        let tamper_res = handle_verify(&verify_tampered);
+        assert!(tamper_res.is_err());
+        let err_msg = tamper_res.unwrap_err().to_string();
+        assert!(err_msg.contains("不匹配"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+        Ok(())
     }
 }
