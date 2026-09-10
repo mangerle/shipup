@@ -427,7 +427,7 @@ update.restart_with(|ctx| {
 当新版本因打包遗漏动态链接库、第三方依赖冲突或代码严重缺陷导致应用启动后立即崩溃闪退时，传统的更新器会使客户端陷入无限崩溃死锁。`shipup` 内置了灾难自愈状态机：
 
 1. **入口前置自检**：在 `main` 函数第一行调用 `shipup::check_and_recover_current(2)`。
-2. **崩溃计数判定**：如果新版本启动连续崩溃超过容忍上限（默认 2 次），下一次启动时自动使用稳定旧版本备份原子覆盖崩溃二进制，完成自愈。
+2. **崩溃计数判定**：如果新版本启动连续崩溃超过容忍上限（`DEFAULT_MAX_CRASH_ATTEMPTS` 默认 2，即第 3 次启动时），自动使用稳定旧版本备份原子覆盖崩溃二进制，完成自愈。
 3. **确认升级闭环**：当应用完成启动并平稳运行（如主界面加载完毕）后，调用 `shipup::confirm_update_success()` 销毁旧备份与状态标记，退出观察期。
 
 ---
@@ -592,11 +592,12 @@ let updater = UpdaterBuilder::new()
 `shipup` 采取严格的防御性与同卷写入设计，各物理文件在磁盘上的分布拓扑如下：
 
 ```
-[可执行程序同级目录]
+[可执行程序同级目录或安全数据目录]
 ├── myapp.exe                     # 当前运行的主程序二进制
-├── myapp.exe.shipup.old           # 物理替换前备份的旧版本（用于自愈回滚与文件锁绕过，由 cleanup_old_backups 回收）
+├── myapp.exe.shipup.{version}.old # 物理替换前按版本备份的旧二进制（用于自愈回滚与主动回滚）
 ├── myapp.exe.{token}.{rnd}.shipup.tmp # 同卷临时写入切片（带高熵随机数防预测与预占投毒）
-├── shipup.recovery.json           # 启动观察期健康状态机与自愈回滚历史持久化（受 max_rollback_entries 限制）
+├── .shipup.state                  # 启动观察期健康状态机标记（崩溃计数与备份路径）
+├── .shipup.history                # 历史版本回滚记录（受 max_rollback_entries 限制）
 └── .shipup_preference.json        # 用户偏好状态（跳过版本、稍后提醒时间戳与客户端唯一匿名 UUID）
 
 [系统通用临时目录 (如 /tmp 或 %TEMP%)]
@@ -604,7 +605,7 @@ let updater = UpdaterBuilder::new()
     └── installer.exe              # 待拉起的完整物理安装程序
 ```
 
-- **备份生命周期**：`.shipup.old` 会在下一次应用程序初始化并确认新版本运行稳定后由 `cleanup_old_backups()` 自动销毁。
-- **孤儿临时切片防泄露**：Windows 与 Unix 下若遇到下载断电或进程强退，修改时间超过 24 小时的孤儿临时切片会在下次程序启动时静默回收。
-- **回滚历史保护**：`shipup.recovery.json` 记录了最近多次升级的版本号与备份文件路径。若连续崩溃次数达到触发阈值（默认 3 次），系统将在无需人工干预的情况下原子恢复至上一版本。
+- **备份生命周期**：版本化备份 `{exe}.shipup.{version}.old` 由回滚历史管理；`{exe}.shipup.old` 会在下一次应用程序初始化并确认新版本运行稳定后由 `cleanup_old_backups()` 自动销毁。
+- **孤儿临时切片防泄露**：Windows、macOS 与 Linux 下若遇到下载断电或进程强退，修改时间超过 24 小时的孤儿临时切片会在下次程序启动时静默回收。
+- **回滚历史保护**：`.shipup.history` 记录了最近多次升级的版本号与备份文件路径；`.shipup.state` 记录健康观察期状态。若启动尝试次数超过容忍上限（`DEFAULT_MAX_CRASH_ATTEMPTS` 默认 2，即第 3 次启动时），系统将在无需人工干预的情况下原子恢复至上一版本。
 
