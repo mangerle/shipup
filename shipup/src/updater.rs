@@ -585,13 +585,17 @@ impl Updater {
     ///
     /// # 设计原理
     /// - **实现初衷**：在配置多个更新端点（主 CDN、备用 CDN 等）时，按错峰延迟并发发起连接与 Manifest 请求。
-    /// - **核心优势**：最快成功返回并校验通过的端点直接采纳，避免前序慢端点引发长尾超时。
-    /// - **代价与局限**：产生多线程并发网络请求，在首选源健康时会产生少许冗余流量。
+    /// - **核心优势**：最快成功返回并校验通过的端点直接采纳；通过原子取消标志位让尚未起步的竞速线程立即放弃，
+    ///   避免胜出后仍继续发起无谓网络请求。
+    /// - **代价与局限**：已进入网络 IO 的阻塞请求无法中途强杀（reqwest blocking 限制），但结果会被直接丢弃。
     fn check_endpoints_racing_blocking(
         &self,
         client: &reqwest::blocking::Client,
         template_ctx: &TemplateContext<'_>,
     ) -> Result<Option<Update>> {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
         let endpoints: Vec<String> = self
             .inner
             .endpoints
@@ -606,6 +610,7 @@ impl Updater {
             self.inner.config.stagger_delay.as_millis()
         );
 
+        let settled = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
         for (idx, endpoint) in endpoints.into_iter().enumerate() {
             let stagger = self
@@ -617,11 +622,18 @@ impl Updater {
             let allow_file = self.inner.config.allow_file_protocol;
             let tx_cloned = tx.clone();
             let updater = self.clone();
+            let settled_cloned = Arc::clone(&settled);
 
             std::thread::spawn(move || {
                 if !stagger.is_zero() {
                     std::thread::sleep(stagger);
                 }
+
+                // 胜出后尚未真正发起请求的线程直接放弃，杜绝冗余流量
+                if settled_cloned.load(AtomicOrdering::Acquire) {
+                    return;
+                }
+
                 let fetch_res = if download::is_file_url(&endpoint) {
                     if !allow_file {
                         Err(UpdateError::FileProtocolNotAllowed(endpoint.clone()))
@@ -651,6 +663,8 @@ impl Updater {
             completed = completed.saturating_add(1);
             match result {
                 Ok(opt_update) => {
+                    // 先置位取消标志，再返回结果，通知其余线程放弃后续请求
+                    settled.store(true, AtomicOrdering::Release);
                     log::info!("多更新源端点竞速胜出: {}", endpoint);
                     return Ok(opt_update);
                 }
@@ -663,6 +677,8 @@ impl Updater {
                 break;
             }
         }
+
+        settled.store(true, AtomicOrdering::Release);
 
         if let Some(ref fallback) = self.inner.fallback_manifest {
             log::warn!("所有竞速端点均请求失败，降级采用内嵌 Fallback Manifest 评估更新");
