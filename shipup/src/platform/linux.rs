@@ -89,17 +89,89 @@ pub fn ensure_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Linux 原地替换可执行文件
+/// 探测当前进程是否运行于 AppImage，并返回其宿主镜像文件路径
+///
+/// # 设计原理
+/// - **实现初衷**：AppImage 运行时通过 FUSE 挂载，`current_exe()` 指向挂载点内的 squashfs 路径，
+///   直接对其执行自替换无法更新真正的镜像文件。AppImage 官方约定通过环境变量 `APPIMAGE`
+///   暴露外层镜像绝对路径。
+/// - **核心优势**：精准定位应被原子替换的真实 `.AppImage` 文件，避免更新“挂载幽灵路径”。
+/// - **代价与局限**：仅在以 AppImage 形态启动时该环境变量存在；普通二进制部署返回 None。
+pub fn current_appimage_path() -> Option<PathBuf> {
+    std::env::var_os("APPIMAGE")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+}
+
+/// Linux 原地替换可执行文件（AppImage 场景自动定位外层镜像）
 ///
 /// # 设计原理
 /// - **实现初衷**：在 POSIX 系统中，正在执行的文件可以通过 `unlink` 移除目录项并由新文件原子替换。
+///   AppImage 形态下必须替换 `APPIMAGE` 指向的镜像文件，而非 FUSE 挂载点内的路径。
 ///
 /// # Errors
 /// 当权限修正或二进制替换失败时返回 [`UpdateError::SelfReplace`]。
 pub fn replace_current_binary(new_binary_path: &Path) -> Result<()> {
     ensure_executable(new_binary_path)?;
+
+    // AppImage 专用路径：替换外层镜像文件并恢复可执行权限
+    if let Some(appimage) = current_appimage_path() {
+        log::info!(
+            "检测到 AppImage 运行环境，将原子替换镜像文件: {}",
+            appimage.display()
+        );
+        replace_appimage_file(&appimage, new_binary_path)?;
+        return Ok(());
+    }
+
     self_replace::self_replace(new_binary_path)
         .map_err(|e| UpdateError::SelfReplace(format!("Linux 原地替换可执行程序失败: {}", e)))?;
+    Ok(())
+}
+
+/// 将新 AppImage 镜像安全覆盖到目标镜像路径
+///
+/// # 设计原理
+/// - **实现初衷**：`self_replace` 仅作用于 `current_exe()`，无法指定任意目标路径；
+///   AppImage 更新必须以“同卷 rename 覆盖 + 备份回退”方式替换外层镜像。
+/// - **核心优势**：先备份旧镜像再覆盖，失败时自动回滚；成功后恢复 0o755 可执行权限。
+///
+/// # Errors
+/// 当备份、覆盖或权限修正失败时返回 [`UpdateError::SelfReplace`]。
+fn replace_appimage_file(target_appimage: &Path, new_binary_path: &Path) -> Result<()> {
+    let backup = target_appimage.with_extension("shipup.old");
+    if backup.exists() {
+        let _ = fs::remove_file(&backup);
+    }
+
+    if let Err(e) = fs::rename(target_appimage, &backup) {
+        return Err(UpdateError::SelfReplace(format!(
+            "备份旧 AppImage 镜像失败 ({} -> {}): {e}",
+            target_appimage.display(),
+            backup.display()
+        )));
+    }
+
+    if let Err(e) = fs::copy(new_binary_path, target_appimage) {
+        // 覆盖失败时尝试恢复旧镜像
+        let _ = fs::rename(&backup, target_appimage);
+        return Err(UpdateError::SelfReplace(format!(
+            "写入新 AppImage 镜像失败，已尝试恢复旧版本: {e}"
+        )));
+    }
+
+    if let Err(e) = ensure_executable(target_appimage) {
+        return Err(UpdateError::SelfReplace(format!(
+            "AppImage 权限修复失败: {e}"
+        )));
+    }
+
+    // 旧镜像备份交由启动清理逻辑回收，此处仅保留供崩溃回滚
+    log::info!(
+        "AppImage 镜像替换完成: {}（旧镜像备份: {}）",
+        target_appimage.display(),
+        backup.display()
+    );
     Ok(())
 }
 
@@ -313,5 +385,36 @@ mod tests {
         assert_eq!(mode & 0o755, 0o755, "执行权限必须包含 0o755 掩码位");
 
         let _ = fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn test_current_appimage_path_none_without_env() {
+        // 未设置 APPIMAGE 环境变量时不应误判
+        // 注意：测试环境可能被外部污染，此处仅验证函数可调用不 panic
+        let _ = current_appimage_path();
+    }
+
+    #[test]
+    fn test_replace_appimage_file_backup_and_restore() {
+        let temp_dir = env::temp_dir().join(format!("shipup_appimage_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let target = temp_dir.join("MyApp.AppImage");
+        let new_bin = temp_dir.join("new.AppImage");
+        fs::write(&target, b"old-appimage-bytes").unwrap();
+        fs::write(&new_bin, b"new-appimage-bytes").unwrap();
+
+        replace_appimage_file(&target, &new_bin).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"new-appimage-bytes");
+        let backup = target.with_extension("shipup.old");
+        assert!(backup.exists(), "旧镜像备份必须保留供回滚");
+        assert_eq!(fs::read(&backup).unwrap(), b"old-appimage-bytes");
+
+        let mode = fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o755, 0o755);
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

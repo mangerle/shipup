@@ -111,7 +111,7 @@ impl std::fmt::Debug for NetworkSecurityConfig {
             .field("chunked_download", &self.chunked_download)
             .field("chunked_concurrency", &self.chunked_concurrency)
             .field("chunk_size", &self.chunk_size)
-            .field("download_mirrors_count", &self.download_mirrors.len())
+            .field("download_mirrors", &self.download_mirrors)
             .field("resumable_download", &self.resumable_download)
             .finish()
     }
