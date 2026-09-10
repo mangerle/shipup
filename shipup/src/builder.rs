@@ -598,8 +598,9 @@ impl UpdaterBuilder {
     /// 便捷配置 GitHub Releases 作为更新发布源
     ///
     /// # 设计原理
-    /// - **实现初衷**：为开源及商业项目托管在 GitHub 的软件提供开箱即用的零配置发布源。
-    /// - **核心优势**：自动探测附件中的 `manifest.json` 或根据 Release 资产名称自动推导平台安装包。
+    /// - **实现初衷**：为开源及商业项目托管在 GitHub 的软件提供开箱即用的静态发布源。
+    /// - **核心优势**：直接向 GitHub Release 附件中的静态清单（默认 `latest.json`）发起请求，完全免除 GitHub REST API 60次/小时 的限流限制，响应迅速。
+    /// - **代价与局限**：必须依赖发布端通过 CI/CD 或 shipup-cli release 将签名清单（如 `latest.json`）作为 Release 附件发布。
     ///
     /// # 参数
     /// * `owner`: GitHub 仓库所有者或组织名

@@ -152,10 +152,7 @@ impl UpdatePreference {
 
     /// 获取已有的客户端设备唯一标识，若尚未存在则自动生成并缓存
     pub fn get_or_create_client_id(&mut self) -> &str {
-        if self.client_id.is_none() {
-            self.client_id = Some(generate_random_client_id());
-        }
-        self.client_id.as_deref().unwrap_or_default()
+        self.client_id.get_or_insert_with(generate_random_client_id)
     }
 
     /// 手动设置客户端设备稳定唯一标识符
@@ -219,8 +216,8 @@ pub fn resolve_safe_data_dir() -> Option<PathBuf> {
     {
         // 探测父目录是否拥有写入权限
         let test_probe = parent.join(format!(".shipup_probe_{}", std::process::id()));
-        if std::fs::write(&test_probe, b"").is_ok() {
-            let _ = std::fs::remove_file(&test_probe);
+        if fs::write(&test_probe, b"").is_ok() {
+            let _ = fs::remove_file(&test_probe);
             return Some(parent.to_path_buf());
         }
     }
@@ -242,12 +239,12 @@ fn get_user_app_data_dir() -> Option<PathBuf> {
     {
         if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
             let dir = PathBuf::from(local_appdata).join(&app_name);
-            let _ = std::fs::create_dir_all(&dir);
+            let _ = fs::create_dir_all(&dir);
             return Some(dir);
         }
         if let Ok(appdata) = std::env::var("APPDATA") {
             let dir = PathBuf::from(appdata).join(&app_name);
-            let _ = std::fs::create_dir_all(&dir);
+            let _ = fs::create_dir_all(&dir);
             return Some(dir);
         }
     }

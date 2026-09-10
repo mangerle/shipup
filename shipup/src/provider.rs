@@ -3,13 +3,7 @@
 #[cfg(any(feature = "blocking", feature = "async", test))]
 use crate::error::{Result, UpdateError};
 #[cfg(any(feature = "blocking", feature = "async", test))]
-use crate::manifest::{Manifest, PackageInfo, PackageType};
-#[cfg(any(feature = "blocking", feature = "async", test))]
-use semver::Version;
-#[cfg(any(feature = "blocking", feature = "async", test))]
-use serde::Deserialize;
-#[cfg(any(feature = "blocking", feature = "async", test))]
-use std::collections::BTreeMap;
+use crate::manifest::Manifest;
 use std::fmt;
 use std::time::Duration;
 
@@ -19,19 +13,19 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT}
 /// 发布源提供者通用接口抽象
 ///
 /// # 设计原理
-/// - **实现初衷**：解耦更新器对单一静态 `manifest.json` 下载端点的依赖，支持接入多种外部发布平台（如 GitHub Releases、GitLab、私有制品库）。
-/// - **核心优势**：在无需运维自建更新元数据服务器的前提下，直接从平台 API 推导或拉取版本清单。
-/// - **代价与局限**：受平台接口鉴权策略与调用频次配额（Rate Limit）约束。
+/// - **实现初衷**：将版本清单（Manifest）的拉取逻辑抽象为通用特型，解耦更新器对常规 HTTP URL 探测通道的直接依赖，支持接入多种自定义或平台化发布源（如 GitHub Releases、GitLab、私有制品库）。
+/// - **核心优势**：调用方可自由扩展清单获取策略（例如注入平台专有鉴权、动态计算直链路径或适配私有协议），统一更新元数据加载契约。
+/// - **代价与局限**：相比直接配置 `manifest_url`，自定义 Provider 需同时实现同步阻塞与异步原生两套获取逻辑。
 pub trait ReleaseProvider: Send + Sync {
-    /// 以同步阻塞方式获取或推导 Manifest 元数据
+    /// 以同步阻塞方式获取 Manifest 元数据
     #[cfg(feature = "blocking")]
     fn fetch_manifest_blocking(&self) -> Result<Manifest>;
 
-    /// 以异步非阻塞方式获取或推导 Manifest 元数据
+    /// 以异步非阻塞方式获取 Manifest 元数据
     #[cfg(feature = "async")]
     fn fetch_manifest_async<'a>(
         &'a self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Manifest>> + Send + 'a>>;
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Manifest>> + Send + 'a>>;
 }
 
 /// 提供者底层 HTTP 客户端参数配置
@@ -55,21 +49,21 @@ impl Default for ProviderClientOptions {
     }
 }
 
-/// GitHub Releases 原生发布源提供者
+/// GitHub Releases 静态清单发布源提供者
 ///
 /// # 设计原理
-/// - **实现初衷**：直接对接 GitHub 官方 Releases API，实现零服务器运维的自动化软件发布与更新。
+/// - **实现初衷**：为托管在 GitHub Releases 的软件提供无服务器运维的静态更新发布源。
 /// - **核心优势**：
-///   - 自动优先检测附件中的 `manifest.json` 或 `latest.json`，若存在则直接作为权威清单载入；
-///   - 若未上传专用清单文件，则自动解析 Release Tag、Release Notes 与附件名称，推导合成符合规范的最小 Manifest；
-///   - 支持配置 GitHub Personal Access Token (PAT) 提高接口配额并支持私有仓库拉取。
-/// - **代价与局限**：未提供 Token 时，GitHub 匿名 API 请求受 60 次/小时限制。
+///   - 直接向 GitHub Release 静态资产（默认固定为 `latest.json`）发起下载请求，走静态存储 CDN；
+///   - 彻底摆脱 GitHub REST API（`api.github.com`）未鉴权 60 次/小时 的 Rate Limit 频次配额限制；
+///   - 响应极快，并且天然支持接入国内镜像反代加速。
+/// - **代价与局限**：发布端必须在发布 Release 时通过 CI/CD 或 shipup-cli 将签名后的清单文件（如 `latest.json`）作为附件一同上传。
 #[derive(Clone)]
 pub struct GitHubProvider {
     owner: String,
     repo: String,
     token: Option<String>,
-    manifest_asset_name: Option<String>,
+    manifest_asset_name: String,
     options: ProviderClientOptions,
 }
 
@@ -96,20 +90,20 @@ impl GitHubProvider {
             owner: owner.into(),
             repo: repo.into(),
             token: None,
-            manifest_asset_name: None,
+            manifest_asset_name: "latest.json".to_string(),
             options: ProviderClientOptions::default(),
         }
     }
 
-    /// 设置 GitHub 访问令牌（用于提高 Rate Limit 配额或访问私有仓库）
+    /// 设置 GitHub 访问令牌（用于私有仓库访问鉴权）
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
         self
     }
 
-    /// 指定附件中作为更新清单的文件名（默认为优先检测 `manifest.json` 或 `latest.json`）
+    /// 指定 Release 附件中作为更新清单的文件名（默认为确定的 `latest.json`）
     pub fn with_manifest_asset_name(mut self, name: impl Into<String>) -> Self {
-        self.manifest_asset_name = Some(name.into());
+        self.manifest_asset_name = name.into();
         self
     }
 
@@ -131,11 +125,24 @@ impl GitHubProvider {
         self
     }
 
-    /// 获取 GitHub Releases API 请求地址
+    /// 获取 GitHub Releases API 请求地址（保留供诊断或特定用途使用）
     pub fn release_api_url(&self) -> String {
         format!(
             "https://api.github.com/repos/{}/{}/releases/latest",
             self.owner, self.repo
+        )
+    }
+
+    /// 获取 GitHub Releases 静态资产直链（默认固定为 latest.json）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：在 GitHub Releases 体系中，shipup-cli 默认规范输出清单文件为 `latest.json`。
+    /// - **核心优势**：直接请求静态资产下载地址（`/releases/latest/download/{asset}`），完全免受 GitHub REST API 60次/小时 Rate Limit 限流，毫秒级响应。
+    /// - **代价与局限**：必须依赖发布端通过 CI/CD 或 shipup-cli release 将清单上传至 Release 附件。
+    pub fn manifest_download_url(&self) -> String {
+        format!(
+            "https://github.com/{}/{}/releases/latest/download/{}",
+            self.owner, self.repo, self.manifest_asset_name
         )
     }
 
@@ -168,314 +175,79 @@ impl GitHubProvider {
     }
 }
 
-/// GitHub Releases 原始响应数据模型
-#[cfg(any(feature = "blocking", feature = "async", test))]
-#[derive(Debug, Deserialize)]
-pub(crate) struct RawGitHubRelease {
-    pub tag_name: String,
-    pub name: Option<String>,
-    pub body: Option<String>,
-    pub published_at: Option<String>,
-    #[serde(default)]
-    pub assets: Vec<RawGitHubAsset>,
-}
-
-/// GitHub Releases 附件数据模型
-#[cfg(any(feature = "blocking", feature = "async", test))]
-#[derive(Debug, Deserialize)]
-pub(crate) struct RawGitHubAsset {
-    pub name: String,
-    pub size: u64,
-    pub browser_download_url: String,
-}
-
-/// GitHub Release 解析结果形态
-#[cfg(any(feature = "blocking", feature = "async", test))]
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ReleaseParseOutcome {
-    /// 附件中包含独立清单文件，提供其下载直链
-    ManifestUrl(String),
-    /// 根据附件与元数据动态推导合成的最小清单实体（Box 消除变体体积差异）
-    DerivedManifest(Box<Manifest>),
-}
-
-/// 解析 GitHub Release API JSON 响应并推导或提取 Manifest
-#[cfg(any(feature = "blocking", feature = "async", test))]
-pub(crate) fn parse_github_release_response(
-    json_text: &str,
-    preferred_manifest_name: Option<&str>,
-) -> Result<ReleaseParseOutcome> {
-    let raw: RawGitHubRelease = serde_json::from_str(json_text).map_err(|e| {
-        UpdateError::ManifestParse(format!("解析 GitHub Releases API 响应失败: {}", e))
-    })?;
-
-    // 1. 优先查找是否存在显式指定的清单文件名
-    if let Some(pref) = preferred_manifest_name
-        && let Some(asset) = raw
-            .assets
-            .iter()
-            .find(|a| a.name.eq_ignore_ascii_case(pref))
-    {
-        return Ok(ReleaseParseOutcome::ManifestUrl(
-            asset.browser_download_url.clone(),
-        ));
-    }
-
-    // 2. 查找默认通用清单文件（manifest.json 或 latest.json）
-    for candidate_name in &["manifest.json", "latest.json"] {
-        if let Some(asset) = raw
-            .assets
-            .iter()
-            .find(|a| a.name.eq_ignore_ascii_case(candidate_name))
-        {
-            return Ok(ReleaseParseOutcome::ManifestUrl(
-                asset.browser_download_url.clone(),
-            ));
-        }
-    }
-
-    // 3. 若无独立清单文件，从 Release Tag 与附件列表动态推导合成 Manifest
-    let clean_tag = raw
-        .tag_name
-        .trim()
-        .strip_prefix('v')
-        .or_else(|| raw.tag_name.trim().strip_prefix('V'))
-        .unwrap_or(raw.tag_name.trim());
-
-    let version = Version::parse(clean_tag)?;
-
-    let mut packages = BTreeMap::new();
-    for asset in &raw.assets {
-        if let Some(target) = detect_target_from_filename(&asset.name) {
-            let package_type = detect_package_type_from_filename(&asset.name);
-            let pkg = PackageInfo {
-                url: asset.browser_download_url.clone(),
-                mirrors: Vec::new(),
-                signature: None,
-                signatures: Vec::new(),
-                checksum: None,
-                package_type,
-                install_mode: None,
-                install_args: Vec::new(),
-                executable_path: None,
-                require_elevation: false,
-                wait_for_exit: false,
-                payload_checksums: Default::default(),
-                size: Some(asset.size),
-            };
-            packages.insert(target.to_string(), pkg);
-        }
-    }
-
-    let manifest = Manifest {
-        version,
-        min_supported_version: None,
-        force_update: false,
-        pub_date: raw.published_at,
-        notes: raw.body.or(raw.name),
-        packages,
-        channels: BTreeMap::new(),
-        signature: None,
-        signatures: Vec::new(),
-        rollout_percentage: None,
-        expires_at: None,
-        version_seq: None,
-    };
-
-    Ok(ReleaseParseOutcome::DerivedManifest(Box::new(manifest)))
-}
-
-/// 根据附件文件名猜测适配的目标平台 Target Triple
-#[cfg(any(feature = "blocking", feature = "async", test))]
-fn detect_target_from_filename(filename: &str) -> Option<&'static str> {
-    let lower = filename.to_ascii_lowercase();
-
-    // 常见标准完整 Rust Target 标识匹配
-    if lower.contains("x86_64-pc-windows-msvc") {
-        return Some("x86_64-pc-windows-msvc");
-    }
-    if lower.contains("x86_64-pc-windows-gnu") {
-        return Some("x86_64-pc-windows-gnu");
-    }
-    if lower.contains("aarch64-pc-windows-msvc") {
-        return Some("aarch64-pc-windows-msvc");
-    }
-    if lower.contains("x86_64-apple-darwin") {
-        return Some("x86_64-apple-darwin");
-    }
-    if lower.contains("aarch64-apple-darwin") {
-        return Some("aarch64-apple-darwin");
-    }
-    if lower.contains("x86_64-unknown-linux-musl") {
-        return Some("x86_64-unknown-linux-musl");
-    }
-    if lower.contains("x86_64-unknown-linux-gnu") {
-        return Some("x86_64-unknown-linux-gnu");
-    }
-    if lower.contains("aarch64-unknown-linux-musl") {
-        return Some("aarch64-unknown-linux-musl");
-    }
-    if lower.contains("aarch64-unknown-linux-gnu") {
-        return Some("aarch64-unknown-linux-gnu");
-    }
-
-    // 启发式架构与操作系统关键字匹配
-    let is_arm64 = lower.contains("arm64") || lower.contains("aarch64");
-    let is_x64 = lower.contains("x86_64") || lower.contains("x64") || lower.contains("amd64");
-
-    if lower.contains("win") || lower.ends_with(".exe") || lower.ends_with(".msi") {
-        if is_arm64 {
-            return Some("aarch64-pc-windows-msvc");
-        }
-        if is_x64 {
-            return Some("x86_64-pc-windows-msvc");
-        }
-    }
-
-    if lower.contains("mac")
-        || lower.contains("darwin")
-        || lower.ends_with(".dmg")
-        || lower.ends_with(".pkg")
-    {
-        if is_arm64 {
-            return Some("aarch64-apple-darwin");
-        }
-        if is_x64 {
-            return Some("x86_64-apple-darwin");
-        }
-    }
-
-    if lower.contains("linux")
-        || lower.ends_with(".deb")
-        || lower.ends_with(".rpm")
-        || lower.ends_with(".appimage")
-    {
-        let is_musl = lower.contains("musl");
-        if is_arm64 {
-            return if is_musl {
-                Some("aarch64-unknown-linux-musl")
-            } else {
-                Some("aarch64-unknown-linux-gnu")
-            };
-        }
-        if is_x64 {
-            return if is_musl {
-                Some("x86_64-unknown-linux-musl")
-            } else {
-                Some("x86_64-unknown-linux-gnu")
-            };
-        }
-    }
-
-    None
-}
-
-/// 根据文件名后缀启发式判断更新包类型
-#[cfg(any(feature = "blocking", feature = "async", test))]
-fn detect_package_type_from_filename(filename: &str) -> PackageType {
-    let lower = filename.to_ascii_lowercase();
-    if lower.ends_with(".zip")
-        || lower.ends_with(".tar.gz")
-        || lower.ends_with(".tgz")
-        || lower.ends_with(".tar.xz")
-        || lower.ends_with(".tar.zst")
-    {
-        PackageType::Archive
-    } else if lower.ends_with(".msi")
-        || lower.ends_with(".exe")
-        || lower.ends_with(".pkg")
-        || lower.ends_with(".dmg")
-        || lower.ends_with(".deb")
-        || lower.ends_with(".rpm")
-    {
-        PackageType::Installer
-    } else {
-        PackageType::Binary
-    }
-}
-
 impl ReleaseProvider for GitHubProvider {
     #[cfg(feature = "blocking")]
     fn fetch_manifest_blocking(&self) -> Result<Manifest> {
         let headers = self.build_headers()?;
-        let client_builder = reqwest::blocking::Client::builder()
+        let client = reqwest::blocking::Client::builder()
             .timeout(self.options.timeout)
-            .default_headers(headers);
-
-        let client = client_builder
+            .default_headers(headers)
             .build()
             .map_err(|e| UpdateError::Network(format!("创建 GitHub HTTP 客户端失败: {}", e)))?;
 
-        let api_url = self.release_api_url();
-        log::info!("正在向 GitHub API 请求最新发布元数据: {}", api_url);
+        let url = self.manifest_download_url();
+        log::info!("正在从 GitHub 静态 Release 资产拉取发布清单: {}", url);
 
-        let response = client
-            .get(&api_url)
-            .send()
-            .map_err(|e| UpdateError::Network(format!("请求 GitHub Releases API 失败: {}", e)))?;
+        let response = client.get(&url).send().map_err(|e| {
+            UpdateError::Network(format!(
+                "请求 GitHub 静态清单直链失败: {}, 原因: {}",
+                url, e
+            ))
+        })?;
 
         let status = response.status();
         if !status.is_success() {
             let msg = response
                 .text()
-                .unwrap_or_else(|_| "无法获取错误响应体".to_string());
-            if status.as_u16() == 403 && msg.contains("rate limit") {
+                .unwrap_or_else(|_| "无法读取错误响应体".to_string());
+            if status.as_u16() == 404 {
                 return Err(UpdateError::HttpStatus {
-                    status_code: 403,
-                    message: "GitHub API 请求频次超限 (Rate Limit Exceeded)，建议配置 Personal Access Token".to_string(),
+                    status_code: 404,
+                    message: format!(
+                        "GitHub Release 附件中未找到静态清单文件（地址: {}）。请确保版本已发布且包含该清单文件",
+                        url
+                    ),
                 });
             }
             return Err(UpdateError::HttpStatus {
                 status_code: status.as_u16(),
-                message: format!("GitHub API 响应异常: {}", msg),
+                message: format!(
+                    "下载 GitHub 静态清单响应异常 (HTTP {}): {}",
+                    status.as_u16(),
+                    msg
+                ),
             });
         }
 
-        let body = response
+        let text = response
             .text()
-            .map_err(|e| UpdateError::Network(format!("读取 GitHub API 响应体失败: {}", e)))?;
+            .map_err(|e| UpdateError::Network(format!("读取 GitHub 清单文件内容失败: {}", e)))?;
 
-        match parse_github_release_response(&body, self.manifest_asset_name.as_deref())? {
-            ReleaseParseOutcome::ManifestUrl(url) => {
-                log::info!("在 GitHub Release 附件中发现清单文件，正在拉取: {}", url);
-                let manifest_resp = client.get(&url).send().map_err(|e| {
-                    UpdateError::Network(format!("下载 GitHub 清单文件失败: {}", e))
-                })?;
-                let manifest_json = manifest_resp.text().map_err(|e| {
-                    UpdateError::Network(format!("读取 GitHub 清单文本失败: {}", e))
-                })?;
-                Manifest::from_json_str(&manifest_json)
-            }
-            ReleaseParseOutcome::DerivedManifest(manifest) => {
-                log::info!(
-                    "根据 GitHub Release 附件动态推导清单完成 (版本: {}, 适配平台数: {})",
-                    manifest.version,
-                    manifest.packages.len()
-                );
-                Ok(*manifest)
-            }
-        }
+        Manifest::from_json_str(&text)
     }
 
     #[cfg(feature = "async")]
     fn fetch_manifest_async<'a>(
         &'a self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Manifest>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Manifest>> + Send + 'a>> {
         Box::pin(async move {
             let headers = self.build_headers()?;
-            let client_builder = reqwest::Client::builder()
+            let client = reqwest::Client::builder()
                 .timeout(self.options.timeout)
-                .default_headers(headers);
+                .default_headers(headers)
+                .build()
+                .map_err(|e| {
+                    UpdateError::Network(format!("创建 GitHub 异步 HTTP 客户端失败: {}", e))
+                })?;
 
-            let client = client_builder.build().map_err(|e| {
-                UpdateError::Network(format!("创建 GitHub 异步 HTTP 客户端失败: {}", e))
-            })?;
+            let url = self.manifest_download_url();
+            log::info!("正在异步从 GitHub 静态 Release 资产拉取发布清单: {}", url);
 
-            let api_url = self.release_api_url();
-            log::info!("正在异步向 GitHub API 请求最新发布元数据: {}", api_url);
-
-            let response = client.get(&api_url).send().await.map_err(|e| {
-                UpdateError::Network(format!("请求 GitHub Releases API 失败: {}", e))
+            let response = client.get(&url).send().await.map_err(|e| {
+                UpdateError::Network(format!(
+                    "请求 GitHub 静态清单直链失败: {}, 原因: {}",
+                    url, e
+                ))
             })?;
 
             let status = response.status();
@@ -483,47 +255,31 @@ impl ReleaseProvider for GitHubProvider {
                 let msg = response
                     .text()
                     .await
-                    .unwrap_or_else(|_| "无法获取错误响应体".to_string());
-                if status.as_u16() == 403 && msg.contains("rate limit") {
+                    .unwrap_or_else(|_| "无法读取错误响应体".to_string());
+                if status.as_u16() == 404 {
                     return Err(UpdateError::HttpStatus {
-                        status_code: 403,
-                        message: "GitHub API 请求频次超限 (Rate Limit Exceeded)，建议配置 Personal Access Token".to_string(),
+                        status_code: 404,
+                        message: format!(
+                            "GitHub Release 附件中未找到静态清单文件（地址: {}）。请确保版本已发布且包含该清单文件",
+                            url
+                        ),
                     });
                 }
                 return Err(UpdateError::HttpStatus {
                     status_code: status.as_u16(),
-                    message: format!("GitHub API 响应异常: {}", msg),
+                    message: format!(
+                        "下载 GitHub 静态清单响应异常 (HTTP {}): {}",
+                        status.as_u16(),
+                        msg
+                    ),
                 });
             }
 
-            let body = response
-                .text()
-                .await
-                .map_err(|e| UpdateError::Network(format!("读取 GitHub API 响应体失败: {}", e)))?;
+            let text = response.text().await.map_err(|e| {
+                UpdateError::Network(format!("读取 GitHub 清单文件内容失败: {}", e))
+            })?;
 
-            match parse_github_release_response(&body, self.manifest_asset_name.as_deref())? {
-                ReleaseParseOutcome::ManifestUrl(url) => {
-                    log::info!(
-                        "在 GitHub Release 附件中发现清单文件，正在异步拉取: {}",
-                        url
-                    );
-                    let manifest_resp = client.get(&url).send().await.map_err(|e| {
-                        UpdateError::Network(format!("下载 GitHub 清单文件失败: {}", e))
-                    })?;
-                    let manifest_json = manifest_resp.text().await.map_err(|e| {
-                        UpdateError::Network(format!("读取 GitHub 清单文本失败: {}", e))
-                    })?;
-                    Manifest::from_json_str(&manifest_json)
-                }
-                ReleaseParseOutcome::DerivedManifest(manifest) => {
-                    log::info!(
-                        "根据 GitHub Release 附件动态推导清单完成 (版本: {}, 适配平台数: {})",
-                        manifest.version,
-                        manifest.packages.len()
-                    );
-                    Ok(*manifest)
-                }
-            }
+            Manifest::from_json_str(&text)
         })
     }
 }
@@ -533,91 +289,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_github_release_with_manifest_asset() {
-        let json = r#"{
-            "tag_name": "v2.5.0",
-            "name": "Release 2.5.0",
-            "body": "Bug fixes and improvements",
-            "published_at": "2026-09-09T10:00:00Z",
-            "assets": [
-                {
-                    "name": "myapp-windows.zip",
-                    "size": 10240,
-                    "browser_download_url": "https://github.com/example/repo/releases/download/v2.5.0/myapp-windows.zip"
-                },
-                {
-                    "name": "latest.json",
-                    "size": 512,
-                    "browser_download_url": "https://github.com/example/repo/releases/download/v2.5.0/latest.json"
-                }
-            ]
-        }"#;
-
-        let res = parse_github_release_response(json, None).unwrap();
+    fn test_github_provider_manifest_download_url_default() {
+        let provider = GitHubProvider::new("mangerle", "rddns");
         assert_eq!(
-            res,
-            ReleaseParseOutcome::ManifestUrl(
-                "https://github.com/example/repo/releases/download/v2.5.0/latest.json".to_string()
-            )
+            provider.manifest_download_url(),
+            "https://github.com/mangerle/rddns/releases/latest/download/latest.json"
         );
     }
 
     #[test]
-    fn test_parse_github_release_derive_manifest() {
-        let json = r#"{
-            "tag_name": "v3.1.0",
-            "name": "Major Upgrade",
-            "body": "Exciting new features",
-            "published_at": "2026-09-10T08:00:00Z",
-            "assets": [
-                {
-                    "name": "myapp-x86_64-pc-windows-msvc.exe",
-                    "size": 20480,
-                    "browser_download_url": "https://github.com/example/repo/releases/download/v3.1.0/myapp-win.exe"
-                },
-                {
-                    "name": "myapp-aarch64-apple-darwin.tar.gz",
-                    "size": 15360,
-                    "browser_download_url": "https://github.com/example/repo/releases/download/v3.1.0/myapp-mac.tar.gz"
-                },
-                {
-                    "name": "myapp-x86_64-unknown-linux-gnu.tar.gz",
-                    "size": 18432,
-                    "browser_download_url": "https://github.com/example/repo/releases/download/v3.1.0/myapp-linux.tar.gz"
-                }
-            ]
-        }"#;
-
-        let res = parse_github_release_response(json, None).unwrap();
-        match res {
-            ReleaseParseOutcome::DerivedManifest(m) => {
-                assert_eq!(m.version, Version::parse("3.1.0").unwrap());
-                assert_eq!(m.notes.as_deref(), Some("Exciting new features"));
-                assert_eq!(m.pub_date.as_deref(), Some("2026-09-10T08:00:00Z"));
-                assert_eq!(m.packages.len(), 3);
-                assert!(m.packages.contains_key("x86_64-pc-windows-msvc"));
-                assert!(m.packages.contains_key("aarch64-apple-darwin"));
-                assert!(m.packages.contains_key("x86_64-unknown-linux-gnu"));
-
-                let win_pkg = m.packages.get("x86_64-pc-windows-msvc").unwrap();
-                assert_eq!(win_pkg.package_type, PackageType::Installer);
-                assert_eq!(win_pkg.size, Some(20480));
-
-                let mac_pkg = m.packages.get("aarch64-apple-darwin").unwrap();
-                assert_eq!(mac_pkg.package_type, PackageType::Archive);
-            }
-            other => panic!("预期解析为 DerivedManifest，实际为: {:?}", other),
-        }
+    fn test_github_provider_manifest_download_url_custom() {
+        let provider =
+            GitHubProvider::new("mangerle", "rddns").with_manifest_asset_name("custom.json");
+        assert_eq!(
+            provider.manifest_download_url(),
+            "https://github.com/mangerle/rddns/releases/latest/download/custom.json"
+        );
     }
 
     #[test]
-    fn test_parse_github_release_invalid_tag_error() {
-        let json = r#"{
-            "tag_name": "not-a-semver",
-            "assets": []
-        }"#;
+    fn test_github_provider_debug_and_options() {
+        let provider = GitHubProvider::new("mangerle", "rddns")
+            .with_token("test-token")
+            .with_timeout(Duration::from_secs(30))
+            .with_user_agent("test-agent/1.0");
 
-        let res = parse_github_release_response(json, None);
-        assert!(matches!(res, Err(UpdateError::SemVer(_))));
+        let debug_str = format!("{:?}", provider);
+        assert!(debug_str.contains("mangerle"));
+        assert!(debug_str.contains("rddns"));
+        assert!(debug_str.contains("has_token: true"));
+        assert_eq!(
+            provider.release_api_url(),
+            "https://api.github.com/repos/mangerle/rddns/releases/latest"
+        );
     }
 }
