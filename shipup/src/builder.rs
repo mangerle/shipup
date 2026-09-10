@@ -98,7 +98,7 @@ impl std::fmt::Debug for UpdaterConfig {
             .field("public_keys", &self.public_keys)
             .field("timeout", &self.timeout)
             .field("user_agent", &self.user_agent)
-            .field("headers", &self.headers)
+            .field("headers", &redact_sensitive_headers(&self.headers))
             .field("proxy", &self.proxy)
             .field("max_retries", &self.max_retries)
             .field("retry_delay", &self.retry_delay)
@@ -194,7 +194,7 @@ impl std::fmt::Debug for UpdaterBuilder {
             .field("public_keys", &self.public_keys)
             .field("timeout", &self.timeout)
             .field("user_agent", &self.user_agent)
-            .field("headers", &self.headers)
+            .field("headers", &redact_sensitive_headers(&self.headers))
             .field("proxy", &self.proxy)
             .field("max_retries", &self.max_retries)
             .field("retry_delay", &self.retry_delay)
@@ -438,6 +438,35 @@ impl UpdaterBuilder {
     /// 批量设置自定义 HTTP 请求头字典
     pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
         self.headers.extend(headers);
+        self
+    }
+
+    /// 配置 HTTP Basic 认证（自动注入 `Authorization: Basic ...` 请求头）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：企业内网制品库与反向代理常要求 Basic 鉴权，避免调用方手写 Base64 与请求头拼装。
+    /// - **核心优势**：凭据在 Debug 输出中自动脱敏，降低日志泄漏风险。
+    /// - **代价与局限**：若同时通过 [`Self::header`] 手动设置 `Authorization`，后设置的值会覆盖前者。
+    pub fn http_basic_auth(mut self, username: impl AsRef<str>, password: impl AsRef<str>) -> Self {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        let raw = format!("{}:{}", username.as_ref(), password.as_ref());
+        let encoded = BASE64.encode(raw.as_bytes());
+        self.headers
+            .insert("Authorization".to_string(), format!("Basic {encoded}"));
+        self
+    }
+
+    /// 配置 HTTP Bearer Token 认证（自动注入 `Authorization: Bearer ...` 请求头）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：对接 OAuth2 / API Gateway 等 Bearer 鉴权场景，统一凭据注入入口。
+    /// - **核心优势**：Token 在 Debug 输出中自动脱敏。
+    pub fn bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.headers.insert(
+            "Authorization".to_string(),
+            format!("Bearer {}", token.into()),
+        );
         self
     }
 
@@ -776,6 +805,30 @@ pub(crate) fn is_insecure_http_url(url: &str) -> bool {
     }
 }
 
+/// 对敏感请求头（Authorization / Cookie 等）执行 Debug 脱敏
+///
+/// # 设计原理
+/// - **实现初衷**：配置结构体常被日志或错误上下文打印，若明文输出 Basic/Bearer 凭据将造成凭证泄漏。
+/// - **核心优势**：仅在格式化视图中替换为掩码，不修改真实运行时配置。
+fn redact_sensitive_headers(headers: &HashMap<String, String>) -> HashMap<&str, String> {
+    headers
+        .iter()
+        .map(|(k, v)| {
+            let key_lower = k.to_ascii_lowercase();
+            let display = if key_lower == "authorization"
+                || key_lower == "cookie"
+                || key_lower == "proxy-authorization"
+                || key_lower == "set-cookie"
+            {
+                "***".to_string()
+            } else {
+                v.clone()
+            };
+            (k.as_str(), display)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1083,5 +1136,32 @@ mod tests {
 
         let debug_str = format!("{:?}", updater);
         assert!(debug_str.contains("resumable_download: true"));
+    }
+
+    #[test]
+    fn test_builder_http_basic_and_bearer_auth_redaction() {
+        let basic = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .manifest_url("https://example.com/manifest.json")
+            .require_signature(false)
+            .http_basic_auth("alice", "s3cret")
+            .build()
+            .unwrap();
+        let basic_debug = format!("{basic:?}");
+        assert!(basic_debug.contains("***"), "Authorization 必须脱敏");
+        assert!(!basic_debug.contains("s3cret"), "禁止泄漏密码明文");
+
+        let bearer = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .manifest_url("https://example.com/manifest.json")
+            .require_signature(false)
+            .bearer_token("eyJhbGciOi.secret")
+            .build()
+            .unwrap();
+        let bearer_debug = format!("{bearer:?}");
+        assert!(bearer_debug.contains("***"));
+        assert!(!bearer_debug.contains("eyJhbGciOi.secret"));
     }
 }

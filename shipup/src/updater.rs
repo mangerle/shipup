@@ -37,7 +37,6 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 /// - **实现初衷**：将网络请求策略（超时、代理、重试、请求头）与加密签名策略（多公钥、TLS 防护、强制验签）内聚为不可变的上下文配置。
 /// - **核心优势**：配置通过 `Arc` 跨线程安全共享，不可被外部篡改，杜绝运行时竞争性安全降级。
 /// - **代价与局限**：一旦初始化完成，运行时连接参数即固定不可动态重载。
-#[derive(Debug)]
 pub(crate) struct NetworkSecurityConfig {
     pub public_keys: Vec<String>,
     pub timeout: Duration,
@@ -61,6 +60,61 @@ pub(crate) struct NetworkSecurityConfig {
     pub chunk_size: usize,
     pub download_mirrors: Vec<String>,
     pub resumable_download: bool,
+}
+
+impl std::fmt::Debug for NetworkSecurityConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_headers: HashMap<&str, String> = self
+            .headers
+            .iter()
+            .map(|(k, v)| {
+                let lower = k.to_ascii_lowercase();
+                let sensitive = lower == "authorization"
+                    || lower == "cookie"
+                    || lower == "proxy-authorization"
+                    || lower == "set-cookie";
+                (
+                    k.as_str(),
+                    if sensitive {
+                        "***".to_string()
+                    } else {
+                        v.clone()
+                    },
+                )
+            })
+            .collect();
+
+        f.debug_struct("NetworkSecurityConfig")
+            .field("public_keys_count", &self.public_keys.len())
+            .field("timeout", &self.timeout)
+            .field("user_agent", &self.user_agent)
+            .field("headers", &redacted_headers)
+            .field("proxy", &self.proxy)
+            .field("max_retries", &self.max_retries)
+            .field("retry_delay", &self.retry_delay)
+            .field(
+                "dangerous_insecure_transport_protocol",
+                &self.dangerous_insecure_transport_protocol,
+            )
+            .field("require_signature", &self.require_signature)
+            .field("max_bytes_per_sec", &self.max_bytes_per_sec)
+            .field("allow_file_protocol", &self.allow_file_protocol)
+            .field(
+                "allow_reboot_deferred_replace",
+                &self.allow_reboot_deferred_replace,
+            )
+            .field("max_rollback_entries", &self.max_rollback_entries)
+            .field("root_certificates_count", &self.root_certificates_pem.len())
+            .field("signature_threshold", &self.signature_threshold)
+            .field("endpoint_racing", &self.endpoint_racing)
+            .field("stagger_delay", &self.stagger_delay)
+            .field("chunked_download", &self.chunked_download)
+            .field("chunked_concurrency", &self.chunked_concurrency)
+            .field("chunk_size", &self.chunk_size)
+            .field("download_mirrors_count", &self.download_mirrors.len())
+            .field("resumable_download", &self.resumable_download)
+            .finish()
+    }
 }
 
 /// 更新器内部共享核心状态实体
