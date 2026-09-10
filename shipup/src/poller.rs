@@ -1,7 +1,9 @@
 // shipup 跨平台自更新系统 - 后台周期性静默轮询与暂存调度器
 
 use crate::error::UpdateError;
-use crate::updater::{DownloadedUpdate, Update, Updater};
+#[cfg(any(feature = "blocking", feature = "async"))]
+use crate::updater::Updater;
+use crate::updater::{DownloadedUpdate, Update};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -56,6 +58,7 @@ impl Default for AutoPollOptions {
 /// # 设计原理
 /// - **实现初衷**：大规模客户端若在同一时刻齐射更新检查，会对更新源造成惊群冲击。
 /// - **核心优势**：在基准间隔上叠加对称随机偏移，平滑分散请求时刻，同时保持期望间隔不变。
+#[cfg_attr(not(any(feature = "blocking", feature = "async")), allow(dead_code))]
 fn compute_jittered_interval(base: Duration, jitter_ratio: f32) -> Duration {
     let ratio = jitter_ratio.clamp(0.0, 1.0);
     if ratio <= 0.0 || base.is_zero() {
@@ -131,6 +134,7 @@ pub struct AutoPollerHandle {
 }
 
 impl AutoPollerHandle {
+    #[cfg_attr(not(any(feature = "blocking", feature = "async")), allow(dead_code))]
     pub(crate) fn new(stop_flag: Arc<AtomicBool>, download_cancel_flag: Arc<AtomicBool>) -> Self {
         Self {
             stop_flag,

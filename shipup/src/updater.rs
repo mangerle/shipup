@@ -1587,7 +1587,7 @@ where
                 return Ok(true);
             }
             #[cfg(not(windows))]
-            let _ = (version, allow_reboot_deferred);
+            let _ = (version, allow_reboot_deferred, &mut *callback);
 
             Err(e)
         }

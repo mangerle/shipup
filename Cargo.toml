@@ -4,6 +4,10 @@ members = [
     "shipup",
     "shipup-cli",
 ]
+# fuzz 需要独立 workspace 表，避免 cargo-fuzz 与根 workspace 冲突
+exclude = [
+    "fuzz",
+]
 
 [workspace.package]
 version = "0.3.0"

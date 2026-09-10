@@ -4,6 +4,9 @@ version = "0.0.0"
 publish = false
 edition = "2024"
 
+# 独立于根 workspace，避免 cargo-fuzz 报 "believes it's in a workspace"
+[workspace]
+
 [package.metadata]
 cargo-fuzz = true
 

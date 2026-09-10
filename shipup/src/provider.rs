@@ -1,9 +1,14 @@
 // shipup 跨平台自更新系统 - 发布源提供者抽象与 GitHub Releases 适配器
 
+#[cfg(any(feature = "blocking", feature = "async", test))]
 use crate::error::{Result, UpdateError};
+#[cfg(any(feature = "blocking", feature = "async", test))]
 use crate::manifest::{Manifest, PackageInfo, PackageType};
+#[cfg(any(feature = "blocking", feature = "async", test))]
 use semver::Version;
+#[cfg(any(feature = "blocking", feature = "async", test))]
 use serde::Deserialize;
+#[cfg(any(feature = "blocking", feature = "async", test))]
 use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
@@ -164,6 +169,7 @@ impl GitHubProvider {
 }
 
 /// GitHub Releases 原始响应数据模型
+#[cfg(any(feature = "blocking", feature = "async", test))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct RawGitHubRelease {
     pub tag_name: String,
@@ -175,6 +181,7 @@ pub(crate) struct RawGitHubRelease {
 }
 
 /// GitHub Releases 附件数据模型
+#[cfg(any(feature = "blocking", feature = "async", test))]
 #[derive(Debug, Deserialize)]
 pub(crate) struct RawGitHubAsset {
     pub name: String,
@@ -183,6 +190,7 @@ pub(crate) struct RawGitHubAsset {
 }
 
 /// GitHub Release 解析结果形态
+#[cfg(any(feature = "blocking", feature = "async", test))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ReleaseParseOutcome {
     /// 附件中包含独立清单文件，提供其下载直链
@@ -192,6 +200,7 @@ pub(crate) enum ReleaseParseOutcome {
 }
 
 /// 解析 GitHub Release API JSON 响应并推导或提取 Manifest
+#[cfg(any(feature = "blocking", feature = "async", test))]
 pub(crate) fn parse_github_release_response(
     json_text: &str,
     preferred_manifest_name: Option<&str>,
@@ -277,6 +286,7 @@ pub(crate) fn parse_github_release_response(
 }
 
 /// 根据附件文件名猜测适配的目标平台 Target Triple
+#[cfg(any(feature = "blocking", feature = "async", test))]
 fn detect_target_from_filename(filename: &str) -> Option<&'static str> {
     let lower = filename.to_ascii_lowercase();
 
@@ -361,6 +371,7 @@ fn detect_target_from_filename(filename: &str) -> Option<&'static str> {
 }
 
 /// 根据文件名后缀启发式判断更新包类型
+#[cfg(any(feature = "blocking", feature = "async", test))]
 fn detect_package_type_from_filename(filename: &str) -> PackageType {
     let lower = filename.to_ascii_lowercase();
     if lower.ends_with(".zip")
