@@ -7,6 +7,72 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const TEMP_SUFFIX: &str = ".shipup.tmp";
+/// 旧版本备份文件后缀（与 Windows/macOS 命名保持一致）
+pub const OLD_BACKUP_SUFFIX: &str = ".shipup.old";
+
+/// 孤儿临时下载切片的最长保留过期时长（24 小时）
+const ORPHAN_TEMP_EXPIRATION_SECS: u64 = 24 * 3600;
+
+/// 清理当前主程序自身遗留的历史备份文件与过期孤儿临时切片
+///
+/// # 设计原理
+/// - **实现初衷**：Linux 下 `self_replace` 与同卷临时切片同样会残留 `.shipup.old` / `.shipup.tmp`，
+///   若不清理会在安装目录持续堆积，占用磁盘并干扰后续更新。
+/// - **核心优势**：定向清理自身备份，绝不误删同目录其他进程正在下载中的临时文件或并发实例。
+/// - **代价与局限**：24 小时内的未完成下载切片将被保留供断点续传，直到超时后自动回收。
+pub fn cleanup_old_backup_files() {
+    let Ok(current_exe) = env::current_exe() else {
+        return;
+    };
+    let Some(parent) = current_exe.parent() else {
+        return;
+    };
+    let exe_name = current_exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("app");
+
+    // 1. 定向清理主程序自身对应的历史备份文件
+    let my_backup = parent.join(format!("{}{}", exe_name, OLD_BACKUP_SUFFIX));
+    if my_backup.exists() {
+        if let Err(e) = fs::remove_file(&my_backup) {
+            log::debug!("清理当前程序历史备份失败 ({}): {}", my_backup.display(), e);
+        } else {
+            log::debug!("成功清理当前程序历史备份: {}", my_backup.display());
+        }
+    }
+
+    // 2. 仅清理修改时间超过 24 小时的孤儿临时切片，避免误删正在下载的文件
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !file_name.ends_with(TEMP_SUFFIX) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age.as_secs() > ORPHAN_TEMP_EXPIRATION_SECS {
+            if let Err(e) = fs::remove_file(&path) {
+                log::debug!("清理过期孤儿临时切片失败 ({}): {}", path.display(), e);
+            } else {
+                log::debug!("成功清理过期孤儿临时切片: {}", path.display());
+            }
+        }
+    }
+}
 
 /// 为 Linux 新程序赋予 0o755 执行权限
 ///

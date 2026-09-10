@@ -41,6 +41,10 @@ pub fn cleanup_old_backups() {
     {
         macos::cleanup_old_backup_bundles();
     }
+    #[cfg(target_os = "linux")]
+    {
+        linux::cleanup_old_backup_files();
+    }
 }
 
 /// 执行原地原子替换
