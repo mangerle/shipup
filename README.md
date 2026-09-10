@@ -43,45 +43,45 @@ shipup = { version = "0.3.0", features = ["blocking"] }
 ### 2. Client Update Checking and Installation
 
 ```rust
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use std::time::Duration;
 use shipup::{Updater, UpdateEvent};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Build the updater instance
+    // 1. Startup health check (auto-rollback after consecutive crashes)
+    shipup::check_and_recover_current(2)?;
+
+    // 2. Build the updater instance
     let updater = Updater::builder()
         .current_version("1.0.0")?
         .manifest_url("https://updates.example.com/latest.json")
         .channel("stable")
-        .public_key("your_base64_ed25519_public_key...")
+        .public_key("YOUR_BASE64_ED25519_PUBLIC_KEY")
         .timeout(Duration::from_secs(15))
         .build()?;
 
-    // Check for updates
+    // 3. Check for updates
     if let Some(update) = updater.check()? {
         println!("New update found: {}", update.version());
 
-        // Download and apply update
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        update.download_and_install_with_cancellation(
-            Some(cancel_flag),
-            |event| match event {
-                UpdateEvent::DownloadStarted { total_bytes } => {
-                    println!("Download started, file size: {:?}", total_bytes);
+        // 4. Download and verify (does not overwrite running binaries)
+        let downloaded = update.download(|event| match event {
+            UpdateEvent::DownloadProgress { percent, speed_bytes_per_sec, .. } => {
+                if let Some(p) = percent {
+                    println!("Download progress: {:.1}%, speed: {:?} B/s", p, speed_bytes_per_sec);
                 }
-                UpdateEvent::DownloadProgress { percent, .. } => {
-                    if let Some(p) = percent {
-                        println!("Download progress: {:.1}%", p);
-                    }
-                }
-                UpdateEvent::Installing => println!("Applying update and replacing files..."),
-                UpdateEvent::ReadyToRestart => println!("Installation completed. Ready to restart."),
-                _ => {}
-            },
-        )?;
+            }
+            UpdateEvent::VerifyingSignature => println!("Verifying digital signature..."),
+            _ => {}
+        })?;
 
-        // Graceful self-restart
+        // 5. Apply binary replacement or spawn installer
+        downloaded.install(|event| {
+            if event == UpdateEvent::ReadyToRestart {
+                println!("Installation completed. Ready to restart.");
+            }
+        })?;
+
+        // 6. Graceful self-restart
         update.restart_with(|ctx| {
             ctx.before_exit(|| {
                 println!("Releasing single-instance locks and cleaning up runtime state...");
@@ -89,6 +89,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     }
 
+    // 7. Confirm the upgrade after the app has started successfully
+    shipup::confirm_update_success()?;
     Ok(())
 }
 ```
