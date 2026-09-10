@@ -18,6 +18,7 @@ pub(crate) mod download;
 pub mod error;
 pub mod event;
 pub mod manifest;
+pub mod offline;
 pub(crate) mod platform;
 pub(crate) mod poller;
 pub mod preference;
@@ -35,6 +36,10 @@ pub use event::UpdateEvent;
 pub use manifest::{
     ChannelInfo, InstallMode, Manifest, PackageInfo, PackageType, ResolveOptions, ResolvedRelease,
     SignatureEntry, current_target_triple,
+};
+pub use offline::{
+    OfflinePackageReport, OfflineVerifyOptions, OfflineVerifyReport, file_url_to_path,
+    is_file_protocol, path_to_file_url, resolve_relative_file_url, verify_offline_repository,
 };
 pub use platform::{
     InstallerOptions, cleanup_old_backups, get_same_volume_temp_path, get_temp_download_path,

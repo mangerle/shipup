@@ -453,6 +453,23 @@ impl UpdaterBuilder {
         self
     }
 
+    /// 配置本地或内网离线镜像更新源目录
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：在单机隔离内网或移动存储设备更新场景下，调用方通常仅持有离线仓库根目录。
+    /// - **核心优势**：一键自动将 `allow_file_protocol` 设为 `true`，并将 `manifest_url` 指向该目录下规范化 `file://` 端点，免除手动路径转义。
+    /// - **代价与局限**：默认假定目录内存在 `manifest.json` 清单文件。
+    ///
+    /// # Errors
+    /// 当本地路径无法转换为合法 `file://` 端点时返回错误。
+    pub fn offline_dir<P: AsRef<std::path::Path>>(mut self, dir_path: P) -> Result<Self> {
+        let manifest_path = dir_path.as_ref().join("manifest.json");
+        let manifest_url = crate::offline::path_to_file_url(&manifest_path)?;
+        self.allow_file_protocol = true;
+        self = self.manifest_url(manifest_url);
+        Ok(self)
+    }
+
     /// 设置内嵌 Fallback Manifest 离线容灾兜底元数据
     ///
     /// # 设计原理
@@ -873,6 +890,26 @@ mod tests {
         let updater = builder.build().unwrap();
         // 验证构建后配置被安全共享
         drop(updater);
+    }
+
+    #[test]
+    fn test_builder_offline_dir_configuration() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_builder_offline_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let builder = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .offline_dir(&temp_dir)
+            .unwrap()
+            .require_signature(false);
+
+        assert!(builder.allow_file_protocol);
+        assert!(!builder.endpoints.is_empty());
+        let url = &builder.endpoints[0];
+        assert!(url.starts_with("file://"));
+        assert!(url.ends_with("manifest.json"));
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

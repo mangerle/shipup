@@ -836,7 +836,17 @@ impl Updater {
             target: &self.inner.target,
             current_version: &self.inner.current_version,
         };
-        let release = manifest.resolve(&options)?;
+        let mut release = manifest.resolve(&options)?;
+
+        // 若 package.url 为相对路径且当前端点为本地 file://，自动展开为绝对 file:// URL
+        if !release.package.url.contains("://")
+            && let Some(endpoint) = self.inner.endpoints.first()
+            && crate::offline::is_file_protocol(endpoint)
+            && let Ok(resolved_url) =
+                crate::offline::resolve_relative_file_url(endpoint, &release.package.url)
+        {
+            release.package.url = resolved_url;
+        }
 
         let is_available = if let Some(ref comparator) = self.inner.version_comparator {
             comparator(&self.inner.current_version, &release.version)

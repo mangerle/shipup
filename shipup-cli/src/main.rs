@@ -59,6 +59,9 @@ enum Commands {
 
     /// 安全清理目标目录下的历史旧版本备份文件与更新残留碎片
     Clean(CleanArgs),
+
+    /// 针对离线内网更新仓库执行全量一致性与完整性安全审计
+    VerifyRepo(VerifyRepoArgs),
 }
 
 /// 批量发布配置文件结构
@@ -295,6 +298,30 @@ struct CleanArgs {
     dry_run: bool,
 }
 
+/// 离线更新仓库一致性核验命令参数
+#[derive(clap::Args, Debug, Clone)]
+struct VerifyRepoArgs {
+    /// 离线更新源仓库根目录（包含 manifest.json 与安装包）
+    #[arg(value_name = "REPO_DIR")]
+    repo_dir: PathBuf,
+
+    /// 清单文件名，默认为 manifest.json
+    #[arg(short, long, default_value = "manifest.json")]
+    manifest: String,
+
+    /// 用于校验清单与安装包签名的 Ed25519 公钥（Base64 编码，可重复指定）
+    #[arg(short = 'k', long = "public-key")]
+    public_keys: Vec<String>,
+
+    /// TUF 门限签名最少达标数，默认为 1
+    #[arg(short, long, default_value_t = 1)]
+    threshold: usize,
+
+    /// 强制要求所有安装包均必须附带数字签名
+    #[arg(long)]
+    require_signature: bool,
+}
+
 fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
@@ -326,6 +353,9 @@ fn main() -> Result<()> {
         }
         Commands::Clean(args) => {
             handle_clean(&args)?;
+        }
+        Commands::VerifyRepo(args) => {
+            handle_verify_repo(&args)?;
         }
     }
 
@@ -1579,6 +1609,99 @@ fn handle_clean(args: &CleanArgs) -> Result<()> {
     Ok(())
 }
 
+/// 执行离线更新源仓库的全量一致性安全审计
+///
+/// # 设计原理
+/// - **实现初衷**：在单机离线环境或内网只读挂载源发布前，快速检验清单结构合法性、签名有效性及安装包完整性。
+/// - **核心优势**：支持 TUF 门限验签，全流程流式哈希计算，输出清晰的架构与包健康度状态表。
+/// - **代价与局限**：对大体积安装包计算校验和需消耗本地磁盘读取时间。
+fn handle_verify_repo(args: &VerifyRepoArgs) -> Result<()> {
+    log::info!(
+        "开始对离线仓库执行全量一致性审计，目录: {}",
+        args.repo_dir.display()
+    );
+    let mut options = shipup::OfflineVerifyOptions::new(&args.repo_dir);
+    options.manifest_filename = Some(&args.manifest);
+    options.public_keys = &args.public_keys;
+    options.signature_threshold = args.threshold;
+    options.require_package_signatures = args.require_signature;
+
+    let report = shipup::verify_offline_repository(&options)
+        .with_context(|| format!("离线仓库一致性审计执行失败: {}", args.repo_dir.display()))?;
+
+    print_offline_verify_report(&report);
+
+    if !report.all_passed() {
+        return Err(anyhow!("离线更新仓库审计存在未通过项，禁止交付或部署"));
+    }
+
+    println!("所有安装包与元数据均通过强一致性核验，离线更新源状态健康");
+    Ok(())
+}
+
+fn print_offline_verify_report(report: &shipup::OfflineVerifyReport) {
+    println!("================= shipup 离线仓库一致性审计报告 =================");
+    println!("清单路径:     {}", report.manifest_path.display());
+    println!(
+        "清单状态:     {}",
+        if report.manifest_valid {
+            "有效"
+        } else {
+            "非法 / 校验失败"
+        }
+    );
+    if let Some(ref ver) = report.version {
+        println!("目标版本:     {ver}");
+    }
+    if let Some(ref err) = report.manifest_error {
+        println!("清单异常:     {err}");
+    }
+    println!("发布通道数:   {}", report.channel_count);
+    println!("待核验安装包: {} 个", report.package_reports.len());
+    println!("-----------------------------------------------------------------");
+
+    for (idx, pkg) in report.package_reports.iter().enumerate() {
+        let status_str = if pkg.is_valid() {
+            "通过"
+        } else {
+            "未通过"
+        };
+        println!(
+            "[{:02}] [{}] 架构: {} | 地址: {} | 格式: {:?}",
+            idx + 1,
+            status_str,
+            pkg.target,
+            pkg.declared_url,
+            pkg.package_type
+        );
+        println!(
+            "     文件存在: {} | 体积: {} 字节 (期望: {:?}) | SHA-256: {}",
+            if pkg.file_exists { "是" } else { "缺失" },
+            pkg.actual_size,
+            pkg.expected_size,
+            if pkg.checksum_matched {
+                "匹配"
+            } else {
+                "不匹配"
+            }
+        );
+        if let Some(sig_ok) = pkg.signature_verified {
+            println!(
+                "     数字签名: {}",
+                if sig_ok {
+                    "验证有效"
+                } else {
+                    "验签失败"
+                }
+            );
+        }
+        if let Some(ref reason) = pkg.failure_reason {
+            println!("     阻断原因: {reason}");
+        }
+    }
+    println!("=================================================================");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2024,6 +2147,87 @@ executable_path = "myapp"
         })?;
         assert!(!orphan_file1.exists());
         assert!(!orphan_file2.exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cli_verify_repo_command() -> Result<()> {
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_cli_verify_repo_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir)?;
+
+        // 生成测试二进制包
+        let pkg_file = temp_dir.join("sample-app-1.0.0.tar.gz");
+        let pkg_bytes = b"sample content for offline repo verify";
+        fs::write(&pkg_file, pkg_bytes)?;
+
+        let mut hasher = Sha256::new();
+        hasher.update(pkg_bytes);
+        let hash = hasher.finalize();
+        let mut sha256_hex = String::with_capacity(64);
+        for b in hash {
+            use std::fmt::Write;
+            let _ = write!(sha256_hex, "{b:02x}");
+        }
+
+        // 构造本地清单
+        let mut packages = BTreeMap::new();
+        packages.insert(
+            "x86_64-pc-windows-msvc".to_string(),
+            PackageInfo {
+                url: "sample-app-1.0.0.tar.gz".to_string(),
+                size: Some(pkg_bytes.len() as u64),
+                checksum: Some(sha256_hex),
+                signature: None,
+                signatures: Vec::new(),
+                package_type: PackageType::Archive,
+                executable_path: None,
+                install_args: Vec::new(),
+                require_elevation: false,
+                install_mode: None,
+            },
+        );
+
+        let manifest = Manifest {
+            version: Version::parse("1.0.0").unwrap(),
+            min_supported_version: None,
+            force_update: false,
+            pub_date: None,
+            notes: None,
+            packages,
+            channels: BTreeMap::new(),
+            signature: None,
+            signatures: Vec::new(),
+            rollout_percentage: None,
+            expires_at: None,
+            version_seq: Some(1),
+        };
+
+        let manifest_path = temp_dir.join("manifest.json");
+        let manifest_json = serde_json::to_string_pretty(&manifest)?;
+        fs::write(&manifest_path, manifest_json)?;
+
+        // 正常核验
+        handle_verify_repo(&VerifyRepoArgs {
+            repo_dir: temp_dir.clone(),
+            manifest: "manifest.json".to_string(),
+            public_keys: Vec::new(),
+            threshold: 1,
+            require_signature: false,
+        })?;
+
+        // 制造篡改：修改包内容导致 SHA-256 不匹配
+        fs::write(&pkg_file, b"tampered content")?;
+        let err = handle_verify_repo(&VerifyRepoArgs {
+            repo_dir: temp_dir.clone(),
+            manifest: "manifest.json".to_string(),
+            public_keys: Vec::new(),
+            threshold: 1,
+            require_signature: false,
+        });
+        assert!(err.is_err());
 
         let _ = fs::remove_dir_all(&temp_dir);
         Ok(())

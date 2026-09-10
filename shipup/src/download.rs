@@ -26,73 +26,16 @@ use crate::signature::verify_sha256_file;
 #[cfg(any(feature = "blocking", feature = "async"))]
 const BUFFER_SIZE: usize = 64 * 1024; // 64KB 缓冲区
 
-/// URL 百分号解码（Percent-Decode）
-pub(crate) fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(hex) = u8::from_str_radix(&input[i + 1..i + 3], 16)
-        {
-            decoded.push(hex);
-            i += 3;
-            continue;
-        }
-        decoded.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(decoded).unwrap_or_else(|_| input.to_string())
-}
-
 /// 检查指定 URL 是否为本地或共享文件协议（file://，忽略 Scheme 大小写）
+#[inline]
 pub(crate) fn is_file_url(url: &str) -> bool {
-    let trimmed = url.trim();
-    if trimmed.len() >= 7 {
-        trimmed[..7].eq_ignore_ascii_case("file://")
-    } else {
-        false
-    }
+    crate::offline::is_file_protocol(url)
 }
 
 /// 解析 file:// 协议 URL 为跨平台本地绝对路径
+#[inline]
 pub(crate) fn parse_file_url_to_path(url: &str) -> Result<PathBuf> {
-    let trimmed = url.trim();
-    if !is_file_url(trimmed) {
-        return Err(UpdateError::FileProtocolNotAllowed(url.to_string()));
-    }
-    let after_scheme = &trimmed[7..];
-    // 去除 localhost 域名前缀（如 file://localhost/path 剥离 localhost 后保留 /path）
-    let path_part =
-        if after_scheme.len() >= 9 && after_scheme[..9].eq_ignore_ascii_case("localhost") {
-            &after_scheme[9..]
-        } else {
-            after_scheme
-        };
-
-    let decoded = percent_decode(path_part);
-
-    #[cfg(windows)]
-    {
-        // 兼容 Windows 格式：file:///C:/path 或 file://C:/path
-        let normalized = if decoded.starts_with('/') && decoded.len() >= 3 {
-            let bytes = decoded.as_bytes();
-            if bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
-                &decoded[1..]
-            } else {
-                &decoded[..]
-            }
-        } else {
-            &decoded[..]
-        };
-        Ok(PathBuf::from(normalized))
-    }
-
-    #[cfg(not(windows))]
-    {
-        Ok(PathBuf::from(decoded))
-    }
+    crate::offline::file_url_to_path(url)
 }
 
 /// 进度度量采样器
