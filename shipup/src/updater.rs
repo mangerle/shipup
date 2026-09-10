@@ -55,6 +55,10 @@ pub(crate) struct NetworkSecurityConfig {
     pub signature_threshold: usize,
     pub endpoint_racing: bool,
     pub stagger_delay: Duration,
+    pub chunked_download: bool,
+    pub chunked_concurrency: usize,
+    pub chunk_size: usize,
+    pub download_mirrors: Vec<String>,
 }
 
 /// 更新器内部共享核心状态实体
@@ -357,6 +361,10 @@ impl Updater {
                     signature_threshold: config.signature_threshold,
                     endpoint_racing: config.endpoint_racing,
                     stagger_delay: config.stagger_delay,
+                    chunked_download: config.chunked_download,
+                    chunked_concurrency: config.chunked_concurrency,
+                    chunk_size: config.chunk_size,
+                    download_mirrors: config.download_mirrors,
                 }),
                 version_comparator: config.version_comparator,
                 preference: Mutex::new(preference),
@@ -1080,8 +1088,25 @@ impl Update {
             max_bytes_per_sec: self.config.max_bytes_per_sec,
         };
 
+        let mut mirrors = self.release.package.mirrors.clone();
+        for m in &self.config.download_mirrors {
+            if !mirrors.contains(m) {
+                mirrors.push(m.clone());
+            }
+        }
+
         if let Err(e) = (|| -> Result<()> {
-            download::download_file_blocking(&client, &options, &mut callback)?;
+            if self.config.chunked_download {
+                let chunked_opts = download::ChunkedDownloadOptions {
+                    base: options,
+                    mirrors: &mirrors,
+                    concurrency: self.config.chunked_concurrency,
+                    chunk_size: self.config.chunk_size,
+                };
+                download::download_file_chunked_blocking(&client, &chunked_opts, &mut callback)?;
+            } else {
+                download::download_file_blocking(&client, &options, &mut callback)?;
+            }
             self.verify_downloaded_payload(&temp_download_path, &mut callback)?;
             Ok(())
         })() {
@@ -1190,8 +1215,26 @@ impl Update {
             max_bytes_per_sec: self.config.max_bytes_per_sec,
         };
 
+        let mut mirrors = self.release.package.mirrors.clone();
+        for m in &self.config.download_mirrors {
+            if !mirrors.contains(m) {
+                mirrors.push(m.clone());
+            }
+        }
+
         let download_and_verify_result: Result<()> = async {
-            download::download_file_async(&client, &options, &mut callback).await?;
+            if self.config.chunked_download {
+                let chunked_opts = download::ChunkedDownloadOptions {
+                    base: options,
+                    mirrors: &mirrors,
+                    concurrency: self.config.chunked_concurrency,
+                    chunk_size: self.config.chunk_size,
+                };
+                download::download_file_chunked_async(&client, &chunked_opts, &mut callback)
+                    .await?;
+            } else {
+                download::download_file_async(&client, &options, &mut callback).await?;
+            }
 
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let this = self.clone();
@@ -1884,6 +1927,7 @@ mod tests {
             notes: Some("更新说明".to_string()),
             package: PackageInfo {
                 url: "https://example.com/app.exe".to_string(),
+                mirrors: vec![],
                 signature: None,
                 signatures: vec![],
                 checksum: None,
@@ -2356,6 +2400,7 @@ mod tests {
                 rollout_percentage: None,
                 package: crate::manifest::PackageInfo {
                     url: "https://example.com/payload.bin".to_string(),
+                    mirrors: vec![],
                     signature: None, // 未提供数字签名
                     signatures: vec![],
                     checksum: None,
@@ -2385,6 +2430,10 @@ mod tests {
                 signature_threshold: 1,
                 endpoint_racing: false,
                 stagger_delay: Duration::from_millis(250),
+                chunked_download: false,
+                chunked_concurrency: 4,
+                chunk_size: 4 * 1024 * 1024,
+                download_mirrors: Vec::new(),
             }),
         };
 
@@ -2415,6 +2464,7 @@ mod tests {
                 rollout_percentage: None,
                 package: crate::manifest::PackageInfo {
                     url: "https://example.com/payload.bin".to_string(),
+                    mirrors: vec![],
                     signature: Some("dummy_sig".to_string()),
                     signatures: vec![],
                     checksum: None,
@@ -2444,6 +2494,10 @@ mod tests {
                 signature_threshold: 1,
                 endpoint_racing: false,
                 stagger_delay: Duration::from_millis(250),
+                chunked_download: false,
+                chunked_concurrency: 4,
+                chunk_size: 4 * 1024 * 1024,
+                download_mirrors: Vec::new(),
             }),
         };
 

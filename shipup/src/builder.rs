@@ -76,6 +76,14 @@ pub struct UpdaterConfig {
     pub endpoint_racing: bool,
     /// 并发竞速模式下的端点错峰阶梯启动延迟
     pub stagger_delay: Duration,
+    /// 是否开启大文件多镜像源分片并行下载与拼装加速（默认为 false）
+    pub chunked_download: bool,
+    /// 分片并行下载并发 Worker 数量（默认为 4）
+    pub chunked_concurrency: usize,
+    /// 单个分片切片字节大小（默认为 4MB）
+    pub chunk_size: usize,
+    /// 全局配置的备用镜像下载直链列表
+    pub download_mirrors: Vec<String>,
 }
 
 impl std::fmt::Debug for UpdaterConfig {
@@ -110,6 +118,10 @@ impl std::fmt::Debug for UpdaterConfig {
             .field("signature_threshold", &self.signature_threshold)
             .field("endpoint_racing", &self.endpoint_racing)
             .field("stagger_delay", &self.stagger_delay)
+            .field("chunked_download", &self.chunked_download)
+            .field("chunked_concurrency", &self.chunked_concurrency)
+            .field("chunk_size", &self.chunk_size)
+            .field("download_mirrors_count", &self.download_mirrors.len())
             .finish()
     }
 }
@@ -162,6 +174,10 @@ pub struct UpdaterBuilder {
     pub(crate) signature_threshold: usize,
     pub(crate) endpoint_racing: bool,
     pub(crate) stagger_delay: Duration,
+    pub(crate) chunked_download: bool,
+    pub(crate) chunked_concurrency: usize,
+    pub(crate) chunk_size: usize,
+    pub(crate) download_mirrors: Vec<String>,
 }
 
 impl std::fmt::Debug for UpdaterBuilder {
@@ -200,6 +216,10 @@ impl std::fmt::Debug for UpdaterBuilder {
             .field("signature_threshold", &self.signature_threshold)
             .field("endpoint_racing", &self.endpoint_racing)
             .field("stagger_delay", &self.stagger_delay)
+            .field("chunked_download", &self.chunked_download)
+            .field("chunked_concurrency", &self.chunked_concurrency)
+            .field("chunk_size", &self.chunk_size)
+            .field("download_mirrors_count", &self.download_mirrors.len())
             .finish()
     }
 }
@@ -235,6 +255,10 @@ impl Default for UpdaterBuilder {
             signature_threshold: 1,
             endpoint_racing: false,
             stagger_delay: Duration::from_millis(250),
+            chunked_download: false,
+            chunked_concurrency: crate::download::DEFAULT_CHUNKED_CONCURRENCY,
+            chunk_size: crate::download::DEFAULT_CHUNK_SIZE,
+            download_mirrors: Vec::new(),
         }
     }
 }
@@ -581,6 +605,58 @@ impl UpdaterBuilder {
         self
     }
 
+    /// 设置是否开启大文件多镜像源分片并行下载与拼装加速（默认为 false）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：针对数十至数百兆大型更新包，突破单 TCP 连接吞吐上限并跨镜像分摊网络流量。
+    /// - **核心优势**：基于 HTTP Range 原地预分配切片写入，若服务端不支持则平滑降级为常规流式下载。
+    /// - **代价与局限**：在开启时会创建多个并发 HTTP 连接和 worker 线程。
+    pub fn chunked_download(mut self, enabled: bool) -> Self {
+        self.chunked_download = enabled;
+        self
+    }
+
+    /// 设置分片并行下载时的并发 Worker 数量（默认 4）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：允许调用方根据网络带宽与设备资源配置合适的并发工作线程数。
+    /// - **代价与局限**：过高并发度可能导致服务端触发频率限制或本地文件句柄抖动，内部自动截断于 1..=16 范围。
+    pub fn chunked_concurrency(mut self, concurrency: usize) -> Self {
+        self.chunked_concurrency = concurrency.clamp(1, 16);
+        self
+    }
+
+    /// 设置单个分片切片的字节大小（默认 4MB，即 4,194,304 字节）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：平衡切片请求开销与断点恢复成本。切片过小会导致 HTTP 头与握手开销增大，切片过大则退化为粗粒度下载。
+    pub fn chunk_size(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = chunk_size.max(64 * 1024);
+        self
+    }
+
+    /// 添加单个备用镜像下载直链（用于大文件分片并发流量分摊与故障转移）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：为客户端提供额外的 CDN 或镜像节点，分片下载引擎将自动在主下载直链与镜像直链间轮询分流。
+    pub fn download_mirror(mut self, mirror: impl Into<String>) -> Self {
+        self.download_mirrors.push(mirror.into());
+        self
+    }
+
+    /// 批量添加备用镜像下载直链列表
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：便于一次性载入多个镜像节点列表。
+    pub fn download_mirrors(
+        mut self,
+        mirrors: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.download_mirrors
+            .extend(mirrors.into_iter().map(Into::into));
+        self
+    }
+
     /// 构建 Updater 实例并完成前置安全门禁与合法性校验
     ///
     /// # 校验内容
@@ -657,6 +733,10 @@ impl UpdaterBuilder {
             signature_threshold: self.signature_threshold,
             endpoint_racing: self.endpoint_racing,
             stagger_delay: self.stagger_delay,
+            chunked_download: self.chunked_download,
+            chunked_concurrency: self.chunked_concurrency,
+            chunk_size: self.chunk_size,
+            download_mirrors: self.download_mirrors,
         };
 
         Ok(Updater::new(config))
@@ -941,5 +1021,33 @@ mod tests {
 
         assert!(updater.endpoints().is_empty());
         assert!(updater.provider().is_some());
+    }
+
+    #[test]
+    fn test_builder_chunked_download_options() {
+        let updater = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .manifest_url("https://example.com/manifest.json")
+            .require_signature(false)
+            .chunked_download(true)
+            .chunked_concurrency(8)
+            .chunk_size(2 * 1024 * 1024)
+            .download_mirror("https://mirror1.example.com/payload.tar.gz")
+            .download_mirrors(vec![
+                "https://mirror2.example.com/payload.tar.gz".to_string(),
+                "https://mirror3.example.com/payload.tar.gz".to_string(),
+            ])
+            .build()
+            .unwrap();
+
+        // 验证 Debug 格式中包含分片配置与镜像
+        let debug_str = format!("{:?}", updater);
+        assert!(debug_str.contains("chunked_download: true"));
+        assert!(debug_str.contains("chunked_concurrency: 8"));
+        assert!(debug_str.contains("chunk_size: 2097152"));
+        assert!(debug_str.contains("mirror1.example.com"));
+        assert!(debug_str.contains("mirror2.example.com"));
+        assert!(debug_str.contains("mirror3.example.com"));
     }
 }

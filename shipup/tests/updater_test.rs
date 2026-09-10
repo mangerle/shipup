@@ -16,6 +16,7 @@ fn test_manifest_serialization_and_routing() {
         "x86_64-pc-windows-msvc".to_string(),
         PackageInfo {
             url: "https://example.com/app-1.2.0.exe".to_string(),
+            mirrors: vec![],
             signature: Some("test-signature".to_string()),
             signatures: vec![],
             checksum: Some("sha256:abcd".to_string()),
@@ -34,6 +35,7 @@ fn test_manifest_serialization_and_routing() {
         "x86_64-pc-windows-msvc".to_string(),
         PackageInfo {
             url: "https://example.com/app-1.3.0-beta.exe".to_string(),
+            mirrors: vec![],
             signature: None,
             signatures: vec![],
             checksum: None,

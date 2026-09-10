@@ -589,6 +589,7 @@ mod tests {
             "x86_64-unknown-linux-gnu".to_string(),
             PackageInfo {
                 url: pkg_filename.to_string(),
+                mirrors: Vec::new(),
                 size: Some(size),
                 checksum: Some(sha256),
                 signature: None,
@@ -649,6 +650,7 @@ mod tests {
             "x86_64-unknown-linux-gnu".to_string(),
             PackageInfo {
                 url: "missing_file.zip".to_string(),
+                mirrors: Vec::new(),
                 size: Some(100),
                 checksum: Some(
                     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),

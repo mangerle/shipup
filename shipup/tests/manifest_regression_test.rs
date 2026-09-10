@@ -126,6 +126,7 @@ fn test_tamper_detection_on_any_nested_manifest_component() {
                 "x86_64-pc-windows-msvc".to_string(),
                 PackageInfo {
                     url: "https://example.com/app.exe".to_string(),
+                    mirrors: vec![],
                     signature: None,
                     signatures: vec![],
                     checksum: Some("abcd".to_string()),
@@ -216,6 +217,7 @@ fn test_tamper_detection_on_any_nested_manifest_component() {
             "aarch64-apple-darwin".to_string(),
             PackageInfo {
                 url: "https://example.com/app-mac.zip".to_string(),
+                mirrors: vec![],
                 signature: None,
                 signatures: vec![],
                 checksum: None,
@@ -251,6 +253,7 @@ fn test_end_to_end_publisher_client_cross_sign_and_verify() {
                 "x86_64-unknown-linux-gnu".to_string(),
                 PackageInfo {
                     url: "https://release.example.com/app-v3.0.0-linux.tar.gz".to_string(),
+                    mirrors: vec![],
                     signature: None,
                     signatures: vec![],
                     checksum: Some(

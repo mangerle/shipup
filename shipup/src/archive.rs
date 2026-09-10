@@ -670,6 +670,7 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
+    #[cfg(feature = "archive-tar-xz")]
     #[test]
     fn test_extract_tar_xz_and_magic_sniffing() {
         let temp_dir =
@@ -706,6 +707,7 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
+    #[cfg(feature = "archive-tar-zst")]
     #[test]
     fn test_extract_tar_zst_and_magic_sniffing() {
         let temp_dir =

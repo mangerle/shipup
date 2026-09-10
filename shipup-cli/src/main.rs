@@ -793,6 +793,7 @@ fn handle_release(args: &ReleaseArgs) -> Result<()> {
 
     let package_info = PackageInfo {
         url: url.to_string(),
+        mirrors: vec![],
         signature,
         signatures: vec![],
         checksum: Some(checksum),
@@ -964,6 +965,7 @@ fn handle_batch_release(config_path: &Path, default_manifest_path: &Path) -> Res
 
         let package_info = PackageInfo {
             url: pkg.url.clone(),
+            mirrors: vec![],
             signature,
             signatures: vec![],
             checksum: Some(checksum),
@@ -1771,6 +1773,7 @@ mod tests {
             pub_date: "2026-08-01T00:00:00Z".to_string(),
             package_info: PackageInfo {
                 url: "https://example.com/win-1.1.0.exe".to_string(),
+                mirrors: vec![],
                 signature: None,
                 signatures: vec![],
                 checksum: Some("sha256:abc".to_string()),
@@ -1827,6 +1830,7 @@ mod tests {
             pub_date: "2026-10-01T00:00:00Z".to_string(),
             package_info: PackageInfo {
                 url: "https://example.com/mac-1.3.0.tar.gz".to_string(),
+                mirrors: vec![],
                 signature: None,
                 signatures: vec![],
                 checksum: Some("sha256:def".to_string()),
@@ -2178,6 +2182,7 @@ executable_path = "myapp"
             "x86_64-pc-windows-msvc".to_string(),
             PackageInfo {
                 url: "sample-app-1.0.0.tar.gz".to_string(),
+                mirrors: Vec::new(),
                 size: Some(pkg_bytes.len() as u64),
                 checksum: Some(sha256_hex),
                 signature: None,

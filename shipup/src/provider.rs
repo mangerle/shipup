@@ -241,6 +241,7 @@ pub(crate) fn parse_github_release_response(
             let package_type = detect_package_type_from_filename(&asset.name);
             let pkg = PackageInfo {
                 url: asset.browser_download_url.clone(),
+                mirrors: Vec::new(),
                 signature: None,
                 signatures: Vec::new(),
                 checksum: None,

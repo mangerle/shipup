@@ -94,6 +94,10 @@ pub struct PackageInfo {
     /// 更新包公网下载直链
     pub url: String,
 
+    /// 备用镜像源下载直链列表（用于并发分片下载流量分流与故障转移）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrors: Vec<String>,
+
     /// Ed25519 数字签名（Base64 编码，通常为 64 字节签名）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
@@ -721,6 +725,7 @@ mod tests {
             "x86_64-pc-windows-msvc".to_string(),
             PackageInfo {
                 url: "https://example.com/app.exe".to_string(),
+                mirrors: vec![],
                 signature: None,
                 signatures: vec![],
                 checksum: None,
@@ -739,6 +744,7 @@ mod tests {
             "x86_64-unknown-linux-gnu".to_string(),
             PackageInfo {
                 url: "https://example.com/app-linux.tar.gz".to_string(),
+                mirrors: vec![],
                 signature: None,
                 signatures: vec![],
                 checksum: None,
@@ -1054,5 +1060,36 @@ mod tests {
         // 门限提高为 3（需要 3 个签名），验证必须失败
         let err_3 = manifest.verify_signatures_threshold(&[pk1, pk2, pk3], 3);
         assert!(matches!(err_3, Err(UpdateError::ThresholdNotMet { .. })));
+    }
+
+    #[test]
+    fn test_package_info_mirrors_deserialize_and_default() {
+        // 1. 未显式提供 mirrors 时，默认解析为空向量
+        let json_default = r#"{
+            "url": "https://example.com/app.tar.gz",
+            "package_type": "archive"
+        }"#;
+        let pkg_default: PackageInfo = serde_json::from_str(json_default).unwrap();
+        assert!(pkg_default.mirrors.is_empty());
+
+        // 2. 显式提供 mirrors 数组时正常反序列化
+        let json_mirrors = r#"{
+            "url": "https://example.com/app.tar.gz",
+            "mirrors": [
+                "https://mirror1.example.com/app.tar.gz",
+                "https://mirror2.example.com/app.tar.gz"
+            ],
+            "package_type": "archive"
+        }"#;
+        let pkg_mirrors: PackageInfo = serde_json::from_str(json_mirrors).unwrap();
+        assert_eq!(pkg_mirrors.mirrors.len(), 2);
+        assert_eq!(
+            pkg_mirrors.mirrors[0],
+            "https://mirror1.example.com/app.tar.gz"
+        );
+        assert_eq!(
+            pkg_mirrors.mirrors[1],
+            "https://mirror2.example.com/app.tar.gz"
+        );
     }
 }
