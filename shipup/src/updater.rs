@@ -9,7 +9,8 @@ use crate::error::{Result, UpdateError};
 use crate::event::UpdateEvent;
 use crate::manifest::{Manifest, PackageType, ResolveOptions, ResolvedRelease};
 use crate::platform::{
-    InstallerOptions, cleanup_old_backups, get_temp_download_path, replace_binary, spawn_installer,
+    InstallerOptions, cleanup_old_backups, get_resumable_download_path, get_temp_download_path,
+    replace_binary, spawn_installer,
 };
 use crate::preference::{self, UpdatePreference};
 use crate::provider::ReleaseProvider;
@@ -59,6 +60,7 @@ pub(crate) struct NetworkSecurityConfig {
     pub chunked_concurrency: usize,
     pub chunk_size: usize,
     pub download_mirrors: Vec<String>,
+    pub resumable_download: bool,
 }
 
 /// 更新器内部共享核心状态实体
@@ -365,6 +367,7 @@ impl Updater {
                     chunked_concurrency: config.chunked_concurrency,
                     chunk_size: config.chunk_size,
                     download_mirrors: config.download_mirrors,
+                    resumable_download: config.resumable_download,
                 }),
                 version_comparator: config.version_comparator,
                 preference: Mutex::new(preference),
@@ -1091,8 +1094,7 @@ impl Update {
             &self.config.root_certificates_pem,
         )?;
 
-        let temp_download_path =
-            get_temp_download_path(self.release.package.package_type, &self.release.package.url)?;
+        let temp_download_path = self.resolve_download_path()?;
         let options = DownloadOptions {
             url: &self.release.package.url,
             target_path: &temp_download_path,
@@ -1218,8 +1220,7 @@ impl Update {
             &self.config.root_certificates_pem,
         )?;
 
-        let temp_download_path =
-            get_temp_download_path(self.release.package.package_type, &self.release.package.url)?;
+        let temp_download_path = self.resolve_download_path()?;
         let options = DownloadOptions {
             url: &self.release.package.url,
             target_path: &temp_download_path,
@@ -1328,6 +1329,23 @@ impl Update {
             .download_with_cancellation_async(cancel_flag, &mut callback)
             .await?;
         downloaded.install(callback)
+    }
+
+    /// 根据配置解析下载落盘路径
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：将“高熵随机临时路径”与“跨进程确定性续传路径”的选择收敛到单一决策点，
+    ///   避免同步与异步下载入口各自散落判断逻辑导致行为漂移。
+    /// - **核心优势**：开启 `resumable_download` 后进程重启可定位未完成分片；默认关闭时保持防预占投毒随机性。
+    fn resolve_download_path(&self) -> Result<PathBuf> {
+        if self.config.resumable_download {
+            get_resumable_download_path(
+                self.release.package.package_type,
+                &self.release.package.url,
+            )
+        } else {
+            get_temp_download_path(self.release.package.package_type, &self.release.package.url)
+        }
     }
 
     fn verify_downloaded_payload<F>(&self, temp_path: &Path, callback: &mut F) -> Result<()>
@@ -2513,6 +2531,7 @@ mod tests {
                 chunked_concurrency: 4,
                 chunk_size: 4 * 1024 * 1024,
                 download_mirrors: Vec::new(),
+                resumable_download: false,
             }),
         };
 
@@ -2577,6 +2596,7 @@ mod tests {
                 chunked_concurrency: 4,
                 chunk_size: 4 * 1024 * 1024,
                 download_mirrors: Vec::new(),
+                resumable_download: false,
             }),
         };
 

@@ -46,8 +46,8 @@ pub use offline::{
     is_file_protocol, path_to_file_url, resolve_relative_file_url, verify_offline_repository,
 };
 pub use platform::{
-    InstallerOptions, cleanup_old_backups, get_same_volume_temp_path, get_temp_download_path,
-    schedule_reboot_delete, schedule_reboot_replace, spawn_installer,
+    InstallerOptions, cleanup_old_backups, get_resumable_download_path, get_same_volume_temp_path,
+    get_temp_download_path, schedule_reboot_delete, schedule_reboot_replace, spawn_installer,
 };
 #[cfg(feature = "async")]
 pub use poller::spawn_polling_task;

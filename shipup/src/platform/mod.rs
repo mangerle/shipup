@@ -330,6 +330,60 @@ pub fn get_temp_download_path(package_type: PackageType, url: &str) -> Result<Pa
     Ok(parent.join(file_name))
 }
 
+/// 获取支持跨进程断点续传的确定性下载路径
+///
+/// # 设计原理
+/// - **实现初衷**：默认临时路径每次生成高熵随机文件名，进程异常退出后无法再次定位部分下载文件，
+///   导致 HTTP Range 断点续传仅在同进程内有效。开启跨进程续传时，需要基于 URL 派生确定性路径。
+/// - **核心优势**：同一更新包 URL 始终映射到同一物理路径，进程重启后可直接续写；配合既有 Range
+///   逻辑与本地缓存命中校验，实现真正跨进程的断点续传。
+/// - **代价与局限**：路径可预测，不再具备防预占投毒的高熵随机性；仅推荐在受控环境或配合校验使用。
+///
+/// # Errors
+/// 当路径探测失败或系统临时目录不可用时返回错误。
+pub fn get_resumable_download_path(package_type: PackageType, url: &str) -> Result<PathBuf> {
+    let token = compute_url_hash_token(url);
+
+    if package_type == PackageType::Installer {
+        let temp_dir = std::env::temp_dir();
+        let url_path = Path::new(url.split('?').next().unwrap_or(url));
+        let ext = url_path.extension().and_then(|s| s.to_str()).unwrap_or({
+            #[cfg(windows)]
+            {
+                "exe"
+            }
+            #[cfg(target_os = "macos")]
+            {
+                "pkg"
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
+            {
+                "bin"
+            }
+        });
+        let dir_name = format!("shipup_installer_{token}");
+        let secure_dir = create_secure_temp_dir(&temp_dir, &dir_name)?;
+        let file_name = format!("installer.{ext}");
+        return Ok(secure_dir.join(file_name));
+    }
+
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        let exe_name = current_exe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("app");
+        let file_name = format!("{exe_name}.{token}.shipup.partial");
+        return Ok(parent.join(file_name));
+    }
+
+    let fallback = get_same_volume_temp_path()?;
+    let parent = fallback.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = format!("app.{token}.shipup.partial");
+    Ok(parent.join(file_name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +447,33 @@ mod tests {
             file_name1.ends_with(".shipup.tmp"),
             "临时二进制文件必须遵循 .shipup.tmp 命名规范以便垃圾回收"
         );
+    }
+
+    #[test]
+    fn test_get_resumable_download_path_deterministic() {
+        let url = "https://example.com/binaries/myapp-1.2.0.exe";
+        let path1 = get_resumable_download_path(PackageType::Binary, url).unwrap();
+        let path2 = get_resumable_download_path(PackageType::Binary, url).unwrap();
+
+        assert_eq!(path1, path2, "同一 URL 的跨进程续传路径必须确定性可复现");
+        let file_name = path1.file_name().and_then(|s| s.to_str()).unwrap();
+        assert!(
+            file_name.ends_with(".shipup.partial"),
+            "跨进程续传文件必须遵循 .shipup.partial 命名规范"
+        );
+
+        // 不同 URL 必须映射到不同路径，避免更新包相互覆盖
+        let other =
+            get_resumable_download_path(PackageType::Binary, "https://example.com/other.exe")
+                .unwrap();
+        assert_ne!(path1, other);
+    }
+
+    #[test]
+    fn test_get_resumable_download_path_installer_isolation() {
+        let url = "https://example.com/setup.exe";
+        let path = get_resumable_download_path(PackageType::Installer, url).unwrap();
+        assert!(path.parent().is_some_and(|p| p.is_dir()));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

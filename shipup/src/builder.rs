@@ -84,6 +84,8 @@ pub struct UpdaterConfig {
     pub chunk_size: usize,
     /// 全局配置的备用镜像下载直链列表
     pub download_mirrors: Vec<String>,
+    /// 是否开启跨进程断点续传（使用确定性临时路径，进程重启后可继续未完成下载）
+    pub resumable_download: bool,
 }
 
 impl std::fmt::Debug for UpdaterConfig {
@@ -122,6 +124,7 @@ impl std::fmt::Debug for UpdaterConfig {
             .field("chunked_concurrency", &self.chunked_concurrency)
             .field("chunk_size", &self.chunk_size)
             .field("download_mirrors_count", &self.download_mirrors.len())
+            .field("resumable_download", &self.resumable_download)
             .finish()
     }
 }
@@ -178,6 +181,7 @@ pub struct UpdaterBuilder {
     pub(crate) chunked_concurrency: usize,
     pub(crate) chunk_size: usize,
     pub(crate) download_mirrors: Vec<String>,
+    pub(crate) resumable_download: bool,
 }
 
 impl std::fmt::Debug for UpdaterBuilder {
@@ -220,6 +224,7 @@ impl std::fmt::Debug for UpdaterBuilder {
             .field("chunked_concurrency", &self.chunked_concurrency)
             .field("chunk_size", &self.chunk_size)
             .field("download_mirrors_count", &self.download_mirrors.len())
+            .field("resumable_download", &self.resumable_download)
             .finish()
     }
 }
@@ -259,6 +264,7 @@ impl Default for UpdaterBuilder {
             chunked_concurrency: crate::download::DEFAULT_CHUNKED_CONCURRENCY,
             chunk_size: crate::download::DEFAULT_CHUNK_SIZE,
             download_mirrors: Vec::new(),
+            resumable_download: false,
         }
     }
 }
@@ -657,6 +663,18 @@ impl UpdaterBuilder {
         self
     }
 
+    /// 设置是否开启跨进程断点续传（默认为 false）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：默认临时路径带高熵随机后缀，进程异常退出后无法再次定位未完成下载文件。
+    ///   开启后改用基于 URL 派生的确定性路径，进程重启后可继续未完成的 Range 下载。
+    /// - **核心优势**：弱网大包更新时显著降低重复下载流量；若本地文件已完整且哈希匹配则直接缓存命中。
+    /// - **代价与局限**：确定性路径可预测，失去防预占投毒的高熵随机性，建议配合签名校验使用。
+    pub fn resumable_download(mut self, enabled: bool) -> Self {
+        self.resumable_download = enabled;
+        self
+    }
+
     /// 构建 Updater 实例并完成前置安全门禁与合法性校验
     ///
     /// # 校验内容
@@ -737,6 +755,7 @@ impl UpdaterBuilder {
             chunked_concurrency: self.chunked_concurrency,
             chunk_size: self.chunk_size,
             download_mirrors: self.download_mirrors,
+            resumable_download: self.resumable_download,
         };
 
         Ok(Updater::new(config))
@@ -1049,5 +1068,20 @@ mod tests {
         assert!(debug_str.contains("mirror1.example.com"));
         assert!(debug_str.contains("mirror2.example.com"));
         assert!(debug_str.contains("mirror3.example.com"));
+    }
+
+    #[test]
+    fn test_builder_resumable_download_option() {
+        let updater = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .manifest_url("https://example.com/manifest.json")
+            .require_signature(false)
+            .resumable_download(true)
+            .build()
+            .unwrap();
+
+        let debug_str = format!("{:?}", updater);
+        assert!(debug_str.contains("resumable_download: true"));
     }
 }
