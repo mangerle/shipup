@@ -13,7 +13,7 @@ use crate::platform::{
 };
 use crate::preference::{self, UpdatePreference};
 use crate::restart::{RestartContext, restart_with};
-use crate::signature::{verify_ed25519_file_any_key, verify_sha256_file};
+use crate::signature::{verify_ed25519_file_threshold, verify_sha256_file};
 use crate::template::{TemplateContext, resolve_url_template};
 use semver::Version;
 use std::collections::HashMap;
@@ -50,6 +50,7 @@ pub(crate) struct NetworkSecurityConfig {
     pub allow_file_protocol: bool,
     pub max_rollback_entries: usize,
     pub root_certificates_pem: Vec<Vec<u8>>,
+    pub signature_threshold: usize,
 }
 
 /// 更新器内部共享核心状态实体
@@ -340,6 +341,7 @@ impl Updater {
                     allow_file_protocol: config.allow_file_protocol,
                     max_rollback_entries: config.max_rollback_entries,
                     root_certificates_pem: config.root_certificates_pem,
+                    signature_threshold: config.signature_threshold,
                 }),
                 version_comparator: config.version_comparator,
                 preference: Mutex::new(preference),
@@ -518,9 +520,16 @@ impl Updater {
 
         // 2. 校验 Manifest 清单自身数字签名
         if !self.inner.config.public_keys.is_empty() {
-            if let Some(ref _sig) = manifest.signature {
-                manifest.verify_signature(&self.inner.config.public_keys)?;
-                log::info!("更新源 Manifest 清单自身数字签名防伪验证通过");
+            let all_sigs = manifest.all_signatures();
+            if !all_sigs.is_empty() {
+                manifest.verify_signatures_threshold(
+                    &self.inner.config.public_keys,
+                    self.inner.config.signature_threshold,
+                )?;
+                log::info!(
+                    "更新源 Manifest 清单自身 TUF 门限数字签名防伪验证通过 (门限: {})",
+                    self.inner.config.signature_threshold
+                );
             } else if self.inner.config.require_signature {
                 log::debug!("当前 Manifest 未附带根级数字签名，将严格依赖后续安装包体级数字签名");
             }
@@ -995,11 +1004,17 @@ impl Update {
                 let _ = fs::remove_file(temp_path);
                 return Err(UpdateError::MissingPublicKey);
             }
-            let sig = self.release.package.signature.as_deref().ok_or_else(|| {
+            let all_sigs = self.release.package.all_signatures();
+            if all_sigs.is_empty() {
                 let _ = fs::remove_file(temp_path);
-                UpdateError::MissingSignature
-            })?;
-            if let Err(e) = verify_ed25519_file_any_key(temp_path, sig, &self.config.public_keys) {
+                return Err(UpdateError::MissingSignature);
+            }
+            if let Err(e) = verify_ed25519_file_threshold(
+                temp_path,
+                &all_sigs,
+                &self.config.public_keys,
+                self.config.signature_threshold,
+            ) {
                 let _ = fs::remove_file(temp_path);
                 return Err(e);
             }
@@ -1529,6 +1544,7 @@ mod tests {
             package: PackageInfo {
                 url: "https://example.com/app.exe".to_string(),
                 signature: None,
+                signatures: vec![],
                 checksum: None,
                 package_type: PackageType::Binary,
                 install_mode: None,
@@ -1863,6 +1879,7 @@ mod tests {
                 package: crate::manifest::PackageInfo {
                     url: "https://example.com/payload.bin".to_string(),
                     signature: None, // 未提供数字签名
+                    signatures: vec![],
                     checksum: None,
                     package_type: PackageType::Binary,
                     install_mode: None,
@@ -1886,6 +1903,7 @@ mod tests {
                 allow_file_protocol: true,
                 max_rollback_entries: 3,
                 root_certificates_pem: Vec::new(),
+                signature_threshold: 1,
             }),
         };
 
@@ -1917,6 +1935,7 @@ mod tests {
                 package: crate::manifest::PackageInfo {
                     url: "https://example.com/payload.bin".to_string(),
                     signature: Some("dummy_sig".to_string()),
+                    signatures: vec![],
                     checksum: None,
                     package_type: PackageType::Binary,
                     install_mode: None,
@@ -1940,6 +1959,7 @@ mod tests {
                 allow_file_protocol: true,
                 max_rollback_entries: 3,
                 root_certificates_pem: Vec::new(),
+                signature_threshold: 1,
             }),
         };
 

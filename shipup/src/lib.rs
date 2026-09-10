@@ -33,7 +33,7 @@ pub use error::{Result, UpdateError};
 pub use event::UpdateEvent;
 pub use manifest::{
     ChannelInfo, InstallMode, Manifest, PackageInfo, PackageType, ResolveOptions, ResolvedRelease,
-    current_target_triple,
+    SignatureEntry, current_target_triple,
 };
 pub use platform::{
     InstallerOptions, cleanup_old_backups, get_same_volume_temp_path, get_temp_download_path,

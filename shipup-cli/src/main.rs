@@ -670,6 +670,7 @@ fn handle_release(args: &ReleaseArgs) -> Result<()> {
     let package_info = PackageInfo {
         url: url.to_string(),
         signature,
+        signatures: vec![],
         checksum: Some(checksum),
         package_type: parsed_pkg_type,
         install_mode: parsed_install_mode,
@@ -766,6 +767,7 @@ fn handle_batch_release(config_path: &Path, default_manifest_path: &Path) -> Res
             packages: BTreeMap::new(),
             channels: BTreeMap::new(),
             signature: None,
+            signatures: vec![],
             rollout_percentage: batch_config.rollout_percentage,
             expires_at: resolved_expires_at,
             version_seq: batch_config.version_seq,
@@ -839,6 +841,7 @@ fn handle_batch_release(config_path: &Path, default_manifest_path: &Path) -> Res
         let package_info = PackageInfo {
             url: pkg.url.clone(),
             signature,
+            signatures: vec![],
             checksum: Some(checksum),
             package_type: parsed_pkg_type,
             install_mode: parsed_install_mode,
@@ -1141,6 +1144,7 @@ fn load_or_init_manifest(
             packages: BTreeMap::new(),
             channels: BTreeMap::new(),
             signature: None,
+            signatures: vec![],
             rollout_percentage: args.rollout_percentage,
             expires_at: resolved_expires_at,
             version_seq: args.version_seq,
@@ -1219,6 +1223,7 @@ mod tests {
             packages: BTreeMap::new(),
             channels: BTreeMap::new(),
             signature: Some("old_signature".to_string()),
+            signatures: vec![],
             rollout_percentage: None,
             expires_at: None,
             version_seq: None,
@@ -1232,6 +1237,7 @@ mod tests {
             package_info: PackageInfo {
                 url: "https://example.com/win-1.1.0.exe".to_string(),
                 signature: None,
+                signatures: vec![],
                 checksum: Some("sha256:abc".to_string()),
                 package_type: PackageType::Binary,
                 install_mode: None,
@@ -1287,6 +1293,7 @@ mod tests {
             package_info: PackageInfo {
                 url: "https://example.com/mac-1.3.0.tar.gz".to_string(),
                 signature: None,
+                signatures: vec![],
                 checksum: Some("sha256:def".to_string()),
                 package_type: PackageType::Archive,
                 install_mode: None,

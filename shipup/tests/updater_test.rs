@@ -17,6 +17,7 @@ fn test_manifest_serialization_and_routing() {
         PackageInfo {
             url: "https://example.com/app-1.2.0.exe".to_string(),
             signature: Some("test-signature".to_string()),
+            signatures: vec![],
             checksum: Some("sha256:abcd".to_string()),
             package_type: PackageType::Binary,
             install_mode: None,
@@ -34,6 +35,7 @@ fn test_manifest_serialization_and_routing() {
         PackageInfo {
             url: "https://example.com/app-1.3.0-beta.exe".to_string(),
             signature: None,
+            signatures: vec![],
             checksum: None,
             package_type: PackageType::Installer,
             install_mode: Some(shipup::InstallMode::Quiet),
@@ -66,6 +68,7 @@ fn test_manifest_serialization_and_routing() {
         packages,
         channels,
         signature: None,
+        signatures: vec![],
         rollout_percentage: None,
         expires_at: None,
         version_seq: None,

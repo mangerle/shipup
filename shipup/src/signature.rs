@@ -1,10 +1,12 @@
 // shipup 跨平台自更新系统 - SHA-256 完整性与 Ed25519 签名校验器
 
 use crate::error::{Result, UpdateError};
+use crate::manifest::SignatureEntry;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -206,38 +208,144 @@ pub fn verify_ed25519_any_key(
     }
 }
 
-/// 允许一次性读入内存执行 Ed25519 签名验证的最大文件体积上限（512MB）
-pub const MAX_SIGNATURE_PAYLOAD_SIZE: u64 = 512 * 1024 * 1024;
-
-/// 针对本地文件路径使用候选公钥列表执行 Ed25519 数字签名验证
+/// 使用候选公钥环对多个数字签名执行 TUF 风格的门限多签验证
 ///
 /// # 设计原理
-/// - **实现初衷**：将下载完成的临时物理文件与配置的公钥环进行整体真实性校验，只要通过任一公钥验证即放行。
+/// - **实现初衷**：遵循 TUF (The Update Framework) 规范的门限安全模型（M-of-N Threshold Signatures），
+///   要求有效签名必须来自至少 `threshold` 个互不相同的受信任公钥。
 /// - **核心优势**：
-///   - 优先采用基于 32 字节 SHA-256 摘要流式验签，内存占用恒定为 64KB，彻底解除 512MB 体积上限并防范 OOM。
-///   - 对历史未采用摘要签名的小文件（<= 512MB）提供向后兼容全文验签支持。
-/// - **代价与局限**：向前兼容路径对未采用摘要签名的文件仍受 512MB 内存上限保护。
+///   - 防重复签名撞票：同一受信任公钥无论匹配多少个签名条目，均严格计为 1 票；
+///   - 诊断详尽透明：未达门限时输出所有候选签名与各公钥比对的具体诊断详情；
+///   - 性能短路优化：一旦达到法定门限即刻提前返回成功，避免无谓计算。
+/// - **代价与局限**：当签名或公钥数量较多且全部不匹配时，时间复杂度为 O(S * P)。
+///
+/// # 参数
+/// * `data`: 待验证的原始数据切片（或 32 字节摘要）
+/// * `signatures`: 候选签名条目集合
+/// * `base64_public_keys`: 受信任候选公钥列表
+/// * `threshold`: 最低要求的独立有效公钥签名数量
 ///
 /// # Errors
-/// 当底层文件读取失败或所有候选公钥均验证失败时返回对应错误。
-pub fn verify_ed25519_file_any_key(
-    file_path: &Path,
-    base64_signature: &str,
+/// - 当公钥列表为空时返回 [`UpdateError::MissingPublicKey`]。
+/// - 当候选签名集合为空时返回 [`UpdateError::MissingSignature`]。
+/// - 当通过验证的独立公钥数量未达 `threshold` 时返回 [`UpdateError::ThresholdNotMet`]。
+pub fn verify_ed25519_threshold(
+    data: &[u8],
+    signatures: &[SignatureEntry],
     base64_public_keys: &[impl AsRef<str>],
+    threshold: usize,
 ) -> Result<()> {
     if base64_public_keys.is_empty() {
         return Err(UpdateError::MissingPublicKey);
     }
+    if signatures.is_empty() {
+        return Err(UpdateError::MissingSignature);
+    }
 
-    // 1. 优先尝试 TUF/Sigstore 规范的标准摘要验签（流式计算 32 字节哈希）
+    let required_threshold = threshold.max(1);
+
+    if signatures.len() < required_threshold {
+        return Err(UpdateError::ThresholdNotMet {
+            threshold: required_threshold,
+            valid_count: 0,
+            total_signatures: signatures.len(),
+            details: format!(
+                "候选签名总数 ({}) 小于要求的门限法定人数 ({})",
+                signatures.len(),
+                required_threshold
+            ),
+        });
+    }
+
+    let mut verified_keys = HashSet::with_capacity(signatures.len());
+    let mut diagnostics = Vec::with_capacity(signatures.len());
+
+    for (sig_idx, entry) in signatures.iter().enumerate() {
+        let mut matched_for_entry = false;
+
+        for pub_key in base64_public_keys {
+            let pk_str = pub_key.as_ref().trim();
+            if verified_keys.contains(pk_str) {
+                // 该公钥已被其他有效签名使用，禁止重复计票
+                continue;
+            }
+
+            if verify_ed25519(data, &entry.signature, pk_str).is_ok() {
+                verified_keys.insert(pk_str.to_string());
+                diagnostics.push(format!(
+                    "候选签名 #{} 成功通过公钥认证 (当前已累积有效独立签名: {})",
+                    sig_idx + 1,
+                    verified_keys.len()
+                ));
+                matched_for_entry = true;
+                break;
+            }
+        }
+
+        if !matched_for_entry {
+            diagnostics.push(format!(
+                "候选签名 #{} 未能匹配任何可用且未使用的受信任公钥",
+                sig_idx + 1
+            ));
+        }
+
+        if verified_keys.len() >= required_threshold {
+            return Ok(());
+        }
+    }
+
+    if required_threshold == 1 && signatures.len() == 1 {
+        if base64_public_keys.len() == 1 {
+            return Err(UpdateError::InvalidSignature);
+        } else {
+            return Err(UpdateError::MultiKeyVerificationFailed {
+                count: base64_public_keys.len(),
+                details: diagnostics.join("; "),
+            });
+        }
+    }
+
+    Err(UpdateError::ThresholdNotMet {
+        threshold: required_threshold,
+        valid_count: verified_keys.len(),
+        total_signatures: signatures.len(),
+        details: diagnostics.join("; "),
+    })
+}
+
+/// 允许一次性读入内存执行 Ed25519 签名验证的最大文件体积上限（512MB）
+pub const MAX_SIGNATURE_PAYLOAD_SIZE: u64 = 512 * 1024 * 1024;
+
+/// 针对本地文件路径使用候选公钥列表执行 TUF 风格的门限多签验证
+///
+/// # 设计原理
+/// - **实现初衷**：为下载到本地的物理安装包提供流式门限签名核验，解除大文件内存占用瓶颈。
+/// - **核心优势**：优先采用 32 字节 SHA-256 摘要流式验签，支持向前兼容全文字节回退校验。
+///
+/// # Errors
+/// 当文件读取失败或门限验证未通过时返回对应错误。
+pub fn verify_ed25519_file_threshold(
+    file_path: &Path,
+    signatures: &[SignatureEntry],
+    base64_public_keys: &[impl AsRef<str>],
+    threshold: usize,
+) -> Result<()> {
+    if base64_public_keys.is_empty() {
+        return Err(UpdateError::MissingPublicKey);
+    }
+    if signatures.is_empty() {
+        return Err(UpdateError::MissingSignature);
+    }
+
+    // 1. 优先尝试 TUF/Sigstore 规范的标准摘要流式验签
     let digest = compute_file_sha256_digest(file_path)?;
-    let digest_err = match verify_ed25519_any_key(&digest, base64_signature, base64_public_keys) {
-        Ok(()) => return Ok(()),
-        Err(e) => e,
-    };
+    let digest_err =
+        match verify_ed25519_threshold(&digest, signatures, base64_public_keys, threshold) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
 
-    // 2. 向前兼容回退：若摘要验签未通过，尝试对全文字节进行兼容验证（限制 <= 512MB 安全上限）
-    // 消除 TOCTOU 竞态：先打开句柄，基于同一文件句柄查询元数据并执行读取，杜绝路径替换与竞态攻击
+    // 2. 向前兼容回退：对未采用摘要签名的传统文件尝试全文字节验证（限制 <= 512MB 安全上限）
     let mut file = File::open(file_path)?;
     let metadata = file.metadata()?;
     if metadata.len() <= MAX_SIGNATURE_PAYLOAD_SIZE {
@@ -254,13 +362,35 @@ pub fn verify_ed25519_file_any_key(
             )));
         }
 
-        if verify_ed25519_any_key(&data, base64_signature, base64_public_keys).is_ok() {
+        if verify_ed25519_threshold(&data, signatures, base64_public_keys, threshold).is_ok() {
             return Ok(());
         }
     }
 
-    // 向后兼容路径亦未通过，返回摘要验签时的完整结构化诊断上下文
     Err(digest_err)
+}
+
+/// 针对本地文件路径使用候选公钥列表执行 Ed25519 数字签名验证（单签兼容模式）
+///
+/// # 设计原理
+/// - **实现初衷**：将下载完成的临时物理文件与配置的公钥环进行整体真实性校验，只要通过任一公钥验证即放行。
+/// - **核心优势**：
+///   - 优先采用基于 32 字节 SHA-256 摘要流式验签，内存占用恒定为 64KB，彻底解除 512MB 体积上限并防范 OOM。
+///   - 对历史未采用摘要签名的小文件（<= 512MB）提供向后兼容全文验签支持。
+/// - **代价与局限**：向前兼容路径对未采用摘要签名的文件仍受 512MB 内存上限保护。
+///
+/// # Errors
+/// 当底层文件读取失败或所有候选公钥均验证失败时返回对应错误。
+pub fn verify_ed25519_file_any_key(
+    file_path: &Path,
+    base64_signature: &str,
+    base64_public_keys: &[impl AsRef<str>],
+) -> Result<()> {
+    let entry = SignatureEntry {
+        key_id: None,
+        signature: base64_signature.to_string(),
+    };
+    verify_ed25519_file_threshold(file_path, &[entry], base64_public_keys, 1)
 }
 
 #[cfg(test)]
@@ -429,6 +559,109 @@ mod tests {
 
         assert!(verify_ed25519_file(&temp_file, &digest_sig, &pubkey).is_err());
         assert!(verify_ed25519_file(&temp_file, &full_sig, &pubkey).is_err());
+
+        let _ = std::fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn test_tuf_threshold_multi_signature_success_and_replay_protection() {
+        let payload = b"tuf threshold signature payload for critical updates";
+
+        // 生成 3 组独立密钥对
+        let key1 = SigningKey::from_bytes(&[1u8; 32]);
+        let key2 = SigningKey::from_bytes(&[2u8; 32]);
+        let key3 = SigningKey::from_bytes(&[3u8; 32]);
+
+        let pk1 = BASE64.encode(key1.verifying_key().to_bytes());
+        let pk2 = BASE64.encode(key2.verifying_key().to_bytes());
+        let pk3 = BASE64.encode(key3.verifying_key().to_bytes());
+        let public_keys = vec![pk1.clone(), pk2.clone(), pk3.clone()];
+
+        let sig1 = BASE64.encode(key1.sign(payload).to_bytes());
+        let sig2 = BASE64.encode(key2.sign(payload).to_bytes());
+
+        // 1. 2-of-3 门限多签验证成功
+        let signatures = vec![
+            SignatureEntry {
+                key_id: Some("key-1".to_string()),
+                signature: sig1.clone(),
+            },
+            SignatureEntry {
+                key_id: Some("key-2".to_string()),
+                signature: sig2.clone(),
+            },
+        ];
+        let res = verify_ed25519_threshold(payload, &signatures, &public_keys, 2);
+        assert!(res.is_ok());
+
+        // 2. 防撞票攻击测试：同一个私钥签署两次，门限为 2，必须被拦截且有效签名计数为 1
+        let duplicate_signatures = vec![
+            SignatureEntry {
+                key_id: None,
+                signature: sig1.clone(),
+            },
+            SignatureEntry {
+                key_id: None,
+                signature: sig1.clone(),
+            },
+        ];
+        let dup_res = verify_ed25519_threshold(payload, &duplicate_signatures, &public_keys, 2);
+        match dup_res {
+            Err(UpdateError::ThresholdNotMet {
+                threshold,
+                valid_count,
+                ..
+            }) => {
+                assert_eq!(threshold, 2);
+                assert_eq!(valid_count, 1);
+            }
+            other => panic!("期望 ThresholdNotMet 错误，实际获得: {:?}", other),
+        }
+
+        // 3. 签名数量少于门限要求
+        let single_sig = vec![SignatureEntry {
+            key_id: None,
+            signature: sig1,
+        }];
+        let insuff_res = verify_ed25519_threshold(payload, &single_sig, &public_keys, 2);
+        assert!(matches!(
+            insuff_res,
+            Err(UpdateError::ThresholdNotMet { .. })
+        ));
+    }
+
+    #[test]
+    fn test_tuf_threshold_file_verification() {
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!("shipup_tuf_file_test_{}.bin", std::process::id()));
+        let content = b"threshold payload file content for integrity check";
+        let mut f = File::create(&temp_file).unwrap();
+        f.write_all(content).unwrap();
+        drop(f);
+
+        let key1 = SigningKey::from_bytes(&[10u8; 32]);
+        let key2 = SigningKey::from_bytes(&[20u8; 32]);
+        let pk1 = BASE64.encode(key1.verifying_key().to_bytes());
+        let pk2 = BASE64.encode(key2.verifying_key().to_bytes());
+
+        // 计算文件摘要并由两方联合签署
+        let digest = compute_file_sha256_digest(&temp_file).unwrap();
+        let sig1 = BASE64.encode(key1.sign(&digest).to_bytes());
+        let sig2 = BASE64.encode(key2.sign(&digest).to_bytes());
+
+        let signatures = vec![
+            SignatureEntry {
+                key_id: None,
+                signature: sig1,
+            },
+            SignatureEntry {
+                key_id: None,
+                signature: sig2,
+            },
+        ];
+
+        // 门限 2 验证通过
+        assert!(verify_ed25519_file_threshold(&temp_file, &signatures, &[pk1, pk2], 2).is_ok());
 
         let _ = std::fs::remove_file(&temp_file);
     }

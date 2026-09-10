@@ -63,12 +63,13 @@ pub(crate) fn parse_file_url_to_path(url: &str) -> Result<PathBuf> {
         return Err(UpdateError::FileProtocolNotAllowed(url.to_string()));
     }
     let after_scheme = &trimmed[7..];
-    // 去除 localhost 域名前缀（如 file://localhost/path）
-    let path_part = if after_scheme.to_ascii_lowercase().starts_with("localhost/") {
-        &after_scheme[10..]
-    } else {
-        after_scheme
-    };
+    // 去除 localhost 域名前缀（如 file://localhost/path 剥离 localhost 后保留 /path）
+    let path_part =
+        if after_scheme.len() >= 9 && after_scheme[..9].eq_ignore_ascii_case("localhost") {
+            &after_scheme[9..]
+        } else {
+            after_scheme
+        };
 
     let decoded = percent_decode(path_part);
 
@@ -317,36 +318,17 @@ fn get_available_disk_space(target_path: &Path) -> std::io::Result<u64> {
     let c_path = CString::new(dir.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-    #[repr(C)]
-    struct Statvfs {
-        f_bsize: std::os::raw::c_ulong,
-        f_frsize: std::os::raw::c_ulong,
-        f_blocks: u64,
-        f_bfree: u64,
-        f_bavail: u64,
-        f_files: u64,
-        f_ffree: u64,
-        f_favail: u64,
-        f_fsid: std::os::raw::c_ulong,
-        f_flag: std::os::raw::c_ulong,
-        f_namemax: std::os::raw::c_ulong,
-        __f_spare: [std::os::raw::c_int; 6],
-    }
-
-    unsafe extern "C" {
-        fn statvfs(path: *const std::os::raw::c_char, buf: *mut Statvfs) -> std::os::raw::c_int;
-    }
-
-    let mut stat = std::mem::MaybeUninit::<Statvfs>::zeroed();
-    let res = unsafe { statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    let res = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
     if res == 0 {
         let stat = unsafe { stat.assume_init() };
-        let frsize = if stat.f_frsize > 0 {
-            stat.f_frsize as u64
+        let frsize: u64 = if stat.f_frsize > 0 {
+            u64::try_from(stat.f_frsize).unwrap_or(0)
         } else {
-            stat.f_bsize as u64
+            u64::try_from(stat.f_bsize).unwrap_or(0)
         };
-        Ok(stat.f_bavail.saturating_mul(frsize))
+        let bavail = u64::try_from(stat.f_bavail).unwrap_or(0);
+        Ok(bavail.saturating_mul(frsize))
     } else {
         Err(std::io::Error::last_os_error())
     }

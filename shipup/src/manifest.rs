@@ -67,6 +67,22 @@ pub enum InstallMode {
     BasicUi,
 }
 
+/// TUF 风格的单个数字签名条目
+///
+/// # 设计原理
+/// - **实现初衷**：遵循 TUF (The Update Framework) 门限多签规范，支持多实体联合签署更新清单或安装包。
+/// - **核心优势**：包含可选的 `key_id`（密钥标识符/指纹）与 Base64 编码的数字签名，支持精准公钥索引与快速验证。
+/// - **代价与局限**：调用端需维护信任公钥列表并声明门限阈值。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureEntry {
+    /// 签名者公钥标识符（如 Key ID 或公钥指纹，可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+
+    /// Base64 编码的 64 字节 Ed25519 数字签名
+    pub signature: String,
+}
+
 /// 针对特定平台的发布包配置信息
 ///
 /// # 设计原理
@@ -81,6 +97,10 @@ pub struct PackageInfo {
     /// Ed25519 数字签名（Base64 编码，通常为 64 字节签名）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+
+    /// TUF 风格的安装包体门限多签名条目列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signatures: Vec<SignatureEntry>,
 
     /// 完整性校验哈希，格式如 "sha256:<hex_digest>"
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,6 +128,22 @@ pub struct PackageInfo {
     /// 更新包物理文件大小（字节，用于硬校验与目标磁盘空间预检）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+}
+
+impl PackageInfo {
+    /// 收集针对该安装包体的所有可用候选数字签名列表（合并单签与多签）
+    pub fn all_signatures(&self) -> Vec<SignatureEntry> {
+        let mut list =
+            Vec::with_capacity(self.signatures.len() + usize::from(self.signature.is_some()));
+        if let Some(ref sig) = self.signature {
+            list.push(SignatureEntry {
+                key_id: None,
+                signature: sig.clone(),
+            });
+        }
+        list.extend(self.signatures.iter().cloned());
+        list
+    }
 }
 
 /// 单独发布通道中的更新信息
@@ -184,6 +220,10 @@ pub struct Manifest {
     /// Manifest 元数据自身的数字签名（Base64 编码，可选）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+
+    /// TUF 风格的清单门限多签名条目列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signatures: Vec<SignatureEntry>,
 
     /// 默认主通道灰度放量比例（0..=100，若未配置则默认全量放行）
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -311,17 +351,49 @@ impl Manifest {
             .map_err(|e| UpdateError::ManifestParse(format!("序列化规范化清单失败: {}", e)))
     }
 
-    /// 使用配置的候选公钥环校验 Manifest 本身的完整性与数字签名
+    /// 收集针对 Manifest 清单本身的所有可用候选数字签名列表（合并单签与多签）
+    pub fn all_signatures(&self) -> Vec<SignatureEntry> {
+        let mut list =
+            Vec::with_capacity(self.signatures.len() + usize::from(self.signature.is_some()));
+        if let Some(ref sig) = self.signature {
+            list.push(SignatureEntry {
+                key_id: None,
+                signature: sig.clone(),
+            });
+        }
+        list.extend(self.signatures.iter().cloned());
+        list
+    }
+
+    /// 使用配置的候选公钥环校验 Manifest 本身的完整性与数字签名（单签兼容模式）
     ///
     /// # Errors
     /// 当缺少签名字段或所有公钥均验签失败时返回错误。
     pub fn verify_signature(&self, public_keys: &[impl AsRef<str>]) -> Result<()> {
-        let sig = self
-            .signature
-            .as_deref()
-            .ok_or(UpdateError::MissingSignature)?;
+        self.verify_signatures_threshold(public_keys, 1)
+    }
+
+    /// 使用配置的候选公钥环校验 Manifest 本身的完整性与 TUF 风格门限多签
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：遵循 TUF 门限安全模型（M-of-N Threshold Signatures），要求至少达到 `threshold` 个独立受信任公钥的有效签名。
+    /// - **核心优势**：自动收集 `signature` 与 `signatures` 中所有候选签名，杜绝单私钥被盗即被任意投毒的风险。
+    ///
+    /// # Errors
+    /// 当签名数不足门限或未能通过足够数量的独立公钥校验时返回 [`UpdateError::ThresholdNotMet`]。
+    pub fn verify_signatures_threshold(
+        &self,
+        public_keys: &[impl AsRef<str>],
+        threshold: usize,
+    ) -> Result<()> {
+        let all_sigs = self.all_signatures();
         let canonical_bytes = self.compute_canonical_bytes()?;
-        crate::signature::verify_ed25519_any_key(&canonical_bytes, sig, public_keys)
+        crate::signature::verify_ed25519_threshold(
+            &canonical_bytes,
+            &all_sigs,
+            public_keys,
+            threshold,
+        )
     }
 
     /// 校验 Manifest 是否已超过指定的过期失效时间戳
@@ -607,6 +679,9 @@ pub fn parse_rfc3339_to_unix(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
     fn test_normalize_target_libc_and_env_distinction() {
@@ -647,6 +722,7 @@ mod tests {
             PackageInfo {
                 url: "https://example.com/app.exe".to_string(),
                 signature: None,
+                signatures: vec![],
                 checksum: None,
                 package_type: PackageType::Binary,
                 install_mode: None,
@@ -664,6 +740,7 @@ mod tests {
             PackageInfo {
                 url: "https://example.com/app-linux.tar.gz".to_string(),
                 signature: None,
+                signatures: vec![],
                 checksum: None,
                 package_type: PackageType::Archive,
                 install_mode: None,
@@ -696,6 +773,7 @@ mod tests {
             packages,
             channels,
             signature: None,
+            signatures: vec![],
             rollout_percentage: None,
             expires_at: None,
             version_seq: None,
@@ -795,6 +873,7 @@ mod tests {
             packages: BTreeMap::new(),
             channels: BTreeMap::new(),
             signature: None,
+            signatures: vec![],
             rollout_percentage: None,
             expires_at: None,
             version_seq: None,
@@ -907,6 +986,7 @@ mod tests {
             packages: BTreeMap::new(),
             channels: BTreeMap::new(),
             signature: None,
+            signatures: vec![],
             rollout_percentage: None,
             expires_at: Some("2026-01-01T00:00:00Z".to_string()),
             version_seq: Some(10),
@@ -922,5 +1002,57 @@ mod tests {
         // 3. 未设置 expires_at 时恒定放行
         manifest.expires_at = None;
         assert!(manifest.verify_freshness(9999999999).is_ok());
+    }
+
+    #[test]
+    fn test_manifest_threshold_signatures() {
+        let key1 = SigningKey::from_bytes(&[101u8; 32]);
+        let key2 = SigningKey::from_bytes(&[102u8; 32]);
+        let key3 = SigningKey::from_bytes(&[103u8; 32]);
+
+        let pk1 = BASE64.encode(key1.verifying_key().to_bytes());
+        let pk2 = BASE64.encode(key2.verifying_key().to_bytes());
+        let pk3 = BASE64.encode(key3.verifying_key().to_bytes());
+
+        let mut manifest = Manifest {
+            version: Version::parse("4.0.0").unwrap(),
+            min_supported_version: None,
+            force_update: false,
+            pub_date: None,
+            notes: Some("门限多签清单测试".to_string()),
+            packages: BTreeMap::new(),
+            channels: BTreeMap::new(),
+            signature: None,
+            signatures: vec![],
+            rollout_percentage: None,
+            expires_at: None,
+            version_seq: None,
+        };
+
+        let canonical = manifest.compute_canonical_bytes().unwrap();
+        let sig1 = BASE64.encode(key1.sign(&canonical).to_bytes());
+        let sig2 = BASE64.encode(key2.sign(&canonical).to_bytes());
+
+        manifest.signatures = vec![
+            SignatureEntry {
+                key_id: Some("signer-1".to_string()),
+                signature: sig1,
+            },
+            SignatureEntry {
+                key_id: Some("signer-2".to_string()),
+                signature: sig2,
+            },
+        ];
+
+        // 2-of-3 门限多签验证成功
+        assert!(
+            manifest
+                .verify_signatures_threshold(&[pk1.clone(), pk2.clone(), pk3.clone()], 2)
+                .is_ok()
+        );
+
+        // 门限提高为 3（需要 3 个签名），验证必须失败
+        let err_3 = manifest.verify_signatures_threshold(&[pk1, pk2, pk3], 3);
+        assert!(matches!(err_3, Err(UpdateError::ThresholdNotMet { .. })));
     }
 }

@@ -65,6 +65,8 @@ pub struct UpdaterConfig {
     pub max_rollback_entries: usize,
     /// 自定义受信任根证书 PEM 字节数据列表（用于自建私有 PKI 或证书固定）
     pub root_certificates_pem: Vec<Vec<u8>>,
+    /// TUF 门限多签要求的最低独立公钥签名法定数量（Threshold，默认 1）
+    pub signature_threshold: usize,
 }
 
 impl std::fmt::Debug for UpdaterConfig {
@@ -95,6 +97,7 @@ impl std::fmt::Debug for UpdaterConfig {
             .field("preference_path", &self.preference_path)
             .field("max_rollback_entries", &self.max_rollback_entries)
             .field("root_certificates_count", &self.root_certificates_pem.len())
+            .field("signature_threshold", &self.signature_threshold)
             .finish()
     }
 }
@@ -142,6 +145,7 @@ pub struct UpdaterBuilder {
     pub(crate) client_id: Option<String>,
     pub(crate) max_rollback_entries: usize,
     pub(crate) root_certificates_pem: Vec<Vec<u8>>,
+    pub(crate) signature_threshold: usize,
 }
 
 impl std::fmt::Debug for UpdaterBuilder {
@@ -176,6 +180,7 @@ impl std::fmt::Debug for UpdaterBuilder {
             .field("client_id", &self.client_id)
             .field("max_rollback_entries", &self.max_rollback_entries)
             .field("root_certificates_count", &self.root_certificates_pem.len())
+            .field("signature_threshold", &self.signature_threshold)
             .finish()
     }
 }
@@ -206,6 +211,7 @@ impl Default for UpdaterBuilder {
             client_id: None,
             max_rollback_entries: crate::recovery::DEFAULT_MAX_ROLLBACK_ENTRIES,
             root_certificates_pem: Vec::new(),
+            signature_threshold: 1,
         }
     }
 }
@@ -282,6 +288,17 @@ impl UpdaterBuilder {
     pub fn public_keys(mut self, public_keys: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.public_keys
             .extend(public_keys.into_iter().map(Into::into));
+        self
+    }
+
+    /// 设置 TUF 门限多签要求的最低独立有效公钥签名数量（Threshold，默认 1）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：在企业级高安全场景下推行 M-of-N 联合签署治理策略，杜绝单一私钥失窃导致恶意固件分发。
+    /// - **核心优势**：强制约束验证通过的签名必须来自不同互斥的受信任公钥，杜绝重放伪造。
+    /// - **代价与局限**：发布端必须组织至少相应数量的受信任密钥持有人联合签署。
+    pub fn signature_threshold(mut self, threshold: usize) -> Self {
+        self.signature_threshold = threshold.max(1);
         self
     }
 
@@ -505,6 +522,14 @@ impl UpdaterBuilder {
             return Err(UpdateError::MissingPublicKey);
         }
 
+        if self.require_signature && self.public_keys.len() < self.signature_threshold {
+            return Err(UpdateError::ManifestParse(format!(
+                "受信任公钥数量 ({}) 少于要求的门限法定人数 ({})",
+                self.public_keys.len(),
+                self.signature_threshold
+            )));
+        }
+
         let config = UpdaterConfig {
             current_version,
             endpoints: self.endpoints,
@@ -529,6 +554,7 @@ impl UpdaterBuilder {
             client_id: self.client_id,
             max_rollback_entries: self.max_rollback_entries,
             root_certificates_pem: self.root_certificates_pem,
+            signature_threshold: self.signature_threshold,
         };
 
         Ok(Updater::new(config))

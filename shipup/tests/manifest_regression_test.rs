@@ -127,6 +127,7 @@ fn test_tamper_detection_on_any_nested_manifest_component() {
                 PackageInfo {
                     url: "https://example.com/app.exe".to_string(),
                     signature: None,
+                    signatures: vec![],
                     checksum: Some("abcd".to_string()),
                     package_type: PackageType::Installer,
                     install_mode: None,
@@ -155,6 +156,7 @@ fn test_tamper_detection_on_any_nested_manifest_component() {
             c
         },
         signature: None,
+        signatures: vec![],
         rollout_percentage: Some(50),
         expires_at: Some("2030-01-01T00:00:00Z".to_string()),
         version_seq: Some(1),
@@ -215,6 +217,7 @@ fn test_tamper_detection_on_any_nested_manifest_component() {
             PackageInfo {
                 url: "https://example.com/app-mac.zip".to_string(),
                 signature: None,
+                signatures: vec![],
                 checksum: None,
                 package_type: PackageType::Archive,
                 install_mode: None,
@@ -249,6 +252,7 @@ fn test_end_to_end_publisher_client_cross_sign_and_verify() {
                 PackageInfo {
                     url: "https://release.example.com/app-v3.0.0-linux.tar.gz".to_string(),
                     signature: None,
+                    signatures: vec![],
                     checksum: Some(
                         "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff"
                             .to_string(),
@@ -265,6 +269,7 @@ fn test_end_to_end_publisher_client_cross_sign_and_verify() {
         },
         channels: BTreeMap::new(),
         signature: None,
+        signatures: vec![],
         rollout_percentage: None,
         expires_at: Some("2028-12-31T23:59:59Z".to_string()),
         version_seq: Some(100),

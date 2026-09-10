@@ -45,6 +45,17 @@ pub enum UpdateError {
     #[error("多候选公钥验签全部失败（共尝试 {count} 个候选公钥）: {details}")]
     MultiKeyVerificationFailed { count: usize, details: String },
 
+    /// 门限多签未达到最低法定人数 (Threshold)
+    #[error(
+        "门限签名验证未通过: 要求至少 {threshold} 个有效独立公钥签名，实际仅验证通过 {valid_count} 个（候选签名总数: {total_signatures}）: {details}"
+    )]
+    ThresholdNotMet {
+        threshold: usize,
+        valid_count: usize,
+        total_signatures: usize,
+        details: String,
+    },
+
     /// 客户端配置了公钥但远端包缺少签名
     #[error("签名配置缺失: 客户端启用了验签但 Manifest 未包含签名")]
     MissingSignature,
