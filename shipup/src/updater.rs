@@ -1630,6 +1630,7 @@ where
                 user_args: &release.package.install_args,
                 install_mode: release.package.install_mode,
                 require_elevation: release.package.require_elevation,
+                wait_for_exit: release.package.wait_for_exit,
             };
             spawn_installer(temp_path, &installer_options)?;
             callback(UpdateEvent::ReadyToRestart);
@@ -1987,6 +1988,7 @@ mod tests {
                 install_args: vec![],
                 executable_path: None,
                 require_elevation: false,
+                wait_for_exit: false,
                 size: None,
             },
             rollout_percentage: None,
@@ -2028,6 +2030,7 @@ mod tests {
                 install_args: vec![],
                 executable_path: None,
                 require_elevation: false,
+                wait_for_exit: false,
                 size: None,
             },
             rollout_percentage: None,
@@ -2506,6 +2509,7 @@ mod tests {
                     install_args: vec![],
                     executable_path: None,
                     require_elevation: false,
+                    wait_for_exit: false,
                     size: None,
                 },
             },
@@ -2571,6 +2575,7 @@ mod tests {
                     install_args: vec![],
                     executable_path: None,
                     require_elevation: false,
+                    wait_for_exit: false,
                     size: None,
                 },
             },

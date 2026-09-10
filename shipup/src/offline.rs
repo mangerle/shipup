@@ -598,6 +598,7 @@ mod tests {
                 executable_path: None,
                 install_args: Vec::new(),
                 require_elevation: false,
+                wait_for_exit: false,
                 install_mode: None,
             },
         );
@@ -661,6 +662,7 @@ mod tests {
                 executable_path: None,
                 install_args: Vec::new(),
                 require_elevation: false,
+                wait_for_exit: false,
                 install_mode: None,
             },
         );

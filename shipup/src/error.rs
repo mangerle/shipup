@@ -84,6 +84,10 @@ pub enum UpdateError {
     #[error("启动外部安装器失败: {0}")]
     InstallerSpawn(String),
 
+    /// 外部安装器退出码非零，安装判定失败
+    #[error("外部安装器执行失败，退出码: {exit_code}，安装路径: {path}")]
+    InstallerExitFailed { exit_code: i32, path: String },
+
     /// 用户主动发起了取消操作
     #[error("更新流程已被用户主动取消")]
     Cancelled,

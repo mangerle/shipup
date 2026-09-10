@@ -99,6 +99,8 @@ struct BatchPackageConfig {
     install_args: Vec<String>,
     #[serde(default)]
     require_elevation: bool,
+    #[serde(default)]
+    wait_for_exit: bool,
     key: Option<PathBuf>,
 }
 
@@ -172,6 +174,10 @@ struct ReleaseArgs {
     /// 是否需要操作系统管理员提权（UAC / Sudo）执行安装（默认 false）
     #[arg(long, default_value_t = false)]
     require_elevation: bool,
+
+    /// 是否等待外部安装器退出并校验退出码（默认 false）
+    #[arg(long, default_value_t = false)]
+    wait_for_exit: bool,
 
     /// 灰度放量比例（0..=100，若不指定则全量发布）
     #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
@@ -802,6 +808,7 @@ fn handle_release(args: &ReleaseArgs) -> Result<()> {
         install_args: args.install_args.clone(),
         executable_path: args.executable_path.clone(),
         require_elevation: args.require_elevation,
+        wait_for_exit: args.wait_for_exit,
         size: Some(package_size),
     };
 
@@ -974,6 +981,7 @@ fn handle_batch_release(config_path: &Path, default_manifest_path: &Path) -> Res
             install_args: pkg.install_args.clone(),
             executable_path: pkg.executable_path.clone(),
             require_elevation: pkg.require_elevation,
+            wait_for_exit: pkg.wait_for_exit,
             size: Some(package_size),
         };
 
@@ -1001,6 +1009,7 @@ fn handle_batch_release(config_path: &Path, default_manifest_path: &Path) -> Res
             executable_path: pkg.executable_path.clone(),
             channel: batch_config.channel.clone(),
             require_elevation: pkg.require_elevation,
+            wait_for_exit: pkg.wait_for_exit,
             rollout_percentage: batch_config.rollout_percentage,
             expires_at: batch_config.expires_at.clone(),
             expires_in: batch_config.expires_in.clone(),
@@ -1782,6 +1791,7 @@ mod tests {
                 install_args: vec![],
                 executable_path: None,
                 require_elevation: false,
+                wait_for_exit: false,
                 size: None,
             },
         };
@@ -1803,6 +1813,7 @@ mod tests {
             executable_path: None,
             channel: None,
             require_elevation: false,
+            wait_for_exit: false,
             rollout_percentage: None,
             expires_at: None,
             expires_in: None,
@@ -1839,6 +1850,7 @@ mod tests {
                 install_args: vec![],
                 executable_path: None,
                 require_elevation: false,
+                wait_for_exit: false,
                 size: None,
             },
         };
@@ -1860,6 +1872,7 @@ mod tests {
             executable_path: None,
             channel: None,
             require_elevation: false,
+            wait_for_exit: false,
             rollout_percentage: Some(30),
             expires_at: Some("2026-12-31T00:00:00Z".to_string()),
             expires_in: None,
@@ -2191,6 +2204,7 @@ executable_path = "myapp"
                 executable_path: None,
                 install_args: Vec::new(),
                 require_elevation: false,
+                wait_for_exit: false,
                 install_mode: None,
             },
         );

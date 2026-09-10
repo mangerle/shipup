@@ -25,6 +25,7 @@ fn test_manifest_serialization_and_routing() {
             install_args: vec![],
             executable_path: None,
             require_elevation: false,
+            wait_for_exit: false,
             size: None,
         },
     );
@@ -44,6 +45,7 @@ fn test_manifest_serialization_and_routing() {
             install_args: vec!["/S".to_string()],
             executable_path: None,
             require_elevation: true,
+            wait_for_exit: false,
             size: None,
         },
     );

@@ -24,6 +24,8 @@ pub struct InstallerOptions<'a> {
     pub install_mode: Option<InstallMode>,
     /// 是否需要提升至操作系统管理员权限执行
     pub require_elevation: bool,
+    /// 是否等待安装器进程退出并校验退出码（默认 false，即派生后立即返回）
+    pub wait_for_exit: bool,
 }
 
 /// 清理以往更新遗留的临时或备份文件
@@ -156,6 +158,19 @@ pub fn spawn_installer(installer_path: &Path, options: &InstallerOptions<'_>) ->
     {
         let mut cmd = std::process::Command::new(installer_path);
         cmd.args(options.user_args);
+        if options.wait_for_exit {
+            let status = cmd.status().map_err(|e| {
+                crate::error::UpdateError::InstallerSpawn(format!("等待安装器退出失败: {e}"))
+            })?;
+            let code = status.code().unwrap_or(-1);
+            if !status.success() {
+                return Err(crate::error::UpdateError::InstallerExitFailed {
+                    exit_code: code,
+                    path: installer_path.display().to_string(),
+                });
+            }
+            return Ok(());
+        }
         cmd.spawn().map_err(|e| {
             crate::error::UpdateError::InstallerSpawn(format!("拉起安装器失败: {}", e))
         })?;

@@ -191,6 +191,21 @@ pub fn spawn_installer(installer_path: &Path, options: &InstallerOptions<'_>) ->
     let mut cmd =
         build_macos_installer_command(installer_path, options.user_args, options.require_elevation);
 
+    if options.wait_for_exit {
+        let status = cmd
+            .status()
+            .map_err(|e| UpdateError::InstallerSpawn(format!("等待 macOS 安装器退出失败: {e}")))?;
+        let code = status.code().unwrap_or(-1);
+        if !status.success() {
+            return Err(UpdateError::InstallerExitFailed {
+                exit_code: code,
+                path: installer_path.display().to_string(),
+            });
+        }
+        log::info!("macOS 安装器已成功退出，退出码: {code}");
+        return Ok(());
+    }
+
     cmd.spawn()
         .map_err(|e| UpdateError::InstallerSpawn(format!("拉起 macOS 安装器失败: {}", e)))?;
 

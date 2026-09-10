@@ -250,6 +250,7 @@ pub(crate) fn parse_github_release_response(
                 install_args: Vec::new(),
                 executable_path: None,
                 require_elevation: false,
+                wait_for_exit: false,
                 size: Some(asset.size),
             };
             packages.insert(target.to_string(), pkg);

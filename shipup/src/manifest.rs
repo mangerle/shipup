@@ -129,6 +129,10 @@ pub struct PackageInfo {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_elevation: bool,
 
+    /// 是否等待外部安装器退出并校验退出码（默认 false，派生后立即返回）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wait_for_exit: bool,
+
     /// 更新包物理文件大小（字节，用于硬校验与目标磁盘空间预检）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
@@ -734,6 +738,7 @@ mod tests {
                 install_args: vec![],
                 executable_path: None,
                 require_elevation: false,
+                wait_for_exit: false,
                 size: None,
             },
         );
@@ -753,6 +758,7 @@ mod tests {
                 install_args: vec![],
                 executable_path: None,
                 require_elevation: false,
+                wait_for_exit: false,
                 size: None,
             },
         );

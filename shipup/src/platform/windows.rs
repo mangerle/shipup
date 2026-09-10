@@ -349,11 +349,35 @@ pub fn spawn_installer(installer_path: &Path, options: &InstallerOptions<'_>) ->
     let (program, args) = build_windows_installer_args(installer_path, options);
 
     if options.require_elevation {
+        // UAC 提权走 ShellExecuteW，系统级无法可靠等待子进程退出码，默认保持派生即返回
+        if options.wait_for_exit {
+            log::warn!(
+                "Windows UAC 提权安装器无法等待退出码，已降级为派生后立即返回: {}",
+                installer_path.display()
+            );
+        }
         return spawn_elevated_installer(&program, &args, installer_path);
     }
 
     let mut cmd = Command::new(&program);
     cmd.args(&args);
+
+    if options.wait_for_exit {
+        // 等待退出码时不能脱离进程树，否则父进程无法持有可等待句柄
+        let status = cmd.status().map_err(|e| {
+            UpdateError::InstallerSpawn(format!("等待 Windows 安装器退出失败: {e}"))
+        })?;
+        let code = status.code().unwrap_or(-1);
+        if !status.success() {
+            return Err(UpdateError::InstallerExitFailed {
+                exit_code: code,
+                path: installer_path.display().to_string(),
+            });
+        }
+        log::info!("Windows 安装器已成功退出，退出码: {code}");
+        return Ok(());
+    }
+
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     cmd.spawn()
         .map_err(|e| UpdateError::InstallerSpawn(format!("拉起 Windows 安装器失败: {}", e)))?;
@@ -397,6 +421,7 @@ mod tests {
             user_args: &empty_args,
             install_mode: None,
             require_elevation: false,
+            wait_for_exit: false,
         };
         let (prog, args) = build_windows_installer_args(path, &opt_default);
         assert_eq!(prog, "msiexec");
@@ -411,6 +436,7 @@ mod tests {
             user_args: &custom_args,
             install_mode: Some(InstallMode::Quiet),
             require_elevation: false,
+            wait_for_exit: false,
         };
         let (prog, args) = build_windows_installer_args(path, &opt_quiet);
         assert_eq!(prog, "msiexec");
@@ -430,6 +456,7 @@ mod tests {
             user_args: &empty_args,
             install_mode: Some(InstallMode::BasicUi),
             require_elevation: false,
+            wait_for_exit: false,
         };
         let (prog, args) = build_windows_installer_args(path, &opt_basic);
         assert_eq!(prog, "msiexec");
@@ -446,6 +473,7 @@ mod tests {
             user_args: &empty_args,
             install_mode: None,
             require_elevation: false,
+            wait_for_exit: false,
         };
         let (prog, args) = build_windows_installer_args(path, &opt_default);
         assert_eq!(prog, "C:\\temp\\setup.exe");
@@ -457,6 +485,7 @@ mod tests {
             user_args: &custom_args,
             install_mode: Some(InstallMode::Passive),
             require_elevation: false,
+            wait_for_exit: false,
         };
         let (prog, args) = build_windows_installer_args(path, &opt_passive);
         assert_eq!(prog, "C:\\temp\\setup.exe");
@@ -510,6 +539,7 @@ mod tests {
             user_args: &empty_args,
             install_mode: None,
             require_elevation: false,
+            wait_for_exit: false,
         };
         let (prog, args) = build_windows_installer_args(path, &opt_default);
         assert_eq!(prog, "msiexec");
@@ -523,6 +553,7 @@ mod tests {
             user_args: &empty_args,
             install_mode: Some(InstallMode::Quiet),
             require_elevation: false,
+            wait_for_exit: false,
         };
         let (prog, args) = build_windows_installer_args(path, &opt_quiet);
         assert_eq!(prog, "msiexec");
