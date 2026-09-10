@@ -52,6 +52,8 @@ pub(crate) struct NetworkSecurityConfig {
     pub max_rollback_entries: usize,
     pub root_certificates_pem: Vec<Vec<u8>>,
     pub signature_threshold: usize,
+    pub endpoint_racing: bool,
+    pub stagger_delay: Duration,
 }
 
 /// 更新器内部共享核心状态实体
@@ -351,6 +353,8 @@ impl Updater {
                     max_rollback_entries: config.max_rollback_entries,
                     root_certificates_pem: config.root_certificates_pem,
                     signature_threshold: config.signature_threshold,
+                    endpoint_racing: config.endpoint_racing,
+                    stagger_delay: config.stagger_delay,
                 }),
                 version_comparator: config.version_comparator,
                 preference: Mutex::new(preference),
@@ -405,6 +409,10 @@ impl Updater {
             current_version: &self.inner.current_version,
             channel: self.inner.channel.as_deref(),
         };
+
+        if self.inner.endpoints.len() > 1 && self.inner.config.endpoint_racing {
+            return self.check_endpoints_racing_blocking(&client, &template_ctx);
+        }
 
         let mut last_error = None;
         for (idx, raw_endpoint) in self.inner.endpoints.iter().enumerate() {
@@ -502,6 +510,12 @@ impl Updater {
             channel: self.inner.channel.as_deref(),
         };
 
+        if self.inner.endpoints.len() > 1 && self.inner.config.endpoint_racing {
+            return self
+                .check_endpoints_racing_async(&client, &template_ctx)
+                .await;
+        }
+
         let mut last_error = None;
         for (idx, raw_endpoint) in self.inner.endpoints.iter().enumerate() {
             let endpoint = resolve_url_template(raw_endpoint, &template_ctx);
@@ -553,6 +567,211 @@ impl Updater {
 
         Err(last_error.unwrap_or_else(|| {
             UpdateError::Network("所有配置的更新源端点均无法连接访问".to_string())
+        }))
+    }
+
+    #[cfg(feature = "blocking")]
+    /// 同步阻塞多更新源并发竞速 (Happy Eyeballs) 探测
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：在配置多个更新端点（主 CDN、备用 CDN 等）时，按错峰延迟并发发起连接与 Manifest 请求。
+    /// - **核心优势**：最快成功返回并校验通过的端点直接采纳，避免前序慢端点引发长尾超时。
+    /// - **代价与局限**：产生多线程并发网络请求，在首选源健康时会产生少许冗余流量。
+    fn check_endpoints_racing_blocking(
+        &self,
+        client: &reqwest::blocking::Client,
+        template_ctx: &TemplateContext<'_>,
+    ) -> Result<Option<Update>> {
+        let endpoints: Vec<String> = self
+            .inner
+            .endpoints
+            .iter()
+            .map(|raw| resolve_url_template(raw, template_ctx))
+            .collect();
+
+        let total = endpoints.len();
+        log::info!(
+            "启动同步更新源端点并发竞速 (端点数: {}, 错峰间隔: {}ms)",
+            total,
+            self.inner.config.stagger_delay.as_millis()
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (idx, endpoint) in endpoints.into_iter().enumerate() {
+            let stagger = self
+                .inner
+                .config
+                .stagger_delay
+                .saturating_mul(u32::try_from(idx).unwrap_or(u32::MAX));
+            let client_cloned = client.clone();
+            let allow_file = self.inner.config.allow_file_protocol;
+            let tx_cloned = tx.clone();
+            let updater = self.clone();
+
+            std::thread::spawn(move || {
+                if !stagger.is_zero() {
+                    std::thread::sleep(stagger);
+                }
+                let fetch_res = if download::is_file_url(&endpoint) {
+                    if !allow_file {
+                        Err(UpdateError::FileProtocolNotAllowed(endpoint.clone()))
+                    } else {
+                        match download::parse_file_url_to_path(&endpoint) {
+                            Ok(path) => fs::read_to_string(&path).map_err(UpdateError::Io),
+                            Err(e) => Err(e),
+                        }
+                    }
+                } else {
+                    fetch_manifest_blocking(&client_cloned, &endpoint)
+                };
+
+                let eval_res = match fetch_res {
+                    Ok(body) => updater.evaluate_manifest(&body),
+                    Err(e) => Err(e),
+                };
+
+                let _ = tx_cloned.send((endpoint, eval_res));
+            });
+        }
+        drop(tx);
+
+        let mut last_err = None;
+        let mut completed = 0usize;
+        while let Ok((endpoint, result)) = rx.recv() {
+            completed = completed.saturating_add(1);
+            match result {
+                Ok(opt_update) => {
+                    log::info!("多更新源端点竞速胜出: {}", endpoint);
+                    return Ok(opt_update);
+                }
+                Err(e) => {
+                    log::debug!("竞速端点 '{}' 失败: {}", endpoint, e);
+                    last_err = Some(e);
+                }
+            }
+            if completed >= total {
+                break;
+            }
+        }
+
+        if let Some(ref fallback) = self.inner.fallback_manifest {
+            log::warn!("所有竞速端点均请求失败，降级采用内嵌 Fallback Manifest 评估更新");
+            return self.evaluate_manifest_struct(fallback);
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            UpdateError::Network("所有竞速更新源端点均无法连接访问".to_string())
+        }))
+    }
+
+    #[cfg(feature = "async")]
+    /// 异步非阻塞多更新源并发竞速 (Happy Eyeballs) 探测
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：借助 Tokio 异步调度器，在错峰间隔后异步拉取各个端点的清单数据。
+    /// - **核心优势**：首个合法返回立刻响应，并自动取消其余迟缓异步请求，兼顾极速与资源防泄漏。
+    /// - **代价与局限**：多端点并发时消耗少量短暂的 Tokio 任务调度开销。
+    async fn check_endpoints_racing_async(
+        &self,
+        client: &reqwest::Client,
+        template_ctx: &TemplateContext<'_>,
+    ) -> Result<Option<Update>> {
+        let endpoints: Vec<String> = self
+            .inner
+            .endpoints
+            .iter()
+            .map(|raw| resolve_url_template(raw, template_ctx))
+            .collect();
+
+        log::info!(
+            "启动异步更新源端点并发竞速 (端点数: {}, 错峰间隔: {}ms)",
+            endpoints.len(),
+            self.inner.config.stagger_delay.as_millis()
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut join_handles = Vec::with_capacity(endpoints.len());
+
+        for (idx, endpoint) in endpoints.into_iter().enumerate() {
+            let stagger = self
+                .inner
+                .config
+                .stagger_delay
+                .saturating_mul(u32::try_from(idx).unwrap_or(u32::MAX));
+            let client_cloned = client.clone();
+            let allow_file = self.inner.config.allow_file_protocol;
+            let tx_cloned = tx.clone();
+            let updater = self.clone();
+
+            let handle = tokio::spawn(async move {
+                if !stagger.is_zero() {
+                    tokio::time::sleep(stagger).await;
+                }
+                let fetch_res = if download::is_file_url(&endpoint) {
+                    if !allow_file {
+                        Err(UpdateError::FileProtocolNotAllowed(endpoint.clone()))
+                    } else {
+                        match download::parse_file_url_to_path(&endpoint) {
+                            Ok(path) => tokio::fs::read_to_string(&path)
+                                .await
+                                .map_err(UpdateError::Io),
+                            Err(e) => Err(e),
+                        }
+                    }
+                } else {
+                    fetch_manifest_async(&client_cloned, &endpoint).await
+                };
+
+                let eval_res = match fetch_res {
+                    Ok(body) => updater.evaluate_manifest(&body),
+                    Err(e) => Err(e),
+                };
+
+                match eval_res {
+                    Ok(opt_update) => {
+                        let _ = tx_cloned.send((endpoint, Ok(opt_update))).await;
+                    }
+                    Err(e) => {
+                        log::debug!("异步竞速端点 '{}' 失败: {}", endpoint, e);
+                        let _ = tx_cloned.send((endpoint, Err(e))).await;
+                    }
+                }
+            });
+            join_handles.push(handle);
+        }
+        drop(tx);
+
+        let mut last_err = None;
+        let mut success_res = None;
+
+        while let Some((endpoint, result)) = rx.recv().await {
+            match result {
+                Ok(opt_update) => {
+                    log::info!("异步多更新源端点竞速胜出: {}", endpoint);
+                    success_res = Some(opt_update);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        for h in join_handles {
+            h.abort();
+        }
+
+        if let Some(opt_update) = success_res {
+            return Ok(opt_update);
+        }
+
+        if let Some(ref fallback) = self.inner.fallback_manifest {
+            log::warn!("所有异步竞速端点均请求失败，降级采用内嵌 Fallback Manifest 评估更新");
+            return self.evaluate_manifest_struct(fallback);
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            UpdateError::Network("所有竞速更新源端点均无法连接访问".to_string())
         }))
     }
 
@@ -1700,6 +1919,142 @@ mod tests {
         let _ = fs::remove_file(&manifest_file);
     }
 
+    #[cfg(feature = "blocking")]
+    #[test]
+    fn test_endpoints_racing_blocking_success() {
+        let temp_dir = std::env::temp_dir();
+        let manifest_file =
+            temp_dir.join(format!("racing_manifest_blk_{}.json", std::process::id()));
+        let manifest_content = r#"{
+            "version": "2.2.0",
+            "notes": "同步竞速测试",
+            "packages": {
+                "x86_64-pc-windows-msvc": {
+                    "url": "https://example.com/app-2.2.0.zip",
+                    "package_type": "archive"
+                }
+            }
+        }"#;
+        fs::write(&manifest_file, manifest_content).unwrap();
+
+        let valid_file_url = if cfg!(windows) {
+            format!(
+                "file:///{}",
+                manifest_file.display().to_string().replace('\\', "/")
+            )
+        } else {
+            format!("file://{}", manifest_file.display())
+        };
+        let invalid_file_url = "file:///tmp/non_existent_racing_file.json".to_string();
+
+        let updater = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .target("x86_64-pc-windows-msvc")
+            .endpoint(&invalid_file_url)
+            .endpoint(&valid_file_url)
+            .endpoint_racing(true)
+            .stagger_delay(Duration::from_millis(5))
+            .allow_file_protocol(true)
+            .require_signature(false)
+            .build()
+            .unwrap();
+
+        let update = updater.check().unwrap();
+        assert!(update.is_some());
+        assert_eq!(update.unwrap().version(), &Version::parse("2.2.0").unwrap());
+
+        let _ = fs::remove_file(&manifest_file);
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn test_endpoints_racing_async_success() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let temp_dir = std::env::temp_dir();
+            let manifest_file =
+                temp_dir.join(format!("racing_manifest_async_{}.json", std::process::id()));
+            let manifest_content = r#"{
+                "version": "2.3.0",
+                "notes": "异步竞速测试",
+                "packages": {
+                    "x86_64-pc-windows-msvc": {
+                        "url": "https://example.com/app-2.3.0.zip",
+                        "package_type": "archive"
+                    }
+                }
+            }"#;
+            fs::write(&manifest_file, manifest_content).unwrap();
+
+            let valid_file_url = if cfg!(windows) {
+                format!(
+                    "file:///{}",
+                    manifest_file.display().to_string().replace('\\', "/")
+                )
+            } else {
+                format!("file://{}", manifest_file.display())
+            };
+            let invalid_file_url = "file:///tmp/non_existent_racing_async.json".to_string();
+
+            let updater = UpdaterBuilder::new()
+                .current_version("1.0.0")
+                .unwrap()
+                .target("x86_64-pc-windows-msvc")
+                .endpoint(&invalid_file_url)
+                .endpoint(&valid_file_url)
+                .endpoint_racing(true)
+                .stagger_delay(Duration::from_millis(5))
+                .allow_file_protocol(true)
+                .require_signature(false)
+                .build()
+                .unwrap();
+
+            let update = updater.check_async().await.unwrap();
+            assert!(update.is_some());
+            assert_eq!(update.unwrap().version(), &Version::parse("2.3.0").unwrap());
+
+            let _ = fs::remove_file(&manifest_file);
+        });
+    }
+
+    #[cfg(feature = "blocking")]
+    #[test]
+    fn test_endpoints_racing_all_failed_fallback() {
+        let manifest_json = r#"{
+            "version": "2.4.0",
+            "notes": "竞速全失败降级测试",
+            "packages": {
+                "x86_64-pc-windows-msvc": {
+                    "url": "https://example.com/app-2.4.0.zip",
+                    "package_type": "archive"
+                }
+            }
+        }"#;
+
+        let updater = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .target("x86_64-pc-windows-msvc")
+            .endpoint("file:///tmp/not_found_1.json")
+            .endpoint("file:///tmp/not_found_2.json")
+            .fallback_manifest_json(manifest_json)
+            .unwrap()
+            .endpoint_racing(true)
+            .stagger_delay(Duration::from_millis(5))
+            .allow_file_protocol(true)
+            .require_signature(false)
+            .build()
+            .unwrap();
+
+        let update = updater.check().unwrap();
+        assert!(update.is_some());
+        assert_eq!(update.unwrap().version(), &Version::parse("2.4.0").unwrap());
+    }
+
     #[test]
     fn test_compute_rollout_bucket_bounds_and_determinism() {
         let v = Version::parse("1.2.0").unwrap();
@@ -1957,6 +2312,8 @@ mod tests {
                 max_rollback_entries: 3,
                 root_certificates_pem: Vec::new(),
                 signature_threshold: 1,
+                endpoint_racing: false,
+                stagger_delay: Duration::from_millis(250),
             }),
         };
 
@@ -2013,6 +2370,8 @@ mod tests {
                 max_rollback_entries: 3,
                 root_certificates_pem: Vec::new(),
                 signature_threshold: 1,
+                endpoint_racing: false,
+                stagger_delay: Duration::from_millis(250),
             }),
         };
 

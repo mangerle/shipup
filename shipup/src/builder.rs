@@ -70,6 +70,10 @@ pub struct UpdaterConfig {
     pub root_certificates_pem: Vec<Vec<u8>>,
     /// TUF 门限多签要求的最低独立公钥签名法定数量（Threshold，默认 1）
     pub signature_threshold: usize,
+    /// 是否开启多更新源端点并发竞速 (Happy Eyeballs) 探测机制
+    pub endpoint_racing: bool,
+    /// 并发竞速模式下的端点错峰阶梯启动延迟
+    pub stagger_delay: Duration,
 }
 
 impl std::fmt::Debug for UpdaterConfig {
@@ -102,6 +106,8 @@ impl std::fmt::Debug for UpdaterConfig {
             .field("max_rollback_entries", &self.max_rollback_entries)
             .field("root_certificates_count", &self.root_certificates_pem.len())
             .field("signature_threshold", &self.signature_threshold)
+            .field("endpoint_racing", &self.endpoint_racing)
+            .field("stagger_delay", &self.stagger_delay)
             .finish()
     }
 }
@@ -151,6 +157,8 @@ pub struct UpdaterBuilder {
     pub(crate) max_rollback_entries: usize,
     pub(crate) root_certificates_pem: Vec<Vec<u8>>,
     pub(crate) signature_threshold: usize,
+    pub(crate) endpoint_racing: bool,
+    pub(crate) stagger_delay: Duration,
 }
 
 impl std::fmt::Debug for UpdaterBuilder {
@@ -187,6 +195,8 @@ impl std::fmt::Debug for UpdaterBuilder {
             .field("max_rollback_entries", &self.max_rollback_entries)
             .field("root_certificates_count", &self.root_certificates_pem.len())
             .field("signature_threshold", &self.signature_threshold)
+            .field("endpoint_racing", &self.endpoint_racing)
+            .field("stagger_delay", &self.stagger_delay)
             .finish()
     }
 }
@@ -219,6 +229,8 @@ impl Default for UpdaterBuilder {
             max_rollback_entries: crate::recovery::DEFAULT_MAX_ROLLBACK_ENTRIES,
             root_certificates_pem: Vec::new(),
             signature_threshold: 1,
+            endpoint_racing: false,
+            stagger_delay: Duration::from_millis(250),
         }
     }
 }
@@ -504,6 +516,27 @@ impl UpdaterBuilder {
         self.provider(GitHubProvider::new(owner, repo))
     }
 
+    /// 设置是否开启多更新源端点并发竞速 (Happy Eyeballs) 探测机制（默认为 false）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：在配置多个更新端点（主 CDN、备用 CDN、海外镜像）时，避免前序端点偶发超时阻塞整体更新检测。
+    /// - **核心优势**：以错峰阶梯并发向所有端点发起请求，最快成功返回并校验通过的端点直接采纳，有效降低长尾延迟。
+    /// - **代价与局限**：在多端点全部可达时会产生少量的额外冗余探测流量。
+    pub fn endpoint_racing(mut self, enabled: bool) -> Self {
+        self.endpoint_racing = enabled;
+        self
+    }
+
+    /// 设置并发竞速模式下的端点错峰阶梯启动延迟（默认 250 毫秒）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：参考 RFC 8305 Happy Eyeballs 算法规范，避免瞬间向所有镜像源发起突发流量风暴。
+    /// - **核心优势**：给予优先级最高的首选端点充分的优先响应时间窗口，仅在主端点迟钝时平滑唤醒后备源。
+    pub fn stagger_delay(mut self, delay: Duration) -> Self {
+        self.stagger_delay = delay;
+        self
+    }
+
     /// 添加自定义受信任根证书 PEM 格式数据（支持私有 CA 或证书固定 Certificate Pinning）
     ///
     /// # 设计原理
@@ -588,6 +621,8 @@ impl UpdaterBuilder {
             max_rollback_entries: self.max_rollback_entries,
             root_certificates_pem: self.root_certificates_pem,
             signature_threshold: self.signature_threshold,
+            endpoint_racing: self.endpoint_racing,
+            stagger_delay: self.stagger_delay,
         };
 
         Ok(Updater::new(config))
