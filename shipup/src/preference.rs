@@ -164,8 +164,27 @@ impl UpdatePreference {
     }
 }
 
-/// 基于系统时间与随机熵源生成 16 字节随机十六进制客户端设备标识
+/// 基于操作系统 CSPRNG 生成 16 字节随机十六进制客户端设备标识
+///
+/// # 设计原理
+/// - **实现初衷**：灰度分桶依赖 client_id 的稳定性与唯一性。原先基于时间戳/PID/堆地址的哈希在容器与 CI
+///   等高度同构环境下碰撞概率偏高，可能导致灰度放量误判。
+/// - **核心优势**：直接调用操作系统级 CSPRNG（`getrandom`），具备 128 位不可预测随机熵空间。
+/// - **代价与局限**：在极端操作系统熵池耗尽情况下可能失败，此时降级为基于时间与 PID 的弱熵回退。
 fn generate_random_client_id() -> String {
+    use std::fmt::Write;
+
+    let mut buf = [0u8; 16];
+    if getrandom::fill(&mut buf).is_ok() {
+        let mut hex = String::with_capacity(32);
+        for b in buf {
+            let _ = write!(hex, "{b:02x}");
+        }
+        return hex;
+    }
+
+    // 熵源不可用时的安全降级：基于时间与进程标识的确定性弱熵
+    log::warn!("获取系统安全随机数失败，客户端标识降级为弱熵生成");
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     let now = SystemTime::now()
@@ -173,13 +192,9 @@ fn generate_random_client_id() -> String {
         .unwrap_or_default();
     hasher.update(now.as_nanos().to_le_bytes());
     hasher.update(std::process::id().to_le_bytes());
-    let boxed = Box::new(0u8);
-    let ptr_val = (&*boxed as *const u8 as usize).to_le_bytes();
-    hasher.update(ptr_val);
     let hash = hasher.finalize();
     let mut hex = String::with_capacity(32);
     for b in &hash[..16] {
-        use std::fmt::Write;
         let _ = write!(hex, "{b:02x}");
     }
     hex
