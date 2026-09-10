@@ -226,10 +226,10 @@ fn get_available_disk_space(target_path: &Path) -> std::io::Result<u64> {
 
     unsafe extern "system" {
         fn GetDiskFreeSpaceExW(
-            lpDirectoryName: *const u16,
-            lpFreeBytesAvailableToCaller: *mut u64,
-            lpTotalNumberOfBytes: *mut u64,
-            lpTotalNumberOfFreeBytes: *mut u64,
+            lp_directory_name: *const u16,
+            lp_free_bytes_available_to_caller: *mut u64,
+            lp_total_number_of_bytes: *mut u64,
+            lp_total_number_of_free_bytes: *mut u64,
         ) -> i32;
     }
 
@@ -370,7 +370,10 @@ pub fn split_file_into_chunks(total_size: u64, chunk_size: usize) -> Vec<FileChu
     let mut index = 0usize;
 
     while start < total_size {
-        let end = (start.saturating_add(chunk_size_u64).saturating_sub(1)).min(total_size - 1);
+        let end = start
+            .saturating_add(chunk_size_u64)
+            .saturating_sub(1)
+            .min(total_size - 1);
         chunks.push(FileChunkRange { index, start, end });
         start = end.saturating_add(1);
         index = index.saturating_add(1);
