@@ -250,6 +250,9 @@ fn get_available_disk_space(target_path: &Path) -> std::io::Result<u64> {
 }
 
 #[cfg(unix)]
+// 64 位 Linux/macOS 上 statvfs 字段已是 u64，32 位平台需要转换；
+// 统一在函数级放行，避免特定 target 报 useless_conversion。
+#[allow(clippy::useless_conversion)]
 fn get_available_disk_space(target_path: &Path) -> std::io::Result<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -267,15 +270,11 @@ fn get_available_disk_space(target_path: &Path) -> std::io::Result<u64> {
     let res = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
     if res == 0 {
         let stat = unsafe { stat.assume_init() };
-        // 64 位 Linux/macOS 上字段本身已是 u64；32 位平台需要 try_from。
-        // 统一加 allow，避免 clippy 在特定 target 上报 useless_conversion。
-        #[allow(clippy::useless_conversion)]
         let frsize: u64 = if stat.f_frsize > 0 {
             u64::try_from(stat.f_frsize).unwrap_or(0)
         } else {
             u64::try_from(stat.f_bsize).unwrap_or(0)
         };
-        #[allow(clippy::useless_conversion)]
         let bavail = u64::try_from(stat.f_bavail).unwrap_or(0);
         Ok(bavail.saturating_mul(frsize))
     } else {
