@@ -21,6 +21,7 @@ pub mod manifest;
 pub(crate) mod platform;
 pub(crate) mod poller;
 pub mod preference;
+pub mod provider;
 pub(crate) mod recovery;
 pub(crate) mod restart;
 pub mod signature;
@@ -45,6 +46,7 @@ pub use poller::spawn_polling_task;
 pub use poller::spawn_polling_thread;
 pub use poller::{AutoPollEvent, AutoPollOptions, AutoPollerHandle};
 pub use preference::UpdatePreference;
+pub use provider::{GitHubProvider, ProviderClientOptions, ReleaseProvider};
 pub use recovery::{
     DEFAULT_MAX_ROLLBACK_ENTRIES, HealthCheckStatus, ROLLBACK_HISTORY_FILENAME, RollbackEntry,
     RollbackHistory, check_and_recover_current, check_and_recover_once, confirm_update_success,

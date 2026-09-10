@@ -12,6 +12,7 @@ use crate::platform::{
     InstallerOptions, cleanup_old_backups, get_temp_download_path, replace_binary, spawn_installer,
 };
 use crate::preference::{self, UpdatePreference};
+use crate::provider::ReleaseProvider;
 use crate::restart::{RestartContext, restart_with};
 use crate::signature::{verify_ed25519_file_threshold, verify_sha256_file};
 use crate::template::{TemplateContext, resolve_url_template};
@@ -57,6 +58,7 @@ pub(crate) struct NetworkSecurityConfig {
 struct UpdaterInner {
     current_version: Version,
     endpoints: Vec<String>,
+    provider: Option<Arc<dyn ReleaseProvider>>,
     channel: Option<String>,
     target: String,
     allow_downgrade: bool,
@@ -72,6 +74,7 @@ impl std::fmt::Debug for UpdaterInner {
         f.debug_struct("UpdaterInner")
             .field("current_version", &self.current_version)
             .field("endpoints", &self.endpoints)
+            .field("has_provider", &self.provider.is_some())
             .field("channel", &self.channel)
             .field("target", &self.target)
             .field("allow_downgrade", &self.allow_downgrade)
@@ -110,6 +113,11 @@ impl Updater {
     /// 获取当前配置的全部更新检查端点列表切片
     pub fn endpoints(&self) -> &[String] {
         &self.inner.endpoints
+    }
+
+    /// 获取当前配置的动态发布源提供者（若未配置则返回 None）
+    pub fn provider(&self) -> Option<&Arc<dyn ReleaseProvider>> {
+        self.inner.provider.as_ref()
     }
 
     /// 获取当前配置的内嵌 Fallback Manifest 兜底清单只读引用（若未配置则返回 None）
@@ -323,6 +331,7 @@ impl Updater {
             inner: Arc::new(UpdaterInner {
                 current_version: config.current_version,
                 endpoints: config.endpoints,
+                provider: config.provider,
                 channel: config.channel,
                 target: config.target,
                 allow_downgrade: config.allow_downgrade,
@@ -361,6 +370,28 @@ impl Updater {
     /// # Errors
     /// 当所有配置的更新端点均无法连通或解析失败时返回最终错误。
     pub fn check(&self) -> Result<Option<Update>> {
+        if let Some(ref provider) = self.inner.provider {
+            log::info!("正在通过动态发布源 ReleaseProvider 获取清单...");
+            match provider.fetch_manifest_blocking() {
+                Ok(manifest) => {
+                    log::info!("动态发布源清单获取成功 (版本: {})", manifest.version);
+                    return self.evaluate_manifest_struct(&manifest);
+                }
+                Err(e) => {
+                    log::warn!("通过动态发布源获取清单失败: {}, 尝试降级至静态端点", e);
+                    if self.inner.endpoints.is_empty() {
+                        if let Some(ref fallback) = self.inner.fallback_manifest {
+                            log::warn!(
+                                "动态发布源失败且无备用端点，降级采用内嵌 Fallback Manifest 评估更新"
+                            );
+                            return self.evaluate_manifest_struct(fallback);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
         let client = build_blocking_http_client(
             self.inner.config.timeout,
             self.inner.config.user_agent.as_deref(),
@@ -435,6 +466,28 @@ impl Updater {
     /// # Errors
     /// 当所有配置的端点均异步失败时返回最终错误。
     pub async fn check_async(&self) -> Result<Option<Update>> {
+        if let Some(ref provider) = self.inner.provider {
+            log::info!("正在异步通过动态发布源 ReleaseProvider 获取清单...");
+            match provider.fetch_manifest_async().await {
+                Ok(manifest) => {
+                    log::info!("异步动态发布源清单获取成功 (版本: {})", manifest.version);
+                    return self.evaluate_manifest_struct(&manifest);
+                }
+                Err(e) => {
+                    log::warn!("异步通过动态发布源获取清单失败: {}, 尝试降级至静态端点", e);
+                    if self.inner.endpoints.is_empty() {
+                        if let Some(ref fallback) = self.inner.fallback_manifest {
+                            log::warn!(
+                                "动态发布源失败且无备用端点，降级采用内嵌 Fallback Manifest 评估更新"
+                            );
+                            return self.evaluate_manifest_struct(fallback);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
         let client = build_async_http_client(
             self.inner.config.timeout,
             self.inner.config.user_agent.as_deref(),

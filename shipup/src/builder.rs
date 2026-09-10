@@ -3,6 +3,7 @@
 use crate::download::is_file_url;
 use crate::error::{Result, UpdateError};
 use crate::manifest::{Manifest, current_target_triple};
+use crate::provider::{GitHubProvider, ReleaseProvider};
 use crate::updater::Updater;
 use semver::Version;
 use std::collections::HashMap;
@@ -23,6 +24,8 @@ pub struct UpdaterConfig {
     pub current_version: Version,
     /// Manifest 元数据远端下载端点列表（支持多源容灾与自动故障转移）
     pub endpoints: Vec<String>,
+    /// 动态发布源提供者（如 GitHub Releases 平台）
+    pub provider: Option<Arc<dyn ReleaseProvider>>,
     /// 目标发布通道
     pub channel: Option<String>,
     /// Ed25519 验签公钥列表（Base64 编码，支持多公钥共存与平滑轮换）
@@ -74,6 +77,7 @@ impl std::fmt::Debug for UpdaterConfig {
         f.debug_struct("UpdaterConfig")
             .field("current_version", &self.current_version)
             .field("endpoints", &self.endpoints)
+            .field("has_provider", &self.provider.is_some())
             .field("channel", &self.channel)
             .field("public_keys", &self.public_keys)
             .field("timeout", &self.timeout)
@@ -124,6 +128,7 @@ impl UpdaterConfig {
 pub struct UpdaterBuilder {
     pub(crate) current_version: Option<Version>,
     pub(crate) endpoints: Vec<String>,
+    pub(crate) provider: Option<Arc<dyn ReleaseProvider>>,
     pub(crate) channel: Option<String>,
     pub(crate) public_keys: Vec<String>,
     pub(crate) timeout: Duration,
@@ -153,6 +158,7 @@ impl std::fmt::Debug for UpdaterBuilder {
         f.debug_struct("UpdaterBuilder")
             .field("current_version", &self.current_version)
             .field("endpoints", &self.endpoints)
+            .field("has_provider", &self.provider.is_some())
             .field("channel", &self.channel)
             .field("public_keys", &self.public_keys)
             .field("timeout", &self.timeout)
@@ -190,6 +196,7 @@ impl Default for UpdaterBuilder {
         Self {
             current_version: None,
             endpoints: Vec::new(),
+            provider: None,
             channel: None,
             public_keys: Vec::new(),
             timeout: Duration::from_secs(15),
@@ -473,6 +480,30 @@ impl UpdaterBuilder {
         self
     }
 
+    /// 设置自定义动态发布源提供者（如 GitHub Releases、GitLab 等）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：解耦更新器对单一固定 Manifest URL 文件的强绑定，支持外部制品平台动态发现。
+    /// - **核心优势**：自动对接平台 API，极大简化发布运维负担。
+    /// - **代价与局限**：受对应平台的鉴权和网络配额限制。
+    pub fn provider(mut self, provider: impl ReleaseProvider + 'static) -> Self {
+        self.provider = Some(Arc::new(provider));
+        self
+    }
+
+    /// 便捷配置 GitHub Releases 作为更新发布源
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：为开源及商业项目托管在 GitHub 的软件提供开箱即用的零配置发布源。
+    /// - **核心优势**：自动探测附件中的 `manifest.json` 或根据 Release 资产名称自动推导平台安装包。
+    ///
+    /// # 参数
+    /// * `owner`: GitHub 仓库所有者或组织名
+    /// * `repo`: GitHub 仓库名称
+    pub fn github_releases(self, owner: impl Into<String>, repo: impl Into<String>) -> Self {
+        self.provider(GitHubProvider::new(owner, repo))
+    }
+
     /// 添加自定义受信任根证书 PEM 格式数据（支持私有 CA 或证书固定 Certificate Pinning）
     ///
     /// # 设计原理
@@ -488,7 +519,7 @@ impl UpdaterBuilder {
     ///
     /// # 校验内容
     /// 1. 验证 `current_version` 已提供。
-    /// 2. 验证至少提供了一个有效的更新源端点（`manifest_url` 或 `endpoints`）。
+    /// 2. 验证至少提供了一个有效的更新源端点（`manifest_url` 或 `endpoints`）或配置了 `provider`。
     /// 3. 在未显式开启 `dangerous_insecure_transport_protocol` 时，拦截任何明文 HTTP 端点。
     /// 4. 在未显式开启 `allow_file_protocol` 时，拦截任何 `file://` 协议端点。
     /// 5. 在 `require_signature` 为 true 时，强制要求至少配置一枚验签公钥。
@@ -503,9 +534,10 @@ impl UpdaterBuilder {
             UpdateError::ManifestParse("构建 Updater 必须提供 current_version".to_string())
         })?;
 
-        if self.endpoints.is_empty() {
+        if self.endpoints.is_empty() && self.provider.is_none() {
             return Err(UpdateError::ManifestParse(
-                "构建 Updater 必须提供至少一个更新端点 (manifest_url 或 endpoints)".to_string(),
+                "构建 Updater 必须提供至少一个更新端点 (manifest_url 或 endpoints) 或配置 provider"
+                    .to_string(),
             ));
         }
 
@@ -533,6 +565,7 @@ impl UpdaterBuilder {
         let config = UpdaterConfig {
             current_version,
             endpoints: self.endpoints,
+            provider: self.provider,
             channel: self.channel,
             public_keys: self.public_keys,
             timeout: self.timeout,
@@ -805,5 +838,19 @@ mod tests {
         let updater = builder.build().unwrap();
         // 验证构建后配置被安全共享
         drop(updater);
+    }
+
+    #[test]
+    fn test_builder_with_provider_without_endpoints() {
+        let updater = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .github_releases("example-org", "example-repo")
+            .require_signature(false)
+            .build()
+            .unwrap();
+
+        assert!(updater.endpoints().is_empty());
+        assert!(updater.provider().is_some());
     }
 }
