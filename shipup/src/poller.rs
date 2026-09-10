@@ -36,6 +36,8 @@ pub struct AutoPollOptions {
     pub check_immediately: bool,
     /// 检测到可用新版本后，是否在后台静默下载并暂存更新包（默认为 true）
     pub silent_download: bool,
+    /// 轮询间隔抖动比例（0.0..=1.0，默认 0.1 即上下浮动 10%），用于打散大规模客户端惊群
+    pub jitter_ratio: f32,
 }
 
 impl Default for AutoPollOptions {
@@ -44,8 +46,36 @@ impl Default for AutoPollOptions {
             interval: Duration::from_secs(4 * 3600), // 默认 4 小时
             check_immediately: true,
             silent_download: true,
+            jitter_ratio: 0.1,
         }
     }
+}
+
+/// 计算应用抖动后的实际休眠时长
+///
+/// # 设计原理
+/// - **实现初衷**：大规模客户端若在同一时刻齐射更新检查，会对更新源造成惊群冲击。
+/// - **核心优势**：在基准间隔上叠加对称随机偏移，平滑分散请求时刻，同时保持期望间隔不变。
+fn compute_jittered_interval(base: Duration, jitter_ratio: f32) -> Duration {
+    let ratio = jitter_ratio.clamp(0.0, 1.0);
+    if ratio <= 0.0 || base.is_zero() {
+        return base;
+    }
+
+    // 生成 [0, 1) 的随机浮点数
+    let mut buf = [0u8; 8];
+    let unit = if getrandom::fill(&mut buf).is_ok() {
+        let bits = u64::from_le_bytes(buf) >> 11; // 取 53 位有效随机位
+        (bits as f64) / ((1u64 << 53) as f64)
+    } else {
+        0.5
+    };
+
+    // 映射到 [-ratio, +ratio]
+    let offset = (unit * 2.0 - 1.0) * f64::from(ratio);
+    let factor = 1.0 + offset;
+    let millis = (base.as_secs_f64() * factor * 1000.0).max(0.0);
+    Duration::from_millis(millis as u64)
 }
 
 impl AutoPollOptions {
@@ -74,6 +104,17 @@ impl AutoPollOptions {
     /// - **关闭场景**：当希望仅通知用户有新版本、并在用户显式点击界面“立即下载”时再发起下载时，可将此项设为 false。
     pub fn silent_download(mut self, silent: bool) -> Self {
         self.silent_download = silent;
+        self
+    }
+
+    /// 设置轮询间隔抖动比例（0.0..=1.0，默认 0.1）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：打散大规模客户端在同一时刻齐射更新检查造成的惊群冲击。
+    /// - **核心优势**：保持期望轮询周期不变，仅对单次休眠时长做对称随机偏移。
+    /// - **代价与局限**：比例过高会拉长最坏情况下的检测延迟；设为 0 可完全关闭抖动。
+    pub fn jitter_ratio(mut self, ratio: f32) -> Self {
+        self.jitter_ratio = ratio.clamp(0.0, 1.0);
         self
     }
 }
@@ -185,9 +226,10 @@ where
                     }
                 }
 
-                // 拆分休眠片，响应毫秒级退出请求
+                // 拆分休眠片，响应毫秒级退出请求；叠加抖动避免惊群
+                let sleep_for = compute_jittered_interval(options.interval, options.jitter_ratio);
                 let slice = Duration::from_millis(500);
-                let total_slices = (options.interval.as_millis() / slice.as_millis()).max(1);
+                let total_slices = (sleep_for.as_millis() / slice.as_millis()).max(1);
                 for _ in 0..total_slices {
                     if worker_stop.load(Ordering::Relaxed) {
                         break;
@@ -264,8 +306,9 @@ where
                 }
             }
 
+            let sleep_for = compute_jittered_interval(options.interval, options.jitter_ratio);
             let slice = Duration::from_millis(500);
-            let total_slices = (options.interval.as_millis() / slice.as_millis()).max(1);
+            let total_slices = (sleep_for.as_millis() / slice.as_millis()).max(1);
             for _ in 0..total_slices {
                 if worker_stop.load(Ordering::Relaxed) {
                     break;
@@ -289,11 +332,33 @@ mod tests {
         let options = AutoPollOptions::default()
             .interval(Duration::from_secs(60))
             .check_immediately(false)
-            .silent_download(false);
+            .silent_download(false)
+            .jitter_ratio(0.25);
 
         assert_eq!(options.interval, Duration::from_secs(60));
         assert!(!options.check_immediately);
         assert!(!options.silent_download);
+        assert!((options.jitter_ratio - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_jittered_interval_bounds() {
+        let base = Duration::from_secs(100);
+        // 关闭抖动时保持原值
+        assert_eq!(compute_jittered_interval(base, 0.0), base);
+
+        // 开启抖动后应落在 [90s, 110s] 区间内
+        for _ in 0..32 {
+            let jittered = compute_jittered_interval(base, 0.1);
+            assert!(jittered >= Duration::from_millis(90_000));
+            assert!(jittered <= Duration::from_millis(110_000));
+        }
+
+        // 零基准间隔保持为零
+        assert_eq!(
+            compute_jittered_interval(Duration::ZERO, 0.1),
+            Duration::ZERO
+        );
     }
 
     #[test]

@@ -375,7 +375,8 @@ use shipup::{AutoPollOptions, AutoPollEvent};
 let poll_options = AutoPollOptions::default()
     .interval(Duration::from_secs(4 * 3600)) // 每 4 小时检查一次
     .check_immediately(true)                // 启动时立即初检
-    .silent_download(true);                 // 发现新版本后后台静默预载
+    .silent_download(true)                  // 发现新版本后后台静默预载
+    .jitter_ratio(0.1);                     // 间隔上下浮动 10%，打散大规模客户端惊群
 
 let handle = updater.start_polling_thread(poll_options, |event| {
     match event {
