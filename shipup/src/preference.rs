@@ -8,6 +8,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// 用户更新偏好持久化文件名（库、CLI 与文档的唯一权威命名）
+pub const PREFERENCE_FILENAME: &str = ".shipup_preference.json";
+
 /// 用户更新意图与提醒偏好配置模型
 ///
 /// # 设计原理
@@ -265,7 +268,7 @@ fn get_user_app_data_dir() -> Option<PathBuf> {
 
 /// 探测获取默认的用户偏好持久化文件路径
 pub(crate) fn default_preference_file_path() -> Option<PathBuf> {
-    resolve_safe_data_dir().map(|dir| dir.join(".shipup_preference.json"))
+    resolve_safe_data_dir().map(|dir| dir.join(PREFERENCE_FILENAME))
 }
 
 #[cfg(test)]

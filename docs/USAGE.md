@@ -597,7 +597,7 @@ let updater = UpdaterBuilder::new()
 ├── myapp.exe.shipup.old           # 物理替换前备份的旧版本（用于自愈回滚与文件锁绕过，由 cleanup_old_backups 回收）
 ├── myapp.exe.{token}.{rnd}.shipup.tmp # 同卷临时写入切片（带高熵随机数防预测与预占投毒）
 ├── shipup.recovery.json           # 启动观察期健康状态机与自愈回滚历史持久化（受 max_rollback_entries 限制）
-└── shipup.preferences.json        # 用户偏好状态（跳过版本、稍后提醒时间戳与客户端唯一匿名 UUID）
+└── .shipup_preference.json        # 用户偏好状态（跳过版本、稍后提醒时间戳与客户端唯一匿名 UUID）
 
 [系统通用临时目录 (如 /tmp 或 %TEMP%)]
 └── shipup_installer_{token}_{rnd}/ # 安装器专用隔离目录（Unix 权限严格限制为 0700 私有模式）

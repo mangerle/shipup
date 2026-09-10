@@ -1397,7 +1397,7 @@ fn handle_sign(args: &SignArgs) -> Result<()> {
 ///
 /// # 设计原理
 /// - **实现初衷**：在客户端现场排错时，快速掌握当前运行目录下的更新偏好、跳过的版本、崩溃计数及可回滚的历史快照。
-/// - **核心优势**：统一汇集 `.shipup.preference`、`.shipup.state` 与 `.shipup.history` 三重元数据，格式化输出。
+/// - **核心优势**：统一汇集 `.shipup_preference.json`、`.shipup.state` 与 `.shipup.history` 三重元数据，格式化输出。
 fn handle_status(args: &StatusArgs) -> Result<()> {
     let state_dir = args
         .dir
@@ -1407,8 +1407,8 @@ fn handle_status(args: &StatusArgs) -> Result<()> {
     println!("================= shipup 客户端运行状态矩阵 =================");
     println!("数据探测目录:     {}", state_dir.display());
 
-    // 1. 读取更新偏好设置
-    let pref_path = state_dir.join(".shipup.preference");
+    // 1. 读取更新偏好设置（文件名与库侧 PREFERENCE_FILENAME 保持一致）
+    let pref_path = state_dir.join(shipup::PREFERENCE_FILENAME);
     if pref_path.exists() {
         let pref = shipup::UpdatePreference::load_from_file(&pref_path);
         println!(
