@@ -50,7 +50,7 @@ pub struct UpdaterConfig {
     pub auto_recover_on_init: bool,
     /// 是否允许不安全的明文 HTTP 传输协议（默认为 false）
     pub dangerous_insecure_transport_protocol: bool,
-    /// 是否强制要求更新包携带数字签名（Release 模式下默认开启）
+    /// 是否强制要求更新包携带数字签名（默认恒为 true，与构建 Profile 无关）
     pub require_signature: bool,
     /// 自定义版本比较器闭包（若未设置则按 SemVer 大于判断）
     pub version_comparator: Option<VersionComparator>,

@@ -265,7 +265,7 @@ let dev_updater = Updater::builder()
 
 ### 5. 发布环境强制安全验签模式
 
-在发布构建（Release Profile）下，`require_signature` 默认为 `true`。若未配置任何公钥或远程发布包缺少数字签名，更新器将拒绝执行并返回错误，彻底杜绝 Fail-Open 漏洞：
+`require_signature` 默认恒为 `true`（与 Debug/Release 构建 Profile 无关，消除环境漂移）。若未配置任何公钥或远程发布包缺少数字签名，更新器将拒绝执行并返回错误，彻底杜绝 Fail-Open 漏洞：
 
 ```rust
 let updater = Updater::builder()
