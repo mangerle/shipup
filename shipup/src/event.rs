@@ -65,6 +65,14 @@ pub enum UpdateEvent {
         reason: String,
     },
 
+    /// 更新已成功登记为下次操作系统重启时延迟执行替换（针对被排他锁定的常驻服务或进程）
+    DeferredToReboot {
+        /// 注册待生效的新版本号
+        version: String,
+        /// 暂存新版二进制以备重启替换的磁盘路径
+        pending_path: std::path::PathBuf,
+    },
+
     /// 更新生命周期已全部圆满完成（包含校验、安装与状态确认）
     Completed,
 }

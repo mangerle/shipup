@@ -60,6 +60,8 @@ pub struct UpdaterConfig {
     pub max_bytes_per_sec: Option<u64>,
     /// 是否允许本地及共享协议（file://，默认为 false）
     pub allow_file_protocol: bool,
+    /// 是否允许在 Windows 原地替换受阻时自动降级为系统重启延迟替换 (MoveFileEx)
+    pub allow_reboot_deferred_replace: bool,
     /// 内嵌 Fallback Manifest 离线容灾兜底元数据
     pub fallback_manifest: Option<Manifest>,
     /// 客户端设备稳定唯一标识（用于灰度放量哈希分桶）
@@ -152,6 +154,7 @@ pub struct UpdaterBuilder {
     pub(crate) preference_path: Option<PathBuf>,
     pub(crate) max_bytes_per_sec: Option<u64>,
     pub(crate) allow_file_protocol: bool,
+    pub(crate) allow_reboot_deferred_replace: bool,
     pub(crate) fallback_manifest: Option<Manifest>,
     pub(crate) client_id: Option<String>,
     pub(crate) max_rollback_entries: usize,
@@ -224,6 +227,7 @@ impl Default for UpdaterBuilder {
             preference_path: None,
             max_bytes_per_sec: None,
             allow_file_protocol: false,
+            allow_reboot_deferred_replace: false,
             fallback_manifest: None,
             client_id: None,
             max_rollback_entries: crate::recovery::DEFAULT_MAX_ROLLBACK_ENTRIES,
@@ -470,6 +474,18 @@ impl UpdaterBuilder {
         Ok(self)
     }
 
+    /// 设置当 Windows 目标可执行程序被占用锁定导致原地替换失败时，是否允许自动降级为系统重启延迟替换 (MoveFileEx)
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：针对 Windows 下常驻后台服务、托盘守护程序或防病毒软件排他锁定导致无法重命名的场景。
+    /// - **核心优势**：利用 Windows 原生 `MoveFileExW(MOVEFILE_DELAY_UNTIL_REBOOT)` 向系统注册替换任务，
+    ///   避免更新主流程直接报错退出，提升常驻服务或被占用进程的更新自愈成功率。
+    /// - **代价与局限**：替换在下一次操作系统重启时生效，需妥善向用户派发提示。
+    pub fn allow_reboot_deferred_replace(mut self, allow: bool) -> Self {
+        self.allow_reboot_deferred_replace = allow;
+        self
+    }
+
     /// 设置内嵌 Fallback Manifest 离线容灾兜底元数据
     ///
     /// # 设计原理
@@ -633,6 +649,7 @@ impl UpdaterBuilder {
             preference_path: self.preference_path,
             max_bytes_per_sec: self.max_bytes_per_sec,
             allow_file_protocol: self.allow_file_protocol,
+            allow_reboot_deferred_replace: self.allow_reboot_deferred_replace,
             fallback_manifest: self.fallback_manifest,
             client_id: self.client_id,
             max_rollback_entries: self.max_rollback_entries,

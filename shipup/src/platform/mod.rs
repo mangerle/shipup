@@ -80,6 +80,49 @@ pub fn replace_binary(new_binary_path: &Path) -> Result<()> {
     }
 }
 
+/// 向操作系统注册重启延迟替换任务（支持 Windows PendingFileRenameOperations）
+///
+/// # 设计原理
+/// - **实现初衷**：为 Windows 平台常驻系统服务、被防病毒软件挂钩或排他锁定的进程提供下次启动生效的替换能力。
+/// - **核心优势**：在操作系统下次引导初期完成原子替换，从系统级解决文件占用冲突。
+/// - **代价与局限**：在非 Windows 平台调用将返回不受支持的错误；替换生效必须经历操作系统重启。
+///
+/// # Errors
+/// 当在非 Windows 平台调用，或底层操作系统调用失败时返回错误。
+pub fn schedule_reboot_replace(source_file: &Path, target_file: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        windows::schedule_reboot_replace(source_file, target_file)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (source_file, target_file);
+        Err(crate::error::UpdateError::SelfReplace(
+            "重启延迟替换机制 (MoveFileEx) 仅在 Windows 操作系统原生支持".to_string(),
+        ))
+    }
+}
+
+/// 向操作系统注册重启延迟删除任务
+///
+/// # Errors
+/// 当在非 Windows 平台调用，或底层操作系统调用失败时返回错误。
+pub fn schedule_reboot_delete(file_to_delete: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        windows::schedule_reboot_delete(file_to_delete)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = file_to_delete;
+        Err(crate::error::UpdateError::SelfReplace(
+            "重启延迟删除机制 (MoveFileEx) 仅在 Windows 操作系统原生支持".to_string(),
+        ))
+    }
+}
+
 /// 拉起外部安装器
 ///
 /// # 设计原理

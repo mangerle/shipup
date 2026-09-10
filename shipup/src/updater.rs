@@ -49,6 +49,7 @@ pub(crate) struct NetworkSecurityConfig {
     pub require_signature: bool,
     pub max_bytes_per_sec: Option<u64>,
     pub allow_file_protocol: bool,
+    pub allow_reboot_deferred_replace: bool,
     pub max_rollback_entries: usize,
     pub root_certificates_pem: Vec<Vec<u8>>,
     pub signature_threshold: usize,
@@ -350,6 +351,7 @@ impl Updater {
                     require_signature: config.require_signature,
                     max_bytes_per_sec: config.max_bytes_per_sec,
                     allow_file_protocol: config.allow_file_protocol,
+                    allow_reboot_deferred_replace: config.allow_reboot_deferred_replace,
                     max_rollback_entries: config.max_rollback_entries,
                     root_certificates_pem: config.root_certificates_pem,
                     signature_threshold: config.signature_threshold,
@@ -1094,6 +1096,7 @@ impl Update {
             release: self.release.clone(),
             downloaded_path: temp_download_path,
             max_rollback_entries: self.config.max_rollback_entries,
+            allow_reboot_deferred_replace: self.config.allow_reboot_deferred_replace,
         })
     }
 
@@ -1230,6 +1233,7 @@ impl Update {
             release: self.release.clone(),
             downloaded_path: temp_download_path,
             max_rollback_entries: self.config.max_rollback_entries,
+            allow_reboot_deferred_replace: self.config.allow_reboot_deferred_replace,
         })
     }
 
@@ -1337,6 +1341,7 @@ pub struct DownloadedUpdate {
     release: ResolvedRelease,
     downloaded_path: PathBuf,
     max_rollback_entries: usize,
+    allow_reboot_deferred_replace: bool,
 }
 
 impl DownloadedUpdate {
@@ -1386,6 +1391,7 @@ impl DownloadedUpdate {
             &self.release,
             &self.downloaded_path,
             self.max_rollback_entries,
+            self.allow_reboot_deferred_replace,
             &mut callback,
         ) {
             Ok(()) => {
@@ -1402,11 +1408,50 @@ impl DownloadedUpdate {
     }
 }
 
+/// 执行二进制替换，若原地替换受阻且配置了允许重启延迟替换则安全降级
+fn perform_replace_with_fallback<F>(
+    new_binary: &Path,
+    version: &str,
+    allow_reboot_deferred: bool,
+    callback: &mut F,
+) -> Result<bool>
+where
+    F: FnMut(UpdateEvent),
+{
+    match replace_binary(new_binary) {
+        Ok(()) => Ok(false),
+        Err(e) => {
+            #[cfg(windows)]
+            if allow_reboot_deferred {
+                log::warn!(
+                    "Windows 原地替换可执行程序受阻 ({e})，尝试降级为系统重启延迟替换 (MoveFileEx)..."
+                );
+                let current_exe = std::env::current_exe()?;
+                let parent = current_exe.parent().unwrap_or_else(|| Path::new("."));
+                let pending_path =
+                    parent.join(format!(".shipup_reboot_pending_{}.exe", std::process::id()));
+                fs::copy(new_binary, &pending_path)?;
+                crate::platform::schedule_reboot_replace(&pending_path, &current_exe)?;
+                callback(UpdateEvent::DeferredToReboot {
+                    version: version.to_string(),
+                    pending_path,
+                });
+                return Ok(true);
+            }
+            #[cfg(not(windows))]
+            let _ = (version, allow_reboot_deferred);
+
+            Err(e)
+        }
+    }
+}
+
 fn apply_downloaded_payload<F>(
     current_version: &Version,
     release: &ResolvedRelease,
     temp_path: &Path,
     max_rollback_entries: usize,
+    allow_reboot_deferred_replace: bool,
     callback: &mut F,
 ) -> Result<()>
 where
@@ -1416,7 +1461,12 @@ where
         PackageType::Binary => {
             callback(UpdateEvent::Installing);
             let backup_path = prepare_backup_before_replace(current_version)?;
-            replace_binary(temp_path)?;
+            let is_deferred = perform_replace_with_fallback(
+                temp_path,
+                &release.version.to_string(),
+                allow_reboot_deferred_replace,
+                callback,
+            )?;
             let _ = fs::remove_file(temp_path);
             record_state_if_possible(
                 current_version,
@@ -1424,7 +1474,9 @@ where
                 backup_path.as_deref(),
                 max_rollback_entries,
             );
-            callback(UpdateEvent::ReadyToRestart);
+            if !is_deferred {
+                callback(UpdateEvent::ReadyToRestart);
+            }
         }
         PackageType::Archive => {
             callback(UpdateEvent::ExtractingArchive);
@@ -1438,7 +1490,7 @@ where
                 .unwrap_or_else(|| Path::new("."))
                 .join(sandbox_name);
 
-            let apply_result = (|| -> Result<Option<PathBuf>> {
+            let apply_result = (|| -> Result<(Option<PathBuf>, bool)> {
                 let extracted_binary = extract_archive(
                     temp_path,
                     &sandbox_dir,
@@ -1455,13 +1507,18 @@ where
                 }
 
                 let backup_path = prepare_backup_before_replace(current_version)?;
-                replace_binary(&extracted_binary)?;
-                Ok(backup_path)
+                let is_deferred = perform_replace_with_fallback(
+                    &extracted_binary,
+                    &release.version.to_string(),
+                    allow_reboot_deferred_replace,
+                    callback,
+                )?;
+                Ok((backup_path, is_deferred))
             })();
 
             let _ = fs::remove_dir_all(&sandbox_dir);
             let _ = fs::remove_file(temp_path);
-            let backup_path = apply_result?;
+            let (backup_path, is_deferred) = apply_result?;
 
             record_state_if_possible(
                 current_version,
@@ -1469,7 +1526,9 @@ where
                 backup_path.as_deref(),
                 max_rollback_entries,
             );
-            callback(UpdateEvent::ReadyToRestart);
+            if !is_deferred {
+                callback(UpdateEvent::ReadyToRestart);
+            }
         }
         PackageType::Installer => {
             callback(UpdateEvent::Installing);
@@ -1844,6 +1903,7 @@ mod tests {
             release,
             downloaded_path: temp_path.clone(),
             max_rollback_entries: crate::recovery::DEFAULT_MAX_ROLLBACK_ENTRIES,
+            allow_reboot_deferred_replace: false,
         };
 
         assert_eq!(downloaded.version(), &Version::parse("1.2.0").unwrap());
@@ -2319,6 +2379,7 @@ mod tests {
                 require_signature: false, // 即使显式设置了 false，因配置了公钥，也绝不允许未签名放行！
                 max_bytes_per_sec: None,
                 allow_file_protocol: true,
+                allow_reboot_deferred_replace: false,
                 max_rollback_entries: 3,
                 root_certificates_pem: Vec::new(),
                 signature_threshold: 1,
@@ -2377,6 +2438,7 @@ mod tests {
                 require_signature: true, // 强制验签但无公钥
                 max_bytes_per_sec: None,
                 allow_file_protocol: true,
+                allow_reboot_deferred_replace: false,
                 max_rollback_entries: 3,
                 root_certificates_pem: Vec::new(),
                 signature_threshold: 1,

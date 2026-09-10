@@ -43,7 +43,7 @@ pub use offline::{
 };
 pub use platform::{
     InstallerOptions, cleanup_old_backups, get_same_volume_temp_path, get_temp_download_path,
-    spawn_installer,
+    schedule_reboot_delete, schedule_reboot_replace, spawn_installer,
 };
 #[cfg(feature = "async")]
 pub use poller::spawn_polling_task;

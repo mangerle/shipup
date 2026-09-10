@@ -162,6 +162,8 @@ mod ffi {
     use std::ffi::c_void;
 
     pub const SW_SHOWNORMAL: i32 = 1;
+    pub const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    pub const MOVEFILE_DELAY_UNTIL_REBOOT: u32 = 0x0000_0004;
 
     #[link(name = "shell32")]
     unsafe extern "system" {
@@ -174,6 +176,76 @@ mod ffi {
             nShowCmd: i32,
         ) -> *mut c_void;
     }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn MoveFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            dwFlags: u32,
+        ) -> i32;
+    }
+}
+
+/// 向 Windows 内核注册系统重启延迟替换任务 (MoveFileExW PendingFileRenameOperations)
+///
+/// # 设计原理
+/// - **实现初衷**：针对 Windows 下常驻服务、排他句柄锁定或安全杀软拦截导致原地替换失败的场景，
+///   交由 Windows 内核在下次引导启动阶段自动完成原子文件替换。
+/// - **核心优势**：直接写入系统级待处理重命名队列，绕过运行期文件锁限制，保障核心服务的更新闭环。
+/// - **代价与局限**：替换仅在机器或服务重启后生效；待替换的临时文件需保持存放在重启前可访问的磁盘分区上。
+///
+/// # Errors
+/// 当底层 Windows 系统调用 `MoveFileExW` 失败时返回 [`UpdateError::SelfReplace`]。
+pub fn schedule_reboot_replace(source_file: &Path, target_file: &Path) -> Result<()> {
+    let src_wide = to_wide_null(&source_file.to_string_lossy());
+    let dst_wide = to_wide_null(&target_file.to_string_lossy());
+    let flags = ffi::MOVEFILE_DELAY_UNTIL_REBOOT | ffi::MOVEFILE_REPLACE_EXISTING;
+
+    let res = unsafe { ffi::MoveFileExW(src_wide.as_ptr(), dst_wide.as_ptr(), flags) };
+    if res == 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(UpdateError::SelfReplace(format!(
+            "向 Windows 注册系统重启替换任务失败，源文件: {}，目标文件: {}，系统错误: {err}",
+            source_file.display(),
+            target_file.display()
+        )));
+    }
+
+    log::info!(
+        "已成功向 Windows 系统登记重启延迟替换任务: {} -> {}",
+        source_file.display(),
+        target_file.display()
+    );
+    Ok(())
+}
+
+/// 向 Windows 内核注册系统重启延迟删除任务 (MoveFileExW NULL)
+///
+/// # 设计原理
+/// - **实现初衷**：在 Windows 下当无法立即销毁旧版本残留文件时，注册为重启后自动清理。
+/// - **核心优势**：系统底层保障安全销毁，杜绝孤儿旧版本堆积。
+///
+/// # Errors
+/// 当底层 Windows 系统调用 `MoveFileExW` 失败时返回 [`UpdateError::SelfReplace`]。
+pub fn schedule_reboot_delete(file_to_delete: &Path) -> Result<()> {
+    let path_wide = to_wide_null(&file_to_delete.to_string_lossy());
+    let flags = ffi::MOVEFILE_DELAY_UNTIL_REBOOT;
+
+    let res = unsafe { ffi::MoveFileExW(path_wide.as_ptr(), std::ptr::null(), flags) };
+    if res == 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(UpdateError::SelfReplace(format!(
+            "向 Windows 注册系统重启删除任务失败，目标文件: {}，系统错误: {err}",
+            file_to_delete.display()
+        )));
+    }
+
+    log::info!(
+        "已成功向 Windows 系统登记重启延迟删除任务: {}",
+        file_to_delete.display()
+    );
+    Ok(())
 }
 
 /// 将字符串安全转换为以空字符（0u16）结尾的 UTF-16 宽字符序列
@@ -458,5 +530,29 @@ mod tests {
             args,
             vec!["/i", "C:\\temp\\installer.msi", "/qn", "/norestart"]
         );
+    }
+
+    #[test]
+    fn test_schedule_reboot_replace_and_delete_api() {
+        let temp_dir = std::env::temp_dir();
+        let src = temp_dir.join(format!("test_src_{}.exe", std::process::id()));
+        let dst = temp_dir.join(format!("test_dst_{}.exe", std::process::id()));
+        let _ = fs::write(&src, b"src content");
+        let _ = fs::write(&dst, b"dst content");
+
+        let res = schedule_reboot_replace(&src, &dst);
+        if let Err(e) = res {
+            let msg = e.to_string();
+            assert!(msg.contains("向 Windows 注册系统重启替换任务失败"));
+        }
+
+        let res_del = schedule_reboot_delete(&src);
+        if let Err(e) = res_del {
+            let msg = e.to_string();
+            assert!(msg.contains("向 Windows 注册系统重启删除任务失败"));
+        }
+
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&dst);
     }
 }
