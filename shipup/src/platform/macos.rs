@@ -150,7 +150,8 @@ pub fn replace_current_binary(new_binary_path: &Path) -> Result<()> {
 /// 构建 macOS 安装器执行命令
 ///
 /// # 设计原理
-/// - **实现初衷**：针对 `.pkg` 安装包且要求提权场景，通过 `osascript` 唤起 macOS 系统原生管理员凭据对话框；其他场景通过 `open` 命令直接交给系统分发。
+/// - **实现初衷**：针对 `.pkg` 且要求提权的场景，通过 `osascript` 唤起系统管理员凭据对话框；
+///   `.pkg` / `.dmg` 通过 `open` 交给系统 Installer / 磁盘映像挂载；通用可执行文件或脚本直接派生执行。
 pub(crate) fn build_macos_installer_command(
     installer_path: &Path,
     user_args: &[String],
@@ -162,21 +163,30 @@ pub(crate) fn build_macos_installer_command(
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    if ext == "pkg" && require_elevation {
-        let script = format!(
-            "do shell script \"installer -pkg '{}' -target /\" with administrator privileges",
-            installer_path.display()
-        );
-        let mut cmd = Command::new("osascript");
-        cmd.arg("-e").arg(script);
-        cmd
-    } else {
-        let mut cmd = Command::new("open");
-        if !user_args.is_empty() {
-            cmd.args(user_args);
+    match ext.as_str() {
+        "pkg" if require_elevation => {
+            let script = format!(
+                "do shell script \"installer -pkg '{}' -target /\" with administrator privileges",
+                installer_path.display()
+            );
+            let mut cmd = Command::new("osascript");
+            cmd.arg("-e").arg(script);
+            cmd
         }
-        cmd.arg(installer_path);
-        cmd
+        "pkg" | "dmg" => {
+            let mut cmd = Command::new("open");
+            if !user_args.is_empty() {
+                cmd.args(user_args);
+            }
+            cmd.arg(installer_path);
+            cmd
+        }
+        _ => {
+            // 通用可执行文件或更新脚本：直接派生，避免 open 误交给默认应用
+            let mut cmd = Command::new(installer_path);
+            cmd.args(user_args);
+            cmd
+        }
     }
 }
 
