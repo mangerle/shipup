@@ -541,6 +541,7 @@ where
     }
 }
 
+#[cfg(feature = "blocking")]
 fn verify_chunked_payload_file(options: &DownloadOptions<'_>) -> Result<()> {
     if let Some(expected_size) = options.expected_size {
         let actual_size = fs::metadata(options.target_path)
@@ -1342,6 +1343,7 @@ async fn download_single_chunk_async(
     cancel_flag: Option<Arc<AtomicBool>>,
     tx: tokio::sync::mpsc::Sender<ChunkWorkerMessage>,
 ) -> Result<()> {
+    use std::io::SeekFrom;
     use tokio::io::AsyncSeekExt;
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
