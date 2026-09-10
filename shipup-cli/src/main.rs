@@ -44,6 +44,21 @@ enum Commands {
 
     /// 查看并格式化解析 Manifest 元数据详情
     Inspect(InspectArgs),
+
+    /// 快速初始化生成发布配置模板文件
+    Init(InitArgs),
+
+    /// 对指定安装包物理文件直接生成 SHA-256 摘要与 Ed25519 数字签名
+    Sign(SignArgs),
+
+    /// 查看目标环境下的更新偏好、崩溃自愈观察状态与历史回滚矩阵
+    Status(StatusArgs),
+
+    /// 手动执行版本回滚至指定的历史版本或上一可用版本
+    Rollback(RollbackArgs),
+
+    /// 安全清理目标目录下的历史旧版本备份文件与更新残留碎片
+    Clean(CleanArgs),
 }
 
 /// 批量发布配置文件结构
@@ -216,6 +231,70 @@ struct InspectArgs {
     channel: Option<String>,
 }
 
+/// 快速初始化发布配置脚手架参数结构体
+#[derive(clap::Args, Debug, Clone)]
+struct InitArgs {
+    /// 配置文件输出路径（默认为 ./shipup.toml）
+    #[arg(short, long, default_value = "shipup.toml")]
+    output: PathBuf,
+
+    /// 是否强制覆盖已存在的目标文件
+    #[arg(short, long, default_value_t = false)]
+    force: bool,
+}
+
+/// 独立安装包物理文件签名参数结构体
+#[derive(clap::Args, Debug, Clone)]
+struct SignArgs {
+    /// 待签名的安装包物理文件路径
+    #[arg(short, long)]
+    file: PathBuf,
+
+    /// Ed25519 私钥文件路径
+    #[arg(short, long, visible_alias = "key-path")]
+    key: PathBuf,
+
+    /// 签名输出文件路径（可选，若未指定则输出至标准终端）
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
+
+/// 客户端更新状态矩阵查看参数结构体
+#[derive(clap::Args, Debug, Clone)]
+struct StatusArgs {
+    /// 状态数据存放目录（若未指定则自动探测系统默认数据目录或当前目录）
+    #[arg(short, long)]
+    dir: Option<PathBuf>,
+}
+
+/// 手动版本回滚参数结构体
+#[derive(clap::Args, Debug, Clone)]
+struct RollbackArgs {
+    /// 目标回滚版本号（SemVer，例如 1.1.0；若未指定则自动回退至上一可用版本）
+    #[arg(short, long)]
+    target: Option<String>,
+
+    /// 目标宿主程序可执行文件路径（可选，默认为当前可执行程序）
+    #[arg(short, long)]
+    exe: Option<PathBuf>,
+
+    /// 回滚历史与状态存储目录（可选）
+    #[arg(short, long)]
+    dir: Option<PathBuf>,
+}
+
+/// 孤儿旧版本备份与碎片清理参数结构体
+#[derive(clap::Args, Debug, Clone)]
+struct CleanArgs {
+    /// 待清理的目标目录（默认为当前工作目录）
+    #[arg(short, long, default_value = ".")]
+    dir: PathBuf,
+
+    /// 是否仅演练显示待清理文件，不执行实际磁盘物理删除
+    #[arg(short, long, default_value_t = false)]
+    dry_run: bool,
+}
+
 fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
@@ -232,6 +311,21 @@ fn main() -> Result<()> {
         }
         Commands::Inspect(args) => {
             handle_inspect(&args)?;
+        }
+        Commands::Init(args) => {
+            handle_init(&args)?;
+        }
+        Commands::Sign(args) => {
+            handle_sign(&args)?;
+        }
+        Commands::Status(args) => {
+            handle_status(&args)?;
+        }
+        Commands::Rollback(args) => {
+            handle_rollback(&args)?;
+        }
+        Commands::Clean(args) => {
+            handle_clean(&args)?;
         }
     }
 
@@ -1167,6 +1261,324 @@ fn save_manifest_file(manifest_path: &Path, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+/// 执行初始化命令生成发布配置脚手架
+///
+/// # 设计原理
+/// - **实现初衷**：为新接入的项目提供开箱即用的标准 `shipup.toml` 配置脚手架，减少手工排版与参数遗漏。
+/// - **核心优势**：默认提供全平台预设结构与详尽注释，兼具规范性与指引价值。
+/// - **代价与局限**：若目标文件已存在默认拒绝覆写，需显式声明 `--force`。
+fn handle_init(args: &InitArgs) -> Result<()> {
+    if args.output.exists() && !args.force {
+        return Err(anyhow!(
+            "目标配置文件已存在: {}，若需覆盖请追加 --force 参数",
+            args.output.display()
+        ));
+    }
+
+    let default_template = r#"# shipup 跨平台自更新发布配置文件
+version = "1.0.0"
+notes = "版本更新说明：常规性能优化与缺陷修复"
+pub_date = "" # 留空将在发布时自动注入当前 UTC 时间
+min_supported_version = "0.9.0"
+force_update = false
+channel = "stable"
+rollout_percentage = 100
+key = "./keys/ed25519.key"
+manifest = "latest.json"
+
+[[packages]]
+target = "x86_64-pc-windows-msvc"
+package = "./dist/myapp-1.0.0-windows-x64.zip"
+package_type = "archive"
+url = "https://download.example.com/myapp-1.0.0-windows-x64.zip"
+executable_path = "myapp.exe"
+
+[[packages]]
+target = "aarch64-apple-darwin"
+package = "./dist/myapp-1.0.0-macos-arm64.tar.gz"
+package_type = "archive"
+url = "https://download.example.com/myapp-1.0.0-macos-arm64.tar.gz"
+executable_path = "myapp"
+
+[[packages]]
+target = "x86_64-unknown-linux-gnu"
+package = "./dist/myapp-1.0.0-linux-x64.tar.gz"
+package_type = "archive"
+url = "https://download.example.com/myapp-1.0.0-linux-x64.tar.gz"
+executable_path = "myapp"
+"#;
+
+    if let Some(parent) = args.output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建配置输出父目录失败: {}", parent.display()))?;
+    }
+
+    fs::write(&args.output, default_template)
+        .with_context(|| format!("写入配置文件失败: {}", args.output.display()))?;
+
+    log::info!("成功生成发布配置模板: {}", args.output.display());
+    println!("成功生成发布配置模板: {}", args.output.display());
+    Ok(())
+}
+
+/// 执行单独文件的 SHA-256 计算与 Ed25519 签名生成
+///
+/// # 设计原理
+/// - **实现初衷**：满足将 shipup 签名能力无缝嵌入第三方流水线（如 GitHub Actions、GitLab CI）的场景。
+/// - **核心优势**：直接输出 Base64 签名字符串并支持写入 `.sig` 文件，无需完整生成 Manifest 即可完成鉴权验签集成。
+/// - **代价与局限**：需要调用方显式指定 Ed25519 私钥路径。
+fn handle_sign(args: &SignArgs) -> Result<()> {
+    if !args.file.exists() {
+        return Err(anyhow!("待签名物理文件不存在: {}", args.file.display()));
+    }
+    let (checksum, opt_sig) = compute_payload_integrity(&args.file, Some(&args.key))?;
+    let sig_b64 = opt_sig.ok_or_else(|| anyhow!("数字签名生成失败"))?;
+    let file_size = fs::metadata(&args.file)
+        .with_context(|| format!("获取文件元数据失败: {}", args.file.display()))?
+        .len();
+
+    println!("=================== shipup 独立签名结果 ===================");
+    println!("文件路径:       {}", args.file.display());
+    println!("文件大小:       {} 字节", file_size);
+    println!("SHA-256:        {}", checksum);
+    println!("Ed25519 签名:   {}", sig_b64);
+    println!("===========================================================");
+
+    if let Some(ref out_path) = args.output {
+        if let Some(parent) = out_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("创建签名输出父目录失败: {}", parent.display()))?;
+        }
+        fs::write(out_path, &sig_b64)
+            .with_context(|| format!("写入签名输出文件失败: {}", out_path.display()))?;
+        println!("数字签名已保存至: {}", out_path.display());
+    }
+
+    Ok(())
+}
+
+/// 执行客户端更新状态、偏好设置与回滚矩阵查看
+///
+/// # 设计原理
+/// - **实现初衷**：在客户端现场排错时，快速掌握当前运行目录下的更新偏好、跳过的版本、崩溃计数及可回滚的历史快照。
+/// - **核心优势**：统一汇集 `.shipup.preference`、`.shipup.state` 与 `.shipup.history` 三重元数据，格式化输出。
+fn handle_status(args: &StatusArgs) -> Result<()> {
+    let state_dir = args
+        .dir
+        .clone()
+        .unwrap_or_else(|| shipup::resolve_safe_data_dir().unwrap_or_else(|| PathBuf::from(".")));
+
+    println!("================= shipup 客户端运行状态矩阵 =================");
+    println!("数据探测目录:     {}", state_dir.display());
+
+    // 1. 读取更新偏好设置
+    let pref_path = state_dir.join(".shipup.preference");
+    if pref_path.exists() {
+        let pref = shipup::UpdatePreference::load_from_file(&pref_path);
+        println!(
+            "客户端唯一 ID:    {}",
+            pref.client_id.as_deref().unwrap_or("未生成")
+        );
+        println!(
+            "已知清单版本序号: {}",
+            pref.last_version_seq
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "无记录".to_string())
+        );
+        let skipped_str = if pref.skipped_versions.is_empty() {
+            "无".to_string()
+        } else {
+            pref.skipped_versions
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!("跳过的版本列表:   {}", skipped_str);
+        let snooze_str = if let Some(ts) = pref.snooze_until {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if ts > now {
+                format!("静默中（截止时间戳: {}）", ts)
+            } else {
+                "已过期".to_string()
+            }
+        } else {
+            "未设置".to_string()
+        };
+        println!("稍后提醒静默期:   {}", snooze_str);
+    } else {
+        println!("更新偏好文件:     未生成（默认空）");
+    }
+
+    // 2. 读取崩溃自愈观察期状态
+    let state_path = state_dir.join(".shipup.state");
+    if state_path.exists() {
+        let content = fs::read_to_string(&state_path).unwrap_or_default();
+        if let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) {
+            let target = state["target_version"].as_str().unwrap_or("未知");
+            let attempts = state["launch_attempts"].as_u64().unwrap_or(0);
+            println!(
+                "更新自愈观察期:   处于观察期（目标版本: {}, 启动计数: {}）",
+                target, attempts
+            );
+        } else {
+            println!("更新自愈观察期:   状态文件格式解析异常");
+        }
+    } else {
+        println!("更新自愈观察期:   正常（无未确认的更新状态）");
+    }
+
+    // 3. 读取历史回滚记录
+    let history = shipup::load_rollback_history(&state_dir);
+    println!("可回滚历史版本数: {}", history.entries.len());
+    for (i, entry) in history.entries.iter().enumerate() {
+        let exists_str = if entry.backup_path.exists() {
+            "物理文件正常"
+        } else {
+            "备份文件缺失"
+        };
+        println!(
+            "  [{}] 版本: {} | 备份时间戳: {} | 状态: {} | 路径: {}",
+            i + 1,
+            entry.version,
+            entry.backed_up_at,
+            exists_str,
+            entry.backup_path.display()
+        );
+    }
+    println!("===========================================================");
+
+    Ok(())
+}
+
+/// 执行手动版本回滚
+///
+/// # 设计原理
+/// - **实现初衷**：在生产环境中为运维人员提供确定的命令行一键回滚手段，不必等待连续崩溃被动自愈。
+/// - **核心优势**：自动校验物理备份文件完整性，执行原地原子替换，并在完成后自动解除观察期标记。
+fn handle_rollback(args: &RollbackArgs) -> Result<()> {
+    let state_dir = args
+        .dir
+        .clone()
+        .unwrap_or_else(|| shipup::resolve_safe_data_dir().unwrap_or_else(|| PathBuf::from(".")));
+
+    let target_version = if let Some(ref ver_str) = args.target {
+        Version::parse(ver_str).with_context(|| format!("解析目标回滚版本号失败: {}", ver_str))?
+    } else {
+        let available = shipup::list_available_rollback_versions(&state_dir);
+        available.first().cloned().ok_or_else(|| {
+            anyhow!(
+                "在目标目录 '{}' 中未发现任何可用的历史备份版本",
+                state_dir.display()
+            )
+        })?
+    };
+
+    let exe_path = if let Some(ref p) = args.exe {
+        p.clone()
+    } else {
+        std::env::current_exe().context("获取当前运行可执行文件路径失败，请显式提供 --exe 参数")?
+    };
+
+    log::info!(
+        "开始执行手动版本回滚: 目标版本 {}, 宿主程序 {}",
+        target_version,
+        exe_path.display()
+    );
+
+    shipup::execute_manual_rollback_to(&state_dir, &exe_path, &target_version)
+        .with_context(|| format!("回滚至版本 {} 失败", target_version))?;
+
+    println!(
+        "版本回滚执行成功: 已将程序恢复至历史稳定版本 {}",
+        target_version
+    );
+    Ok(())
+}
+
+/// 执行孤儿备份与历史替换碎片清理
+///
+/// # 设计原理
+/// - **实现初衷**：自更新完成后遗留的 `.old`、`.bak` 临时文件在长期运行后可能占用磁盘空间，提供安全清理工具。
+/// - **核心优势**：支持 `--dry-run` 预览待清理清单，避免误删正在被自愈系统跟踪引用的活跃备份。
+fn handle_clean(args: &CleanArgs) -> Result<()> {
+    if !args.dir.exists() {
+        return Err(anyhow!("目标清理目录不存在: {}", args.dir.display()));
+    }
+
+    let entries =
+        fs::read_dir(&args.dir).with_context(|| format!("读取目录失败: {}", args.dir.display()))?;
+
+    let mut clean_targets = Vec::new();
+    let mut total_bytes = 0u64;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            let is_match = file_name.ends_with(".old")
+                || file_name.ends_with(".bak")
+                || file_name.starts_with(".shipup_tmp_")
+                || file_name.contains(".shipup_old_");
+
+            if is_match {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                total_bytes = total_bytes.saturating_add(size);
+                clean_targets.push((path, size));
+            }
+        }
+    }
+
+    if clean_targets.is_empty() {
+        println!(
+            "目录 '{}' 中未检测到任何可清理的历史备份或临时碎片文件",
+            args.dir.display()
+        );
+        return Ok(());
+    }
+
+    println!("================= shipup 历史备份清理扫描 =================");
+    println!("扫描目录:       {}", args.dir.display());
+    println!("匹配碎片文件数: {}", clean_targets.len());
+    println!("预计释放空间:   {} 字节", total_bytes);
+    println!("-----------------------------------------------------------");
+
+    for (p, s) in &clean_targets {
+        println!("  - {} ({} 字节)", p.display(), s);
+    }
+    println!("===========================================================");
+
+    if args.dry_run {
+        println!("提示: 当前处于演练模式 (--dry-run)，未执行实际删除");
+        return Ok(());
+    }
+
+    let mut success_count = 0usize;
+    for (p, _) in clean_targets {
+        if let Err(e) = fs::remove_file(&p) {
+            log::warn!("清理文件失败: {}, 错误: {}", p.display(), e);
+        } else {
+            success_count = success_count.saturating_add(1);
+        }
+    }
+
+    println!(
+        "清理完毕: 成功删除 {} 个历史文件，释放约 {} 字节",
+        success_count, total_bytes
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1468,6 +1880,152 @@ executable_path = "myapp"
         let rel_ts = res_relative.unwrap();
         assert_eq!(rel_ts.len(), 20);
         assert!(rel_ts.ends_with('Z'));
+        Ok(())
+    }
+
+    #[test]
+    fn test_cli_init_command() -> Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("test_cli_init_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir)?;
+        let out_toml = temp_dir.join("shipup.toml");
+
+        // 1. 首次初始化生成成功
+        handle_init(&InitArgs {
+            output: out_toml.clone(),
+            force: false,
+        })?;
+        assert!(out_toml.exists());
+        let content = fs::read_to_string(&out_toml)?;
+        assert!(content.contains("version = \"1.0.0\""));
+        assert!(content.contains("[[packages]]"));
+
+        // 2. 未加 --force 重复初始化应报错拦截
+        let err = handle_init(&InitArgs {
+            output: out_toml.clone(),
+            force: false,
+        });
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("已存在"));
+
+        // 3. 追加 --force 允许覆盖
+        handle_init(&InitArgs {
+            output: out_toml,
+            force: true,
+        })?;
+
+        let _ = fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cli_sign_command() -> Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("test_cli_sign_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir)?;
+
+        // 生成测试密钥
+        let keys_dir = temp_dir.join("keys");
+        handle_keygen(&keys_dir)?;
+        let key_path = keys_dir.join("ed25519.key");
+        let pub_path = keys_dir.join("ed25519.pub");
+
+        // 准备待签名文件
+        let test_bin = temp_dir.join("app.bin");
+        fs::write(&test_bin, b"binary content for signing test")?;
+
+        let sig_out = temp_dir.join("app.bin.sig");
+        handle_sign(&SignArgs {
+            file: test_bin.clone(),
+            key: key_path,
+            output: Some(sig_out.clone()),
+        })?;
+
+        assert!(sig_out.exists());
+        let sig_b64 = fs::read_to_string(&sig_out)?;
+        let pub_b64 = fs::read_to_string(&pub_path)?;
+
+        // 使用 shipup 内置签名验证能力检验生成的独立签名合法性
+        let pub_bytes = BASE64.decode(pub_b64.trim())?;
+        let pub_array: [u8; 32] = pub_bytes.as_slice().try_into().unwrap();
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pub_array).unwrap();
+
+        let sig_bytes = BASE64.decode(sig_b64.trim())?;
+        let sig_array: [u8; 64] = sig_bytes.as_slice().try_into().unwrap();
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_array);
+
+        let (checksum, _) = compute_payload_integrity(&test_bin, None)?;
+        let hex_str = checksum.strip_prefix("sha256:").unwrap();
+        let mut raw_digest = [0u8; 32];
+        for i in 0..32 {
+            raw_digest[i] = u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16).unwrap();
+        }
+
+        verifying_key
+            .verify_strict(&raw_digest, &signature)
+            .expect("生成的 Ed25519 签名验证应当通过");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cli_status_rollback_and_clean_flow() -> Result<()> {
+        let temp_dir = std::env::temp_dir().join(format!("test_cli_ops_{}", std::process::id()));
+        fs::create_dir_all(&temp_dir)?;
+
+        // 1. 初始化假主程序与假备份文件
+        let exe_path = temp_dir.join("myapp.exe");
+        fs::write(&exe_path, b"v2.0.0 corrupted current binary")?;
+
+        let backup_v1 = temp_dir.join("myapp.v1.0.0.bak");
+        fs::write(&backup_v1, b"v1.0.0 healthy backup binary")?;
+
+        // 2. 写入历史版本回滚文件
+        shipup::record_rollback_version(
+            &temp_dir,
+            &Version::parse("1.0.0").unwrap(),
+            &backup_v1,
+            3,
+        )?;
+
+        // 3. 测试 status 正常执行
+        handle_status(&StatusArgs {
+            dir: Some(temp_dir.clone()),
+        })?;
+
+        // 4. 测试 rollback
+        handle_rollback(&RollbackArgs {
+            target: Some("1.0.0".to_string()),
+            exe: Some(exe_path.clone()),
+            dir: Some(temp_dir.clone()),
+        })?;
+
+        // 验证主程序已被原子替换回备份内容
+        let restored_content = fs::read(&exe_path)?;
+        assert_eq!(restored_content, b"v1.0.0 healthy backup binary");
+
+        // 5. 制造残留碎片测试 clean
+        let orphan_file1 = temp_dir.join("test_orphan.old");
+        let orphan_file2 = temp_dir.join(".shipup_tmp_123");
+        fs::write(&orphan_file1, b"orphan old")?;
+        fs::write(&orphan_file2, b"orphan tmp")?;
+
+        // 演练模式不删除
+        handle_clean(&CleanArgs {
+            dir: temp_dir.clone(),
+            dry_run: true,
+        })?;
+        assert!(orphan_file1.exists());
+        assert!(orphan_file2.exists());
+
+        // 实际删除
+        handle_clean(&CleanArgs {
+            dir: temp_dir.clone(),
+            dry_run: false,
+        })?;
+        assert!(!orphan_file1.exists());
+        assert!(!orphan_file2.exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
         Ok(())
     }
 }

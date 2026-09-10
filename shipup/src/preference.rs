@@ -195,7 +195,7 @@ pub(crate) fn current_unix_timestamp() -> u64 {
 /// # 设计原理
 /// - **实现初衷**：在 Windows `C:\Program Files` 或 Linux `/usr/bin` 等受限安装路径下，程序同级目录对标准用户只读。
 /// - **核心优势**：优先在程序同级写入以保持便携免安装应用的内聚性；遇到权限受限时，自动优雅降级至操作系统本地用户数据目录（如 `%LOCALAPPDATA%`），绝不崩溃或静默丢失配置。
-pub(crate) fn resolve_safe_data_dir() -> Option<PathBuf> {
+pub fn resolve_safe_data_dir() -> Option<PathBuf> {
     if let Ok(current_exe) = std::env::current_exe()
         && let Some(parent) = current_exe.parent()
     {

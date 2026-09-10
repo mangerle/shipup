@@ -45,7 +45,7 @@ pub use poller::spawn_polling_task;
 #[cfg(feature = "blocking")]
 pub use poller::spawn_polling_thread;
 pub use poller::{AutoPollEvent, AutoPollOptions, AutoPollerHandle};
-pub use preference::UpdatePreference;
+pub use preference::{UpdatePreference, resolve_safe_data_dir};
 pub use provider::{GitHubProvider, ProviderClientOptions, ReleaseProvider};
 pub use recovery::{
     DEFAULT_MAX_ROLLBACK_ENTRIES, HealthCheckStatus, ROLLBACK_HISTORY_FILENAME, RollbackEntry,
