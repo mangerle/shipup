@@ -599,6 +599,7 @@ mod tests {
                 install_args: Vec::new(),
                 require_elevation: false,
                 wait_for_exit: false,
+                payload_checksums: Default::default(),
                 install_mode: None,
             },
         );
@@ -663,6 +664,7 @@ mod tests {
                 install_args: Vec::new(),
                 require_elevation: false,
                 wait_for_exit: false,
+                payload_checksums: Default::default(),
                 install_mode: None,
             },
         );

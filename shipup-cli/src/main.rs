@@ -809,6 +809,7 @@ fn handle_release(args: &ReleaseArgs) -> Result<()> {
         executable_path: args.executable_path.clone(),
         require_elevation: args.require_elevation,
         wait_for_exit: args.wait_for_exit,
+        payload_checksums: Default::default(),
         size: Some(package_size),
     };
 
@@ -982,6 +983,7 @@ fn handle_batch_release(config_path: &Path, default_manifest_path: &Path) -> Res
             executable_path: pkg.executable_path.clone(),
             require_elevation: pkg.require_elevation,
             wait_for_exit: pkg.wait_for_exit,
+            payload_checksums: Default::default(),
             size: Some(package_size),
         };
 
@@ -1792,6 +1794,7 @@ mod tests {
                 executable_path: None,
                 require_elevation: false,
                 wait_for_exit: false,
+                payload_checksums: Default::default(),
                 size: None,
             },
         };
@@ -1851,6 +1854,7 @@ mod tests {
                 executable_path: None,
                 require_elevation: false,
                 wait_for_exit: false,
+                payload_checksums: Default::default(),
                 size: None,
             },
         };
@@ -2205,6 +2209,7 @@ executable_path = "myapp"
                 install_args: Vec::new(),
                 require_elevation: false,
                 wait_for_exit: false,
+                payload_checksums: Default::default(),
                 install_mode: None,
             },
         );

@@ -136,6 +136,7 @@ fn test_tamper_detection_on_any_nested_manifest_component() {
                     executable_path: None,
                     require_elevation: false,
                     wait_for_exit: false,
+                    payload_checksums: Default::default(),
                     size: None,
                 },
             );
@@ -228,6 +229,7 @@ fn test_tamper_detection_on_any_nested_manifest_component() {
                 executable_path: None,
                 require_elevation: false,
                 wait_for_exit: false,
+                payload_checksums: Default::default(),
                 size: None,
             },
         );
@@ -268,6 +270,7 @@ fn test_end_to_end_publisher_client_cross_sign_and_verify() {
                     install_args: Vec::new(),
                     require_elevation: false,
                     wait_for_exit: false,
+                    payload_checksums: Default::default(),
                     size: None,
                 },
             );

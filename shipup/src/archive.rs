@@ -580,6 +580,50 @@ pub fn sync_extracted_payload(
     Ok(())
 }
 
+/// 校验归档解压目录内声明的关键文件 SHA-256 完整性
+///
+/// # 设计原理
+/// - **实现初衷**：归档级数字签名仅覆盖压缩包原始字节；若解压器存在边界缺陷，落盘内容可能偏离原始意图。
+///   通过 Manifest 声明关键文件哈希，在部署前形成二次防伪。
+/// - **核心优势**：仅校验调用方声明的关键文件，避免全量扫盘的性能开销；路径强制限制在沙箱根内，防路径逃逸。
+/// - **代价与局限**：发布端必须维护并更新 `payload_checksums`；未声明的文件不会被额外校验。
+///
+/// # Errors
+/// - 当相对路径越界逃逸沙箱时返回 [`UpdateError::ZipSlipViolation`]。
+/// - 当关键文件缺失时返回 [`UpdateError::ArchiveExtract`]。
+/// - 当哈希不匹配时返回 [`UpdateError::ChecksumMismatch`]。
+pub fn verify_extracted_payload_checksums(
+    extract_root: &Path,
+    expected: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+
+    let canonical_root = extract_root
+        .canonicalize()
+        .map_err(|e| UpdateError::ArchiveExtract(format!("解压根目录规范化失败: {e}")))?;
+
+    for (rel, checksum) in expected {
+        let target = canonical_root.join(rel);
+        let canonical_target = target
+            .canonicalize()
+            .map_err(|_| UpdateError::ArchiveExtract(format!("解压后关键文件缺失: {}", rel)))?;
+        if !canonical_target.starts_with(&canonical_root) {
+            return Err(UpdateError::ZipSlipViolation(rel.clone()));
+        }
+        if !canonical_target.is_file() {
+            return Err(UpdateError::ArchiveExtract(format!(
+                "解压后关键路径不是普通文件: {}",
+                rel
+            )));
+        }
+        crate::signature::verify_sha256_file(&canonical_target, checksum)?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,6 +786,60 @@ mod tests {
 
         assert!(extracted_exe.exists());
         assert_eq!(fs::read(extracted_exe).unwrap(), payload_content);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_verify_extracted_payload_checksums_success_and_failure() {
+        use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "shipup_payload_checksum_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(temp_dir.join("bin")).unwrap();
+
+        let content = b"critical-binary-content";
+        let file_path = temp_dir.join("bin/app.exe");
+        fs::write(&file_path, content).unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        let digest = hasher.finalize();
+        let mut hex = String::with_capacity(64);
+        for b in digest {
+            use std::fmt::Write;
+            let _ = write!(hex, "{b:02x}");
+        }
+
+        let mut expected = BTreeMap::new();
+        expected.insert("bin/app.exe".to_string(), format!("sha256:{hex}"));
+
+        // 正常路径应通过
+        assert!(verify_extracted_payload_checksums(&temp_dir, &expected).is_ok());
+
+        // 篡改文件内容后应失败
+        fs::write(&file_path, b"tampered").unwrap();
+        assert!(matches!(
+            verify_extracted_payload_checksums(&temp_dir, &expected),
+            Err(UpdateError::ChecksumMismatch { .. })
+        ));
+
+        // 还原正确内容后，声明不存在的关键文件应失败
+        fs::write(&file_path, content).unwrap();
+        expected.insert("bin/missing.dll".to_string(), format!("sha256:{hex}"));
+        assert!(matches!(
+            verify_extracted_payload_checksums(&temp_dir, &expected),
+            Err(UpdateError::ArchiveExtract(_))
+        ));
+
+        // 路径逃逸应被拦截
+        let mut escape_map = BTreeMap::new();
+        escape_map.insert("../outside.exe".to_string(), format!("sha256:{hex}"));
+        assert!(verify_extracted_payload_checksums(&temp_dir, &escape_map).is_err());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

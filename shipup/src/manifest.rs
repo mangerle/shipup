@@ -133,6 +133,14 @@ pub struct PackageInfo {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wait_for_exit: bool,
 
+    /// 归档解压后的关键文件完整性校验表（相对路径 -> sha256:<hex>）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：归档整体签名只能证明压缩包字节未被篡改，无法防御解压器实现缺陷导致的落盘内容偏差。
+    /// - **核心优势**：解压后对声明的关键文件逐个复核 SHA-256，形成“包体签名 + 关键文件哈希”双重防线。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub payload_checksums: BTreeMap<String, String>,
+
     /// 更新包物理文件大小（字节，用于硬校验与目标磁盘空间预检）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
@@ -739,6 +747,7 @@ mod tests {
                 executable_path: None,
                 require_elevation: false,
                 wait_for_exit: false,
+                payload_checksums: Default::default(),
                 size: None,
             },
         );
@@ -759,6 +768,7 @@ mod tests {
                 executable_path: None,
                 require_elevation: false,
                 wait_for_exit: false,
+                payload_checksums: Default::default(),
                 size: None,
             },
         );

@@ -251,6 +251,7 @@ pub(crate) fn parse_github_release_response(
                 executable_path: None,
                 require_elevation: false,
                 wait_for_exit: false,
+                payload_checksums: Default::default(),
                 size: Some(asset.size),
             };
             packages.insert(target.to_string(), pkg);

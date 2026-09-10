@@ -26,6 +26,7 @@ fn test_manifest_serialization_and_routing() {
             executable_path: None,
             require_elevation: false,
             wait_for_exit: false,
+            payload_checksums: Default::default(),
             size: None,
         },
     );
@@ -46,6 +47,7 @@ fn test_manifest_serialization_and_routing() {
             executable_path: None,
             require_elevation: true,
             wait_for_exit: false,
+            payload_checksums: Default::default(),
             size: None,
         },
     );

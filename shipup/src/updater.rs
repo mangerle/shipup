@@ -1591,6 +1591,18 @@ where
                     release.package.executable_path.as_deref(),
                 )?;
 
+                // 解压后对 Manifest 声明的关键文件执行二次哈希防伪
+                if !release.package.payload_checksums.is_empty() {
+                    let extract_root = extracted_binary
+                        .parent()
+                        .unwrap_or(&sandbox_dir)
+                        .to_path_buf();
+                    crate::archive::verify_extracted_payload_checksums(
+                        &extract_root,
+                        &release.package.payload_checksums,
+                    )?;
+                }
+
                 callback(UpdateEvent::Installing);
 
                 // 同步解压目录中除主程序外的全部伴随依赖（动态库、静态资源等）到宿主应用目录
@@ -1989,6 +2001,7 @@ mod tests {
                 executable_path: None,
                 require_elevation: false,
                 wait_for_exit: false,
+                payload_checksums: Default::default(),
                 size: None,
             },
             rollout_percentage: None,
@@ -2031,6 +2044,7 @@ mod tests {
                 executable_path: None,
                 require_elevation: false,
                 wait_for_exit: false,
+                payload_checksums: Default::default(),
                 size: None,
             },
             rollout_percentage: None,
@@ -2510,6 +2524,7 @@ mod tests {
                     executable_path: None,
                     require_elevation: false,
                     wait_for_exit: false,
+                    payload_checksums: Default::default(),
                     size: None,
                 },
             },
@@ -2576,6 +2591,7 @@ mod tests {
                     executable_path: None,
                     require_elevation: false,
                     wait_for_exit: false,
+                    payload_checksums: Default::default(),
                     size: None,
                 },
             },
