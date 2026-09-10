@@ -1411,6 +1411,23 @@ impl DownloadedUpdate {
         &self.release
     }
 
+    /// 显式清理已下载的本地暂存更新包
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：当用户取消升级或预载后放弃安装时，需要主动回收磁盘上的临时更新包，避免长期残留。
+    /// - **核心优势**：幂等安全，文件不存在时静默成功；不依赖 `Drop`，避免 `Clone` 语义下误删共享副本。
+    /// - **代价与局限**：清理后本实例不可再调用 `install()`；若存在其他克隆副本共享同一路径，安装能力同样失效。
+    ///
+    /// # Errors
+    /// 当底层文件删除失败时返回 [`UpdateError::Io`]。
+    pub fn cleanup(&self) -> Result<()> {
+        if self.downloaded_path.exists() {
+            fs::remove_file(&self.downloaded_path).map_err(UpdateError::Io)?;
+            log::info!("已清理本地暂存更新包: {}", self.downloaded_path.display());
+        }
+        Ok(())
+    }
+
     /// 执行物理安装、解压替换或拉起外部安装器
     ///
     /// # 设计原理
@@ -1956,6 +1973,52 @@ mod tests {
             &Version::parse("1.0.0").unwrap()
         );
         assert_eq!(downloaded.downloaded_path(), temp_path.as_path());
+    }
+
+    #[test]
+    fn test_downloaded_update_cleanup_removes_temp_file() {
+        let release = ResolvedRelease {
+            version: Version::parse("1.2.0").unwrap(),
+            min_supported_version: None,
+            is_mandatory: false,
+            pub_date: None,
+            notes: None,
+            package: PackageInfo {
+                url: "https://example.com/app.exe".to_string(),
+                mirrors: vec![],
+                signature: None,
+                signatures: vec![],
+                checksum: None,
+                package_type: PackageType::Binary,
+                install_mode: None,
+                install_args: vec![],
+                executable_path: None,
+                require_elevation: false,
+                size: None,
+            },
+            rollout_percentage: None,
+        };
+
+        let temp_path = std::env::temp_dir().join(format!(
+            "shipup_cleanup_test_{}.shipup.tmp",
+            std::process::id()
+        ));
+        fs::write(&temp_path, b"pending-update-payload").unwrap();
+
+        let downloaded = DownloadedUpdate {
+            current_version: Version::parse("1.0.0").unwrap(),
+            release,
+            downloaded_path: temp_path.clone(),
+            max_rollback_entries: crate::recovery::DEFAULT_MAX_ROLLBACK_ENTRIES,
+            allow_reboot_deferred_replace: false,
+        };
+
+        assert!(temp_path.exists());
+        downloaded.cleanup().unwrap();
+        assert!(!temp_path.exists());
+
+        // 幂等：文件已不存在时再次清理仍应成功
+        downloaded.cleanup().unwrap();
     }
 
     #[cfg(feature = "blocking")]
