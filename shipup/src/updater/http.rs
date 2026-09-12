@@ -22,9 +22,50 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 #[cfg(any(feature = "blocking", feature = "async"))]
+use crate::updater::config::NetworkSecurityConfig;
+#[cfg(any(feature = "blocking", feature = "async"))]
 use reqwest::Proxy;
 #[cfg(any(feature = "blocking", feature = "async"))]
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+/// HTTP 客户端构建参数对象
+///
+/// # 设计原理
+/// - **实现初衷**：`build_blocking_http_client` 与 `build_async_http_client` 原先各自接收
+///   timeout / user_agent / headers / proxy / root_certificates_pem 五个平铺参数，
+///   既突破函数入参数量上限，也在新增安全字段时留下「只改一处」的漏改隐患。
+/// - **核心优势**：参数集合单点定义，同步与异步构建入口共用同一结构体；
+///   可直接从 [`NetworkSecurityConfig`] 派生，调用方无需手工拆字段。
+/// - **代价与局限**：引入一层结构体间接，阅读时需先确认各字段含义。
+#[cfg(any(feature = "blocking", feature = "async"))]
+#[derive(Debug, Clone)]
+pub(super) struct HttpClientOptions<'a> {
+    /// 单次请求超时时长
+    pub(super) timeout: Duration,
+    /// 自定义 User-Agent（None 表示使用库内置标识）
+    pub(super) user_agent: Option<&'a str>,
+    /// 默认请求头字典
+    pub(super) headers: &'a HashMap<String, String>,
+    /// 代理服务器地址（None 表示直连）
+    pub(super) proxy: Option<&'a str>,
+    /// 自定义受信任根证书 PEM 字节列表
+    pub(super) root_certificates_pem: &'a [Vec<u8>],
+}
+
+#[cfg(any(feature = "blocking", feature = "async"))]
+impl<'a> HttpClientOptions<'a> {
+    /// 从网络安全配置中提取 HTTP 客户端构建所需的字段子集
+    #[must_use]
+    pub(super) fn from_network_config(config: &'a NetworkSecurityConfig) -> Self {
+        Self {
+            timeout: config.timeout,
+            user_agent: config.user_agent.as_deref(),
+            headers: &config.headers,
+            proxy: config.proxy.as_deref(),
+            root_certificates_pem: &config.root_certificates_pem,
+        }
+    }
+}
 
 #[cfg(any(feature = "blocking", feature = "async"))]
 /// 把字符串字典形式的自定义请求头解析为 `reqwest` 的 [`HeaderMap`]。
@@ -79,29 +120,25 @@ pub(super) fn parse_proxy(proxy: Option<&str>) -> Result<Option<Proxy>> {
 /// - 请求头或代理配置非法：[`UpdateError::Network`]；
 /// - 客户端初始化失败：[`UpdateError::Network`]。
 pub(super) fn build_blocking_http_client(
-    timeout: Duration,
-    user_agent: Option<&str>,
-    headers: &HashMap<String, String>,
-    proxy: Option<&str>,
-    root_certificates_pem: &[Vec<u8>],
+    options: &HttpClientOptions<'_>,
 ) -> Result<reqwest::blocking::Client> {
     let mut builder = reqwest::blocking::Client::builder()
-        .timeout(timeout)
+        .timeout(options.timeout)
         .min_tls_version(reqwest::tls::Version::TLS_1_2);
 
-    for pem_bytes in root_certificates_pem {
+    for pem_bytes in options.root_certificates_pem {
         let cert = reqwest::Certificate::from_pem(pem_bytes)
             .map_err(|e| UpdateError::Network(format!("加载自定义受信任根证书失败: {}", e)))?;
         builder = builder.add_root_certificate(cert);
     }
 
-    if let Some(ua) = user_agent {
+    if let Some(ua) = options.user_agent {
         builder = builder.user_agent(ua);
     }
-    if let Some(header_map) = parse_header_map(headers)? {
+    if let Some(header_map) = parse_header_map(options.headers)? {
         builder = builder.default_headers(header_map);
     }
-    if let Some(proxy_config) = parse_proxy(proxy)? {
+    if let Some(proxy_config) = parse_proxy(options.proxy)? {
         builder = builder.proxy(proxy_config);
     }
     builder
@@ -119,30 +156,24 @@ pub(super) fn build_blocking_http_client(
 /// - 自定义根证书 PEM 解析失败：[`UpdateError::Network`]；
 /// - 请求头或代理配置非法：[`UpdateError::Network`]；
 /// - 客户端初始化失败：[`UpdateError::Network`]。
-pub(super) fn build_async_http_client(
-    timeout: Duration,
-    user_agent: Option<&str>,
-    headers: &HashMap<String, String>,
-    proxy: Option<&str>,
-    root_certificates_pem: &[Vec<u8>],
-) -> Result<reqwest::Client> {
+pub(super) fn build_async_http_client(options: &HttpClientOptions<'_>) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
-        .timeout(timeout)
+        .timeout(options.timeout)
         .min_tls_version(reqwest::tls::Version::TLS_1_2);
 
-    for pem_bytes in root_certificates_pem {
+    for pem_bytes in options.root_certificates_pem {
         let cert = reqwest::Certificate::from_pem(pem_bytes)
             .map_err(|e| UpdateError::Network(format!("加载自定义受信任根证书失败: {}", e)))?;
         builder = builder.add_root_certificate(cert);
     }
 
-    if let Some(ua) = user_agent {
+    if let Some(ua) = options.user_agent {
         builder = builder.user_agent(ua);
     }
-    if let Some(header_map) = parse_header_map(headers)? {
+    if let Some(header_map) = parse_header_map(options.headers)? {
         builder = builder.default_headers(header_map);
     }
-    if let Some(proxy_config) = parse_proxy(proxy)? {
+    if let Some(proxy_config) = parse_proxy(options.proxy)? {
         builder = builder.proxy(proxy_config);
     }
     builder

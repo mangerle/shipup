@@ -225,51 +225,77 @@ where
             let mut first_run = true;
 
             while !worker_stop.load(Ordering::Relaxed) {
-                if first_run && !options.check_immediately {
-                    first_run = false;
-                } else {
-                    first_run = false;
-                    callback(AutoPollEvent::Checking);
-                    match updater.check() {
-                        Ok(Some(update)) => {
-                            if options.silent_download {
-                                callback(AutoPollEvent::Downloading(update.clone()));
-                                worker_download_cancel.store(false, Ordering::Relaxed);
-                                let cancel_token = Some(Arc::clone(&worker_download_cancel));
-                                match update.download_with_cancellation(cancel_token, |_| {}) {
-                                    Ok(downloaded) => {
-                                        callback(AutoPollEvent::UpdateReady(downloaded))
-                                    }
-                                    Err(UpdateError::Cancelled) => {
-                                        log::info!("后台静默下载更新包已被取消，保持周期轮询调度");
-                                    }
-                                    Err(e) => callback(AutoPollEvent::Error(e)),
-                                }
-                            } else {
-                                callback(AutoPollEvent::NewVersionAvailable(update));
-                            }
-                        }
-                        Ok(None) => callback(AutoPollEvent::UpToDate),
-                        Err(e) => callback(AutoPollEvent::Error(e)),
-                    }
+                let should_check = !first_run || options.check_immediately;
+                first_run = false;
+
+                if should_check {
+                    run_blocking_poll_iteration(
+                        &updater,
+                        &options,
+                        &worker_download_cancel,
+                        &mut callback,
+                    );
                 }
 
-                // 拆分休眠片，响应毫秒级退出请求；叠加抖动避免惊群
-                let sleep_for = compute_jittered_interval(options.interval, options.jitter_ratio);
-                let slice = Duration::from_millis(500);
-                let total_slices = (sleep_for.as_millis() / slice.as_millis()).max(1);
-                for _ in 0..total_slices {
-                    if worker_stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    std::thread::sleep(slice);
-                }
+                interruptible_sleep_blocking(options.interval, options.jitter_ratio, &worker_stop);
             }
 
             log::info!("后台自更新轮询工作线程已优雅退出");
         })?;
 
     Ok(AutoPollerHandle::new(stop_flag, download_cancel_flag))
+}
+
+/// 执行一次同步轮询迭代：检查更新，必要时静默预载并派发对应事件
+///
+/// # 设计原理
+/// - **实现初衷**：把「检查 → 可选静默下载」这一完整业务单元从线程主循环中抽出，
+///   使主循环只保留调度语义（首检策略、休眠切片、停止响应），降低嵌套深度。
+/// - **代价与局限**：单次网络失败仅以 [`AutoPollEvent::Error`] 通知宿主，不会终止轮询循环。
+#[cfg(feature = "blocking")]
+fn run_blocking_poll_iteration<F>(
+    updater: &Updater,
+    options: &AutoPollOptions,
+    download_cancel_flag: &Arc<AtomicBool>,
+    callback: &mut F,
+) where
+    F: FnMut(AutoPollEvent),
+{
+    callback(AutoPollEvent::Checking);
+    match updater.check() {
+        Ok(Some(update)) => {
+            if options.silent_download {
+                callback(AutoPollEvent::Downloading(update.clone()));
+                download_cancel_flag.store(false, Ordering::Relaxed);
+                let cancel_token = Some(Arc::clone(download_cancel_flag));
+                match update.download_with_cancellation(cancel_token, |_| {}) {
+                    Ok(downloaded) => callback(AutoPollEvent::UpdateReady(downloaded)),
+                    Err(UpdateError::Cancelled) => {
+                        log::info!("后台静默下载更新包已被取消，保持周期轮询调度");
+                    }
+                    Err(e) => callback(AutoPollEvent::Error(e)),
+                }
+            } else {
+                callback(AutoPollEvent::NewVersionAvailable(update));
+            }
+        }
+        Ok(None) => callback(AutoPollEvent::UpToDate),
+        Err(e) => callback(AutoPollEvent::Error(e)),
+    }
+}
+
+/// 将轮询休眠拆成 500ms 切片并叠加抖动，使停止指令能在半秒内被响应
+#[cfg(feature = "blocking")]
+fn interruptible_sleep_blocking(interval: Duration, jitter_ratio: f32, stop_flag: &AtomicBool) {
+    let sleep_for = compute_jittered_interval(interval, jitter_ratio);
+    let slice = Duration::from_millis(500);
+    let total_slices = (sleep_for.as_millis() / slice.as_millis()).max(1);
+    for _ in 0..total_slices {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        std::thread::sleep(slice);
+    }
 }
 
 #[cfg(feature = "async")]

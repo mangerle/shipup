@@ -17,6 +17,16 @@
 //!
 //! # 安全契约
 //! 分片下载完成后必须重新校验整体体积与哈希；任一分片体积不符即判定失败并删除临时文件。
+//!
+//! # 同步/异步修改契约
+//! 本模块与 [`super::asynchronous`] 中以下成对函数语义必须同步修改，禁止只改一侧：
+//! - `download_file_blocking` ↔ `download_file_async`
+//! - `download_file_chunked_blocking` ↔ `download_file_chunked_async`
+//! - `download_file_blocking_attempt` ↔ `download_file_async_attempt`
+//! - `execute_chunked_download_blocking` ↔ `execute_chunked_download_async`
+//! - `pipe_blocking_stream` ↔ `pipe_async_stream`
+//! - `copy_local_file_blocking` ↔ `copy_local_file_async`
+//! - `probe_range_support_blocking` ↔ `probe_range_support_async`
 
 #![cfg_attr(not(feature = "blocking"), allow(unused))]
 
@@ -497,6 +507,48 @@ where
 }
 
 #[cfg(feature = "blocking")]
+/// 依据响应是否为 206 打开续传追加文件或新建截断文件
+fn open_target_for_response(
+    options: &DownloadOptions<'_>,
+    status: StatusCode,
+    existing_len: u64,
+    response: &mut reqwest::blocking::Response,
+) -> Result<(File, u64, Option<u64>)> {
+    if status == StatusCode::PARTIAL_CONTENT {
+        let remaining = response.content_length();
+        let total = remaining.map(|r| existing_len.saturating_add(r));
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(options.target_path)?;
+        Ok((f, existing_len, total))
+    } else {
+        let total = response.content_length();
+        let f = File::create(options.target_path)?;
+        Ok((f, 0, total))
+    }
+}
+
+#[cfg(feature = "blocking")]
+/// 下载结束后按期望体积硬校验，不符则删除临时文件并上抛
+fn verify_final_size_blocking(options: &DownloadOptions<'_>) -> Result<()> {
+    let Some(expected) = options.expected_size else {
+        return Ok(());
+    };
+    let final_len = fs::metadata(options.target_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if final_len != expected {
+        let _ = fs::remove_file(options.target_path);
+        return Err(UpdateError::PayloadSizeMismatch {
+            expected,
+            actual: final_len,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "blocking")]
 fn download_file_blocking_attempt<F>(
     client: &reqwest::blocking::Client,
     options: &DownloadOptions<'_>,
@@ -549,28 +601,13 @@ where
         fs::create_dir_all(parent)?;
     }
 
-    let (file, initial_downloaded, total_bytes) = if status == StatusCode::PARTIAL_CONTENT {
-        let remaining = response.content_length();
-        let total = remaining.map(|r| existing_len.saturating_add(r));
-        let f = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(options.target_path)?;
-        (f, existing_len, total)
-    } else {
-        let total = response.content_length();
-        let f = File::create(options.target_path)?;
-        (f, 0, total)
-    };
+    let (file, initial_downloaded, total_bytes) =
+        open_target_for_response(options, status, existing_len, &mut response)?;
 
     if let (Some(expected), Some(actual_total)) = (options.expected_size, total_bytes)
         && actual_total != expected
     {
-        log::error!(
-            "HTTP 响应声明的包体积 ({} 字节) 与清单期望值 ({} 字节) 不符",
-            actual_total,
-            expected
-        );
+        // 禁止双重记录：此处只构造错误上抛，日志由顶层消费方统一输出
         return Err(UpdateError::PayloadSizeMismatch {
             expected,
             actual: actual_total,
@@ -588,19 +625,7 @@ where
         event_callback,
     };
     pipe_blocking_stream(&mut response, ctx)?;
-
-    if let Some(expected) = options.expected_size {
-        let final_len = fs::metadata(options.target_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if final_len != expected {
-            let _ = fs::remove_file(options.target_path);
-            return Err(UpdateError::PayloadSizeMismatch {
-                expected,
-                actual: final_len,
-            });
-        }
-    }
+    verify_final_size_blocking(options)?;
 
     log::info!(
         "更新包同步下载完成，临时路径: {}",

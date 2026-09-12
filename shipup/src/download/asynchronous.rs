@@ -17,6 +17,16 @@
 //! # 安全契约
 //! 分片下载完成后必须重新校验整体体积与哈希；体积校验与哈希计算均在阻塞线程池中执行，
 //! 以避免阻塞 Tokio 事件循环。
+//!
+//! # 同步/异步修改契约
+//! 本模块与 [`super::blocking`] 中以下成对函数语义必须同步修改，禁止只改一侧：
+//! - `download_file_async` ↔ `download_file_blocking`
+//! - `download_file_chunked_async` ↔ `download_file_chunked_blocking`
+//! - `download_file_async_attempt` ↔ `download_file_blocking_attempt`
+//! - `execute_chunked_download_async` ↔ `execute_chunked_download_blocking`
+//! - `pipe_async_stream` ↔ `pipe_blocking_stream`
+//! - `copy_local_file_async` ↔ `copy_local_file_blocking`
+//! - `probe_range_support_async` ↔ `probe_range_support_blocking`
 
 #![cfg_attr(not(feature = "async"), allow(unused))]
 
@@ -203,11 +213,50 @@ where
     let target_path_buf = options.base.target_path.to_path_buf();
     let cancel_flag = options.base.cancel_flag.clone();
 
+    spawn_async_chunk_tasks(
+        client,
+        chunks,
+        &semaphore,
+        &target_path_buf,
+        &candidate_urls,
+        &cancel_flag,
+        tx.clone(),
+        &mut handles,
+    );
+    drop(tx);
+
+    monitor_chunked_progress_async(rx, total_chunks, total_size, &mut event_callback).await?;
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    verify_chunked_payload_async(options, total_size).await?;
+
+    log::info!(
+        "异步分片并行下载与拼装完成，临时文件: {}",
+        options.base.target_path.display()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "async")]
+#[allow(clippy::too_many_arguments)]
+fn spawn_async_chunk_tasks(
+    client: &reqwest::Client,
+    chunks: Vec<FileChunkRange>,
+    semaphore: &Arc<tokio::sync::Semaphore>,
+    target_path: &Path,
+    candidate_urls: &[String],
+    cancel_flag: &Option<Arc<AtomicBool>>,
+    tx: tokio::sync::mpsc::Sender<ChunkWorkerMessage>,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
     for chunk in chunks {
         let sem = semaphore.clone();
         let client_clone = client.clone();
-        let path_clone = target_path_buf.clone();
-        let urls_clone = candidate_urls.clone();
+        let path_clone = target_path.to_path_buf();
+        let urls_clone = candidate_urls.to_vec();
         let cancel_clone = cancel_flag.clone();
         let tx_clone = tx.clone();
 
@@ -232,14 +281,14 @@ where
             let _ = tx_clone.send(ChunkWorkerMessage::ChunkCompleted).await;
         }));
     }
-    drop(tx);
+}
 
-    monitor_chunked_progress_async(rx, total_chunks, total_size, &mut event_callback).await?;
-
-    for handle in handles {
-        let _ = handle.await;
-    }
-
+#[cfg(feature = "async")]
+/// 分片拼装完成后的体积与哈希硬校验（在阻塞线程池中执行）
+async fn verify_chunked_payload_async(
+    options: &ChunkedDownloadOptions<'_>,
+    total_size: u64,
+) -> Result<()> {
     let target_path = options.base.target_path.to_path_buf();
     let expected_checksum = options.base.expected_checksum.map(|s| s.to_string());
     let expected_size = options.base.expected_size;
@@ -262,11 +311,7 @@ where
     })
     .await
     .map_err(|e| UpdateError::SelfReplace(format!("异步分片校验后台任务中止: {}", e)))??;
-
-    log::info!(
-        "异步分片并行下载与拼装完成，临时文件: {}",
-        options.base.target_path.display()
-    );
+    let _ = total_size;
     Ok(())
 }
 
@@ -505,6 +550,50 @@ where
 }
 
 #[cfg(feature = "async")]
+/// 依据响应是否为 206 打开续传追加文件或新建截断文件
+async fn open_target_for_response_async(
+    options: &DownloadOptions<'_>,
+    status: StatusCode,
+    existing_len: u64,
+    response: &reqwest::Response,
+) -> Result<(tokio::fs::File, u64, Option<u64>)> {
+    if status == StatusCode::PARTIAL_CONTENT {
+        let remaining = response.content_length();
+        let total = remaining.map(|r| existing_len.saturating_add(r));
+        let f = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(options.target_path)
+            .await?;
+        Ok((f, existing_len, total))
+    } else {
+        let total = response.content_length();
+        let f = tokio::fs::File::create(options.target_path).await?;
+        Ok((f, 0, total))
+    }
+}
+
+#[cfg(feature = "async")]
+/// 下载结束后按期望体积硬校验，不符则删除临时文件并上抛
+async fn verify_final_size_async(options: &DownloadOptions<'_>) -> Result<()> {
+    let Some(expected) = options.expected_size else {
+        return Ok(());
+    };
+    let final_len = match tokio::fs::metadata(options.target_path).await {
+        Ok(m) => m.len(),
+        Err(_) => 0,
+    };
+    if final_len != expected {
+        let _ = tokio::fs::remove_file(options.target_path).await;
+        return Err(UpdateError::PayloadSizeMismatch {
+            expected,
+            actual: final_len,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "async")]
 async fn download_file_async_attempt<F>(
     client: &reqwest::Client,
     options: &DownloadOptions<'_>,
@@ -559,29 +648,13 @@ where
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let (file, initial_downloaded, total_bytes) = if status == StatusCode::PARTIAL_CONTENT {
-        let remaining = response.content_length();
-        let total = remaining.map(|r| existing_len.saturating_add(r));
-        let f = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(options.target_path)
-            .await?;
-        (f, existing_len, total)
-    } else {
-        let total = response.content_length();
-        let f = tokio::fs::File::create(options.target_path).await?;
-        (f, 0, total)
-    };
+    let (file, initial_downloaded, total_bytes) =
+        open_target_for_response_async(options, status, existing_len, &response).await?;
 
     if let (Some(expected), Some(actual_total)) = (options.expected_size, total_bytes)
         && actual_total != expected
     {
-        log::error!(
-            "异步 HTTP 响应声明的包体积 ({} 字节) 与清单期望值 ({} 字节) 不符",
-            actual_total,
-            expected
-        );
+        // 禁止双重记录：此处只构造错误上抛，日志由顶层消费方统一输出
         return Err(UpdateError::PayloadSizeMismatch {
             expected,
             actual: actual_total,
@@ -599,20 +672,7 @@ where
         event_callback,
     };
     pipe_async_stream(response, ctx).await?;
-
-    if let Some(expected) = options.expected_size {
-        let final_len = match tokio::fs::metadata(options.target_path).await {
-            Ok(m) => m.len(),
-            Err(_) => 0,
-        };
-        if final_len != expected {
-            let _ = tokio::fs::remove_file(options.target_path).await;
-            return Err(UpdateError::PayloadSizeMismatch {
-                expected,
-                actual: final_len,
-            });
-        }
-    }
+    verify_final_size_async(options).await?;
 
     log::info!(
         "更新包异步下载完成，临时路径: {}",

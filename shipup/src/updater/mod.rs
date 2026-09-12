@@ -24,7 +24,8 @@
 
 #![cfg_attr(not(any(feature = "blocking", feature = "async")), allow(unused))]
 
-use crate::builder::{UpdaterBuilder, UpdaterConfig, VersionComparator};
+use crate::builder::UpdaterBuilder;
+use crate::config::{UpdaterConfig, VersionComparator};
 use crate::error::{Result, UpdateError};
 use crate::manifest::Manifest;
 use crate::platform::cleanup_old_backups;
@@ -372,6 +373,8 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
 
+    #[cfg(any(feature = "blocking", feature = "async"))]
+    use crate::updater::http::HttpClientOptions;
     #[cfg(feature = "async")]
     use crate::updater::http::build_async_http_client;
     #[cfg(feature = "blocking")]
@@ -1143,13 +1146,14 @@ mod tests {
             b"-----BEGIN CERTIFICATE-----\ninvalid_corrupt_base64\n-----END CERTIFICATE-----"
                 .to_vec(),
         ];
-        let res = build_blocking_http_client(
-            Duration::from_secs(5),
-            None,
-            &HashMap::new(),
-            None,
-            &invalid_pem,
-        );
+        let options = HttpClientOptions {
+            timeout: Duration::from_secs(5),
+            user_agent: None,
+            headers: &HashMap::new(),
+            proxy: None,
+            root_certificates_pem: &invalid_pem,
+        };
+        let res = build_blocking_http_client(&options);
         assert!(res.is_err());
     }
 
@@ -1160,21 +1164,30 @@ mod tests {
             b"-----BEGIN CERTIFICATE-----\ninvalid_corrupt_base64\n-----END CERTIFICATE-----"
                 .to_vec(),
         ];
-        let res = build_async_http_client(
-            Duration::from_secs(5),
-            None,
-            &HashMap::new(),
-            None,
-            &invalid_pem,
-        );
+        let options = HttpClientOptions {
+            timeout: Duration::from_secs(5),
+            user_agent: None,
+            headers: &HashMap::new(),
+            proxy: None,
+            root_certificates_pem: &invalid_pem,
+        };
+        let res = build_async_http_client(&options);
         assert!(res.is_err());
     }
 
     #[cfg(feature = "blocking")]
     #[test]
     fn test_build_blocking_http_client_defaults() {
-        let res =
-            build_blocking_http_client(Duration::from_secs(5), None, &HashMap::new(), None, &[]);
+        let empty_headers = HashMap::new();
+        let empty_certs: Vec<Vec<u8>> = Vec::new();
+        let options = HttpClientOptions {
+            timeout: Duration::from_secs(5),
+            user_agent: None,
+            headers: &empty_headers,
+            proxy: None,
+            root_certificates_pem: &empty_certs,
+        };
+        let res = build_blocking_http_client(&options);
         assert!(res.is_ok());
     }
 }

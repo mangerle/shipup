@@ -297,116 +297,181 @@ pub fn verify_offline_repository(
     let manifest_file_name = options.manifest_filename.unwrap_or("manifest.json");
     let manifest_path = options.repository_dir.join(manifest_file_name);
 
-    if !manifest_path.exists() {
-        return Ok(OfflineVerifyReport {
-            manifest_path: manifest_path.clone(),
-            manifest_valid: false,
-            manifest_error: Some(format!("清单文件不存在: {}", manifest_path.display())),
-            version: None,
-            channel_count: 0,
-            package_reports: Vec::new(),
-        });
-    }
-
-    let manifest_content = fs::read_to_string(&manifest_path)?;
-    let manifest = match Manifest::from_json_str(&manifest_content) {
-        Ok(m) => m,
-        Err(e) => {
-            return Ok(OfflineVerifyReport {
-                manifest_path,
-                manifest_valid: false,
-                manifest_error: Some(format!("清单反序列化解析失败: {e}")),
-                version: None,
-                channel_count: 0,
-                package_reports: Vec::new(),
-            });
+    let manifest = match load_manifest(&manifest_path)? {
+        ManifestLoadOutcome::Loaded(m) => *m,
+        ManifestLoadOutcome::Missing => {
+            let reason = format!("清单文件不存在: {}", manifest_path.display());
+            return Ok(build_manifest_failure_report(manifest_path, reason));
+        }
+        ManifestLoadOutcome::ParseError(detail) => {
+            let reason = format!("清单反序列化解析失败: {detail}");
+            return Ok(build_manifest_failure_report(manifest_path, reason));
         }
     };
 
-    // 校验清单自身签名
-    let mut manifest_valid = true;
-    let mut manifest_error = None;
-
-    if !options.public_keys.is_empty() {
-        let all_sigs = manifest.all_signatures();
-        if all_sigs.is_empty() {
-            if options.require_package_signatures {
-                manifest_valid = false;
-                manifest_error = Some("清单未包含任何数字签名，被安全策略阻断".to_string());
-            }
-        } else if let Err(e) =
-            manifest.verify_signatures_threshold(options.public_keys, options.signature_threshold)
-        {
-            manifest_valid = false;
-            manifest_error = Some(format!("清单签名门限校验未通过: {e}"));
-        }
-    }
-
-    let version = Some(manifest.version.to_string());
-    let channel_count = manifest.channels.len();
-    let mut package_reports = Vec::new();
-
-    // 1. 核验根级默认包
-    for (target, pkg) in &manifest.packages {
-        let report = verify_single_offline_package(
-            options.repository_dir,
-            None,
-            target,
-            pkg,
-            options.public_keys,
-            options.require_package_signatures,
-        );
-        package_reports.push(report);
-    }
-
-    // 2. 核验各独立发布通道包
-    for (channel_name, ch_info) in &manifest.channels {
-        for (target, pkg) in &ch_info.packages {
-            let report = verify_single_offline_package(
-                options.repository_dir,
-                Some(channel_name),
-                target,
-                pkg,
-                options.public_keys,
-                options.require_package_signatures,
-            );
-            package_reports.push(report);
-        }
-    }
+    let (manifest_valid, manifest_error) = verify_manifest_signatures(options, &manifest);
+    let package_reports = collect_package_reports(options, &manifest);
 
     Ok(OfflineVerifyReport {
         manifest_path,
         manifest_valid,
         manifest_error,
-        version,
-        channel_count,
+        version: Some(manifest.version.to_string()),
+        channel_count: manifest.channels.len(),
         package_reports,
     })
 }
 
-/// 内部私有辅助：核验单个包文件一致性与有效性
-fn verify_single_offline_package(
-    repository_dir: &Path,
-    channel: Option<&str>,
-    target: &str,
-    pkg: &PackageInfo,
-    public_keys: &[String],
+/// 离线清单加载结果
+///
+/// # 设计原理
+/// 成功分支以 `Box` 间接持有体积较大的 [`Manifest`]，
+/// 使整个枚举的栈尺寸与失败分支对齐，避免调用方在热路径上付出无谓的复制开销。
+enum ManifestLoadOutcome {
+    /// 清单文本已成功反序列化
+    Loaded(Box<Manifest>),
+    /// 清单文件在磁盘上不存在
+    Missing,
+    /// 清单文本存在但反序列化失败，携带底层错误描述
+    ParseError(String),
+}
+
+/// 读取并解析离线清单，区分「文件缺失」与「解析失败」两种不可用形态
+///
+/// # Errors
+/// 当底层文件读取发生 IO 异常时返回错误。
+fn load_manifest(manifest_path: &Path) -> Result<ManifestLoadOutcome> {
+    if !manifest_path.exists() {
+        return Ok(ManifestLoadOutcome::Missing);
+    }
+    let manifest_content = fs::read_to_string(manifest_path)?;
+    match Manifest::from_json_str(&manifest_content) {
+        Ok(m) => Ok(ManifestLoadOutcome::Loaded(Box::new(m))),
+        Err(e) => Ok(ManifestLoadOutcome::ParseError(e.to_string())),
+    }
+}
+
+/// 构造清单缺失或解析失败时的审计报告（不含任何包级核验结果）
+fn build_manifest_failure_report(manifest_path: PathBuf, reason: String) -> OfflineVerifyReport {
+    OfflineVerifyReport {
+        manifest_path,
+        manifest_valid: false,
+        manifest_error: Some(reason),
+        version: None,
+        channel_count: 0,
+        package_reports: Vec::new(),
+    }
+}
+
+/// 校验清单自身的数字签名门限，返回 (是否有效, 可选错误说明)
+fn verify_manifest_signatures(
+    options: &OfflineVerifyOptions<'_>,
+    manifest: &Manifest,
+) -> (bool, Option<String>) {
+    if options.public_keys.is_empty() {
+        return (true, None);
+    }
+
+    let all_sigs = manifest.all_signatures();
+    if all_sigs.is_empty() {
+        if options.require_package_signatures {
+            return (
+                false,
+                Some("清单未包含任何数字签名，被安全策略阻断".to_string()),
+            );
+        }
+        return (true, None);
+    }
+
+    match manifest.verify_signatures_threshold(options.public_keys, options.signature_threshold) {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(format!("清单签名门限校验未通过: {e}"))),
+    }
+}
+
+/// 遍历根级与各通道安装包，生成全量细粒度核验报告列表
+fn collect_package_reports(
+    options: &OfflineVerifyOptions<'_>,
+    manifest: &Manifest,
+) -> Vec<OfflinePackageReport> {
+    let capacity = manifest.packages.len()
+        + manifest
+            .channels
+            .values()
+            .map(|c| c.packages.len())
+            .sum::<usize>();
+    let mut package_reports = Vec::with_capacity(capacity);
+
+    // 1. 核验根级默认包
+    for (target, pkg) in &manifest.packages {
+        package_reports.push(verify_single_offline_package(
+            &OfflinePackageVerifyContext {
+                repository_dir: options.repository_dir,
+                channel: None,
+                target,
+                pkg,
+                public_keys: options.public_keys,
+                require_signature: options.require_package_signatures,
+            },
+        ));
+    }
+
+    // 2. 核验各独立发布通道包
+    for (channel_name, ch_info) in &manifest.channels {
+        for (target, pkg) in &ch_info.packages {
+            package_reports.push(verify_single_offline_package(
+                &OfflinePackageVerifyContext {
+                    repository_dir: options.repository_dir,
+                    channel: Some(channel_name),
+                    target,
+                    pkg,
+                    public_keys: options.public_keys,
+                    require_signature: options.require_package_signatures,
+                },
+            ));
+        }
+    }
+
+    package_reports
+}
+
+/// 单个安装包离线核验参数对象
+///
+/// # 设计原理
+/// - **实现初衷**：`verify_single_offline_package` 原先以六个平铺参数接收上下文，
+///   既突破入参数量上限，也在新增核验维度时留下漏改隐患。
+/// - **核心优势**：参数集合单点定义，调用方以结构体字面量一次构造完毕。
+struct OfflinePackageVerifyContext<'a> {
+    /// 离线更新源仓库根目录
+    repository_dir: &'a Path,
+    /// 所在发布通道（根级包为 None）
+    channel: Option<&'a str>,
+    /// 目标平台 Triple 标识
+    target: &'a str,
+    /// 清单中声明的包元数据
+    pkg: &'a PackageInfo,
+    /// 用于校验数字签名的 Ed25519 公钥列表
+    public_keys: &'a [String],
+    /// 是否强制要求包必须携带数字签名
     require_signature: bool,
-) -> OfflinePackageReport {
-    let local_file_path = resolve_local_package_path(repository_dir, &pkg.url);
+}
+
+/// 内部私有辅助：核验单个包文件一致性与有效性
+fn verify_single_offline_package(ctx: &OfflinePackageVerifyContext<'_>) -> OfflinePackageReport {
+    let local_file_path = resolve_local_package_path(ctx.repository_dir, &ctx.pkg.url);
     let mut report = OfflinePackageReport {
-        target: target.to_string(),
-        channel: channel.map(ToString::to_string),
-        declared_url: pkg.url.clone(),
+        target: ctx.target.to_string(),
+        channel: ctx.channel.map(ToString::to_string),
+        declared_url: ctx.pkg.url.clone(),
         resolved_local_path: local_file_path.clone(),
-        package_type: pkg.package_type,
+        package_type: ctx.pkg.package_type,
         file_exists: false,
         size_matched: false,
         actual_size: 0,
-        expected_size: pkg.size,
+        expected_size: ctx.pkg.size,
         checksum_matched: false,
         actual_checksum: None,
-        expected_checksum: pkg.checksum.clone(),
+        expected_checksum: ctx.pkg.checksum.clone(),
         signature_verified: None,
         failure_reason: None,
     };
@@ -422,12 +487,29 @@ fn verify_single_offline_package(
     }
     report.file_exists = true;
 
-    // 1. 体积校验
-    let actual_size = match fs::metadata(&path) {
+    if !verify_package_file_size(&path, ctx.pkg, &mut report) {
+        return report;
+    }
+
+    if !verify_package_checksum(&path, ctx.pkg, &mut report) {
+        return report;
+    }
+
+    verify_package_signature(&path, ctx, &mut report);
+    report
+}
+
+/// 校验包文件体积是否与清单声明一致；失败时写入报告原因并返回 false
+fn verify_package_file_size(
+    path: &Path,
+    pkg: &PackageInfo,
+    report: &mut OfflinePackageReport,
+) -> bool {
+    let actual_size = match fs::metadata(path) {
         Ok(meta) => meta.len(),
         Err(e) => {
             report.failure_reason = Some(format!("获取文件元数据失败: {e}"));
-            return report;
+            return false;
         }
     };
     report.actual_size = actual_size;
@@ -441,15 +523,22 @@ fn verify_single_offline_package(
             pkg.size.unwrap_or(0),
             actual_size
         ));
-        return report;
+        return false;
     }
+    true
+}
 
-    // 2. SHA-256 完整性校验
-    let actual_checksum = match compute_file_sha256_digest(&path) {
+/// 校验包文件 SHA-256 完整性摘要；失败时写入报告原因并返回 false
+fn verify_package_checksum(
+    path: &Path,
+    pkg: &PackageInfo,
+    report: &mut OfflinePackageReport,
+) -> bool {
+    let actual_checksum = match compute_file_sha256_digest(path) {
         Ok(digest) => bytes_to_hex(&digest),
         Err(e) => {
             report.failure_reason = Some(format!("计算 SHA-256 哈希失败: {e}"));
-            return report;
+            return false;
         }
     };
     report.actual_checksum = Some(actual_checksum.clone());
@@ -459,29 +548,35 @@ fn verify_single_offline_package(
     };
     if !report.checksum_matched {
         report.failure_reason = Some("SHA-256 完整性校验和不匹配".to_string());
-        return report;
+        return false;
+    }
+    true
+}
+
+/// 在策略要求时执行 Ed25519 数字签名校验，并将结果写入报告
+fn verify_package_signature(
+    path: &Path,
+    ctx: &OfflinePackageVerifyContext<'_>,
+    report: &mut OfflinePackageReport,
+) {
+    if ctx.public_keys.is_empty() && !ctx.require_signature {
+        return;
     }
 
-    // 3. 数字签名校验
-    if !public_keys.is_empty() || require_signature {
-        if let Some(ref sig) = pkg.signature {
-            match verify_ed25519_file_any_key(&path, sig, public_keys) {
-                Ok(()) => {
-                    report.signature_verified = Some(true);
-                }
-                Err(e) => {
-                    report.signature_verified = Some(false);
-                    report.failure_reason = Some(format!("安装包 Ed25519 签名验证未通过: {e}"));
-                }
+    if let Some(ref sig) = ctx.pkg.signature {
+        match verify_ed25519_file_any_key(path, sig, ctx.public_keys) {
+            Ok(()) => {
+                report.signature_verified = Some(true);
             }
-        } else if require_signature {
-            report.signature_verified = Some(false);
-            report.failure_reason =
-                Some("策略要求必须包含签名，但包配置未声明数字签名".to_string());
+            Err(e) => {
+                report.signature_verified = Some(false);
+                report.failure_reason = Some(format!("安装包 Ed25519 签名验证未通过: {e}"));
+            }
         }
+    } else if ctx.require_signature {
+        report.signature_verified = Some(false);
+        report.failure_reason = Some("策略要求必须包含签名，但包配置未声明数字签名".to_string());
     }
-
-    report
 }
 
 /// 解析相对包路径或本地 file:// 得到物理磁盘绝对路径

@@ -1,12 +1,14 @@
-//! 更新器构建器与配置模型模块。
+//! 更新器链式构建器模块。
 //!
 //! # 模块职责
-//! 定义自更新系统的配置面：
-//! - [`UpdaterConfig`]：构建完成的不可变配置快照，字段全部为公开只读，供上层检视与复用；
+//! 定义自更新系统的构建入口面：
 //! - [`UpdaterBuilder`]：链式构建器，逐项设定版本基准、端点、通道、验签策略、并发与限流参数；
-//! - [`VersionComparator`]：可插拔的版本裁决函数类型；
 //! - 构建期安全门禁：[`UpdaterBuilder::build`] 在实例化前拦截明文 HTTP、未授权的 `file://`
 //!   以及「要求验签却未配置公钥」等危险配置。
+//!
+//! 配置快照类型 [`UpdaterConfig`] 与版本裁决类型
+//! [`VersionComparator`] 已下沉至 [`crate::config`] 模块，
+//! 本模块仅依赖该配置模型，与 `updater` 引擎之间不再形成双向引用。
 //!
 //! # 设计原理
 //! - **实现初衷**：更新器共有二十余项可调参数，若以长参数列表一一平铺，
@@ -21,9 +23,14 @@
 //!   需要不同策略时必须重新构建实例。
 //!
 //! # 校验契约
-//! [`UpdaterBuilder::build`] 会依次校验必填字段、端点协议安全性与公钥门限人数，
+//! [`UpdaterBuilder::build`] 会依次调用 [`UpdaterBuilder::validate_required_fields`]、
+//! [`UpdaterBuilder::validate_endpoint_security`] 与 [`UpdaterBuilder::validate_signature_threshold`]，
+//! 校验必填字段、端点协议安全性与公钥门限人数，
 //! 任一不通过都返回明确的领域错误，绝不「带着错误配置继续运行」。
 
+use crate::config::{
+    UpdaterConfig, VersionComparator, is_insecure_http_url, redact_sensitive_headers,
+};
 use crate::download::is_file_url;
 use crate::error::{Result, UpdateError};
 use crate::manifest::{Manifest, current_target_triple};
@@ -34,136 +41,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// 自定义版本比较器函数指针/闭包类型（输入当前版本与远端版本，返回 true 表示需要更新）
-pub type VersionComparator = Arc<dyn Fn(&Version, &Version) -> bool + Send + Sync>;
-
-/// 更新器核心配置结构体
-///
-/// # 设计原理
-/// - **实现初衷**：收敛更新器实例化所需的版本号、目标通道、验签公钥与超时参数，彻底消除多参数平铺。
-#[derive(Clone)]
-pub struct UpdaterConfig {
-    /// 宿主应用当前运行版本号
-    pub current_version: Version,
-    /// Manifest 元数据远端下载端点列表（支持多源容灾与自动故障转移）
-    pub endpoints: Vec<String>,
-    /// 动态发布源提供者（如 GitHub Releases 平台）
-    pub provider: Option<Arc<dyn ReleaseProvider>>,
-    /// 目标发布通道
-    pub channel: Option<String>,
-    /// Ed25519 验签公钥列表（Base64 编码，支持多公钥共存与平滑轮换）
-    pub public_keys: Vec<String>,
-    /// 网络超时时长
-    pub timeout: Duration,
-    /// 自定义 HTTP User-Agent
-    pub user_agent: Option<String>,
-    /// 自定义 HTTP 请求头字典（用于 Token 鉴权、Cookie 注入等）
-    pub headers: HashMap<String, String>,
-    /// HTTP / HTTPS / SOCKS 代理服务器地址
-    pub proxy: Option<String>,
-    /// 网络请求重试最大次数（默认 3 次）
-    pub max_retries: u32,
-    /// 网络重试初始退避延迟（默认 1 秒）
-    pub retry_delay: Duration,
-    /// 目标架构 Target Triple 标识
-    pub target: String,
-    /// 是否允许降级升级
-    pub allow_downgrade: bool,
-    /// 是否在构造 Updater 时自动执行启动自愈检查（默认为 false）
-    pub auto_recover_on_init: bool,
-    /// 是否允许不安全的明文 HTTP 传输协议（默认为 false）
-    pub dangerous_insecure_transport_protocol: bool,
-    /// 是否强制要求更新包携带数字签名（默认恒为 true，与构建 Profile 无关）
-    pub require_signature: bool,
-    /// 自定义版本比较器闭包（若未设置则按 SemVer 大于判断）
-    pub version_comparator: Option<VersionComparator>,
-    /// 用户更新偏好持久化文件路径（若为 None 则使用默认同级目录）
-    pub preference_path: Option<PathBuf>,
-    /// 后台下载最大带宽限速（字节/秒，若为 None 则不限速）
-    pub max_bytes_per_sec: Option<u64>,
-    /// 是否允许本地及共享协议（file://，默认为 false）
-    pub allow_file_protocol: bool,
-    /// 是否允许在 Windows 原地替换受阻时自动降级为系统重启延迟替换 (MoveFileEx)
-    pub allow_reboot_deferred_replace: bool,
-    /// 内嵌 Fallback Manifest 离线容灾兜底元数据
-    pub fallback_manifest: Option<Manifest>,
-    /// 客户端设备稳定唯一标识（用于灰度放量哈希分桶）
-    pub client_id: Option<String>,
-    /// 最大保留的历史版本回滚备份数量（默认 3）
-    pub max_rollback_entries: usize,
-    /// 自定义受信任根证书 PEM 字节数据列表（用于自建私有 PKI 或证书固定）
-    pub root_certificates_pem: Vec<Vec<u8>>,
-    /// TUF 门限多签要求的最低独立公钥签名法定数量（Threshold，默认 1）
-    pub signature_threshold: usize,
-    /// 是否开启多更新源端点并发竞速 (Happy Eyeballs) 探测机制
-    pub endpoint_racing: bool,
-    /// 并发竞速模式下的端点错峰阶梯启动延迟
-    pub stagger_delay: Duration,
-    /// 是否开启大文件多镜像源分片并行下载与拼装加速（默认为 false）
-    pub chunked_download: bool,
-    /// 分片并行下载并发 Worker 数量（默认为 4）
-    pub chunked_concurrency: usize,
-    /// 单个分片切片字节大小（默认为 4MB）
-    pub chunk_size: usize,
-    /// 全局配置的备用镜像下载直链列表
-    pub download_mirrors: Vec<String>,
-    /// 是否开启跨进程断点续传（使用确定性临时路径，进程重启后可继续未完成下载）
-    pub resumable_download: bool,
-}
-
-impl std::fmt::Debug for UpdaterConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UpdaterConfig")
-            .field("current_version", &self.current_version)
-            .field("endpoints", &self.endpoints)
-            .field("has_provider", &self.provider.is_some())
-            .field("channel", &self.channel)
-            .field("public_keys", &self.public_keys)
-            .field("timeout", &self.timeout)
-            .field("user_agent", &self.user_agent)
-            .field("headers", &redact_sensitive_headers(&self.headers))
-            .field("proxy", &self.proxy)
-            .field("max_retries", &self.max_retries)
-            .field("retry_delay", &self.retry_delay)
-            .field("target", &self.target)
-            .field("allow_downgrade", &self.allow_downgrade)
-            .field("auto_recover_on_init", &self.auto_recover_on_init)
-            .field(
-                "dangerous_insecure_transport_protocol",
-                &self.dangerous_insecure_transport_protocol,
-            )
-            .field("require_signature", &self.require_signature)
-            .field(
-                "has_custom_version_comparator",
-                &self.version_comparator.is_some(),
-            )
-            .field("preference_path", &self.preference_path)
-            .field("max_rollback_entries", &self.max_rollback_entries)
-            .field("root_certificates_count", &self.root_certificates_pem.len())
-            .field("signature_threshold", &self.signature_threshold)
-            .field("endpoint_racing", &self.endpoint_racing)
-            .field("stagger_delay", &self.stagger_delay)
-            .field("chunked_download", &self.chunked_download)
-            .field("chunked_concurrency", &self.chunked_concurrency)
-            .field("chunk_size", &self.chunk_size)
-            .field("download_mirrors_count", &self.download_mirrors.len())
-            .field("resumable_download", &self.resumable_download)
-            .finish()
-    }
-}
-
-impl UpdaterConfig {
-    /// 获取首选主验签公钥（向后兼容接口）
-    pub fn public_key(&self) -> Option<&str> {
-        self.public_keys.first().map(|s| s.as_str())
-    }
-
-    /// 获取首选主端点下载地址（向后兼容接口）
-    pub fn manifest_url(&self) -> Option<&str> {
-        self.endpoints.first().map(|s| s.as_str())
-    }
-}
 
 /// 更新器链式构建器
 ///
@@ -729,32 +606,32 @@ impl UpdaterBuilder {
         self
     }
 
-    /// 构建 Updater 实例并完成前置安全门禁与合法性校验
-    ///
-    /// # 校验内容
-    /// 1. 验证 `current_version` 已提供。
-    /// 2. 验证至少提供了一个有效的更新源端点（`manifest_url` 或 `endpoints`）或配置了 `provider`。
-    /// 3. 在未显式开启 `dangerous_insecure_transport_protocol` 时，拦截任何明文 HTTP 端点。
-    /// 4. 在未显式开启 `allow_file_protocol` 时，拦截任何 `file://` 协议端点。
-    /// 5. 在 `require_signature` 为 true 时，强制要求至少配置一枚验签公钥。
+    /// 校验必填字段完整性（`current_version` 与更新源端点/provider 二选一）
     ///
     /// # Errors
-    /// - 当缺少必填字段时返回 [`UpdateError::ManifestParse`]。
-    /// - 当端点使用明文 HTTP 且未显式允许时返回 [`UpdateError::InsecureTransportProtocol`]。
-    /// - 当端点使用 file:// 且未显式允许时返回 [`UpdateError::FileProtocolNotAllowed`]。
-    /// - 当强制验签模式下缺少公钥时返回 [`UpdateError::MissingPublicKey`]。
-    pub fn build(self) -> Result<Updater> {
-        let current_version = self.current_version.ok_or_else(|| {
-            UpdateError::ManifestParse("构建 Updater 必须提供 current_version".to_string())
-        })?;
-
+    /// 当缺少 `current_version`，或既未配置端点也未配置 `provider` 时，
+    /// 返回 [`UpdateError::ManifestParse`]。
+    fn validate_required_fields(&self) -> Result<()> {
+        if self.current_version.is_none() {
+            return Err(UpdateError::ManifestParse(
+                "构建 Updater 必须提供 current_version".to_string(),
+            ));
+        }
         if self.endpoints.is_empty() && self.provider.is_none() {
             return Err(UpdateError::ManifestParse(
                 "构建 Updater 必须提供至少一个更新端点 (manifest_url 或 endpoints) 或配置 provider"
                     .to_string(),
             ));
         }
+        Ok(())
+    }
 
+    /// 校验端点协议安全性（拦截明文 HTTP 与未授权的 file://）
+    ///
+    /// # Errors
+    /// - 当端点使用明文 HTTP 且未显式允许时返回 [`UpdateError::InsecureTransportProtocol`]。
+    /// - 当端点使用 file:// 且未显式允许时返回 [`UpdateError::FileProtocolNotAllowed`]。
+    fn validate_endpoint_security(&self) -> Result<()> {
         for ep in &self.endpoints {
             if !self.dangerous_insecure_transport_protocol && is_insecure_http_url(ep) {
                 return Err(UpdateError::InsecureTransportProtocol(ep.clone()));
@@ -763,11 +640,18 @@ impl UpdaterBuilder {
                 return Err(UpdateError::FileProtocolNotAllowed(ep.clone()));
             }
         }
+        Ok(())
+    }
 
+    /// 校验强制验签模式下的公钥配置与门限法定人数
+    ///
+    /// # Errors
+    /// - 当强制验签模式下缺少公钥时返回 [`UpdateError::MissingPublicKey`]。
+    /// - 当公钥数量少于门限法定人数时返回 [`UpdateError::ManifestParse`]。
+    fn validate_signature_threshold(&self) -> Result<()> {
         if self.require_signature && self.public_keys.is_empty() {
             return Err(UpdateError::MissingPublicKey);
         }
-
         if self.require_signature && self.public_keys.len() < self.signature_threshold {
             return Err(UpdateError::ManifestParse(format!(
                 "受信任公钥数量 ({}) 少于要求的门限法定人数 ({})",
@@ -775,6 +659,30 @@ impl UpdaterBuilder {
                 self.signature_threshold
             )));
         }
+        Ok(())
+    }
+
+    /// 构建 Updater 实例并完成前置安全门禁与合法性校验
+    ///
+    /// # 校验内容
+    /// 依次执行必填字段、端点协议安全性与验签门限三重门禁（见
+    /// [`Self::validate_required_fields`]、[`Self::validate_endpoint_security`]、
+    /// [`Self::validate_signature_threshold`]），全部通过后组装不可变配置快照并实例化引擎。
+    ///
+    /// # Errors
+    /// - 当缺少必填字段时返回 [`UpdateError::ManifestParse`]。
+    /// - 当端点使用明文 HTTP 且未显式允许时返回 [`UpdateError::InsecureTransportProtocol`]。
+    /// - 当端点使用 file:// 且未显式允许时返回 [`UpdateError::FileProtocolNotAllowed`]。
+    /// - 当强制验签模式下缺少公钥时返回 [`UpdateError::MissingPublicKey`]。
+    pub fn build(mut self) -> Result<Updater> {
+        self.validate_required_fields()?;
+        self.validate_endpoint_security()?;
+        self.validate_signature_threshold()?;
+
+        // 前置门禁已确保 current_version 存在，此处 take 仅做类型收窄，避免多余克隆
+        let current_version = self.current_version.take().ok_or_else(|| {
+            UpdateError::ManifestParse("构建 Updater 必须提供 current_version".to_string())
+        })?;
 
         let config = UpdaterConfig {
             current_version,
@@ -814,44 +722,6 @@ impl UpdaterBuilder {
 
         Ok(Updater::new(config))
     }
-}
-
-/// 检查指定 URL 是否为不安全的明文 HTTP 协议传输（忽略协议 Scheme 大小写）
-///
-/// # 设计原理
-/// - **实现初衷**：根据 RFC 3986 规范，URL Scheme 大小写不敏感。防范利用大写 `HTTP://` 或混合大小写绕过明文拦截。
-/// - **核心优势**：在栈上提取前 7 字节执行 ASCII 大小写无关比对，零堆内存分配。
-pub(crate) fn is_insecure_http_url(url: &str) -> bool {
-    let trimmed = url.trim();
-    if trimmed.len() >= 7 {
-        trimmed[..7].eq_ignore_ascii_case("http://")
-    } else {
-        false
-    }
-}
-
-/// 对敏感请求头（Authorization / Cookie 等）执行 Debug 脱敏
-///
-/// # 设计原理
-/// - **实现初衷**：配置结构体常被日志或错误上下文打印，若明文输出 Basic/Bearer 凭据将造成凭证泄漏。
-/// - **核心优势**：仅在格式化视图中替换为掩码，不修改真实运行时配置。
-fn redact_sensitive_headers(headers: &HashMap<String, String>) -> HashMap<&str, String> {
-    headers
-        .iter()
-        .map(|(k, v)| {
-            let key_lower = k.to_ascii_lowercase();
-            let display = if key_lower == "authorization"
-                || key_lower == "cookie"
-                || key_lower == "proxy-authorization"
-                || key_lower == "set-cookie"
-            {
-                "***".to_string()
-            } else {
-                v.clone()
-            };
-            (k.as_str(), display)
-        })
-        .collect()
 }
 
 #[cfg(test)]

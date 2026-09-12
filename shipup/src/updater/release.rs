@@ -20,7 +20,7 @@
 
 #![cfg_attr(not(any(feature = "blocking", feature = "async")), allow(unused))]
 
-use crate::builder::is_insecure_http_url;
+use crate::config::is_insecure_http_url;
 use crate::download::{self, DownloadOptions};
 use crate::error::{Result, UpdateError};
 use crate::event::UpdateEvent;
@@ -37,6 +37,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+#[cfg(any(feature = "blocking", feature = "async"))]
+use crate::updater::http::HttpClientOptions;
 #[cfg(feature = "async")]
 use crate::updater::http::build_async_http_client;
 #[cfg(feature = "blocking")]
@@ -114,6 +116,35 @@ impl Update {
     where
         F: FnMut(UpdateEvent),
     {
+        self.validate_package_transport()?;
+
+        let client =
+            build_blocking_http_client(&HttpClientOptions::from_network_config(&self.config))?;
+        let temp_download_path = self.resolve_download_path()?;
+        let options = self.build_download_options(&temp_download_path, cancel_flag);
+        let mirrors = self.merge_download_mirrors();
+
+        if let Err(e) = self.download_and_verify_blocking(
+            &client,
+            &options,
+            &mirrors,
+            &temp_download_path,
+            &mut callback,
+        ) {
+            callback(UpdateEvent::Failed {
+                reason: e.to_string(),
+            });
+            return Err(e);
+        }
+
+        Ok(self.build_downloaded_update(temp_download_path))
+    }
+
+    /// 校验更新包传输协议是否满足安全策略（禁止明文 HTTP 与未授权 file:// 协议）
+    ///
+    /// # Errors
+    /// 当端点为明文 HTTP 或 file:// 协议且未被显式放行时返回对应错误。
+    fn validate_package_transport(&self) -> Result<()> {
         if !self.config.dangerous_insecure_transport_protocol
             && is_insecure_http_url(&self.release.package.url)
         {
@@ -128,61 +159,77 @@ impl Update {
             ));
         }
 
-        let client = build_blocking_http_client(
-            self.config.timeout,
-            self.config.user_agent.as_deref(),
-            &self.config.headers,
-            self.config.proxy.as_deref(),
-            &self.config.root_certificates_pem,
-        )?;
+        Ok(())
+    }
 
-        let temp_download_path = self.resolve_download_path()?;
-        let options = DownloadOptions {
+    /// 基于网络配置与暂存路径组装下载参数对象
+    fn build_download_options<'a>(
+        &'a self,
+        temp_path: &'a Path,
+        cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> DownloadOptions<'a> {
+        DownloadOptions {
             url: &self.release.package.url,
-            target_path: &temp_download_path,
+            target_path: temp_path,
             cancel_flag,
             max_retries: self.config.max_retries,
             retry_delay: self.config.retry_delay,
             expected_checksum: self.release.package.checksum.as_deref(),
             expected_size: self.release.package.size,
             max_bytes_per_sec: self.config.max_bytes_per_sec,
-        };
+        }
+    }
 
+    /// 合并清单自带镜像与全局配置镜像，去重后形成最终镜像列表
+    fn merge_download_mirrors(&self) -> Vec<String> {
         let mut mirrors = self.release.package.mirrors.clone();
         for m in &self.config.download_mirrors {
             if !mirrors.contains(m) {
                 mirrors.push(m.clone());
             }
         }
+        mirrors
+    }
 
-        if let Err(e) = (|| -> Result<()> {
-            if self.config.chunked_download {
-                let chunked_opts = download::ChunkedDownloadOptions {
-                    base: options,
-                    mirrors: &mirrors,
-                    concurrency: self.config.chunked_concurrency,
-                    chunk_size: self.config.chunk_size,
-                };
-                download::download_file_chunked_blocking(&client, &chunked_opts, &mut callback)?;
-            } else {
-                download::download_file_blocking(&client, &options, &mut callback)?;
-            }
-            self.verify_downloaded_payload(&temp_download_path, &mut callback)?;
-            Ok(())
-        })() {
-            callback(UpdateEvent::Failed {
-                reason: e.to_string(),
-            });
-            return Err(e);
-        }
-
-        Ok(DownloadedUpdate {
+    /// 构造已通过校验的待安装更新实体
+    fn build_downloaded_update(&self, downloaded_path: PathBuf) -> DownloadedUpdate {
+        DownloadedUpdate {
             current_version: self.current_version.clone(),
             release: self.release.clone(),
-            downloaded_path: temp_download_path,
+            downloaded_path,
             max_rollback_entries: self.config.max_rollback_entries,
             allow_reboot_deferred_replace: self.config.allow_reboot_deferred_replace,
-        })
+        }
+    }
+
+    /// 同步执行下载（整包或分片）并对暂存文件完成完整性与签名校验
+    ///
+    /// # Errors
+    /// 下载失败或哈希/签名校验不通过时返回对应错误。
+    #[cfg(feature = "blocking")]
+    fn download_and_verify_blocking<F>(
+        &self,
+        client: &reqwest::blocking::Client,
+        options: &DownloadOptions<'_>,
+        mirrors: &[String],
+        temp_path: &Path,
+        callback: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(UpdateEvent),
+    {
+        if self.config.chunked_download {
+            let chunked_opts = download::ChunkedDownloadOptions {
+                base: options.clone(),
+                mirrors,
+                concurrency: self.config.chunked_concurrency,
+                chunk_size: self.config.chunk_size,
+            };
+            download::download_file_chunked_blocking(client, &chunked_opts, &mut *callback)?;
+        } else {
+            download::download_file_blocking(client, options, &mut *callback)?;
+        }
+        self.verify_downloaded_payload(temp_path, callback)
     }
 
     #[cfg(feature = "blocking")]
@@ -240,88 +287,23 @@ impl Update {
     where
         F: FnMut(UpdateEvent) + Send,
     {
-        if !self.config.dangerous_insecure_transport_protocol
-            && is_insecure_http_url(&self.release.package.url)
-        {
-            return Err(UpdateError::InsecureTransportProtocol(
-                self.release.package.url.clone(),
-            ));
-        }
+        self.validate_package_transport()?;
 
-        if !self.config.allow_file_protocol && download::is_file_url(&self.release.package.url) {
-            return Err(UpdateError::FileProtocolNotAllowed(
-                self.release.package.url.clone(),
-            ));
-        }
-
-        let client = build_async_http_client(
-            self.config.timeout,
-            self.config.user_agent.as_deref(),
-            &self.config.headers,
-            self.config.proxy.as_deref(),
-            &self.config.root_certificates_pem,
-        )?;
-
+        let client =
+            build_async_http_client(&HttpClientOptions::from_network_config(&self.config))?;
         let temp_download_path = self.resolve_download_path()?;
-        let options = DownloadOptions {
-            url: &self.release.package.url,
-            target_path: &temp_download_path,
-            cancel_flag,
-            max_retries: self.config.max_retries,
-            retry_delay: self.config.retry_delay,
-            expected_checksum: self.release.package.checksum.as_deref(),
-            expected_size: self.release.package.size,
-            max_bytes_per_sec: self.config.max_bytes_per_sec,
-        };
+        let options = self.build_download_options(&temp_download_path, cancel_flag);
+        let mirrors = self.merge_download_mirrors();
 
-        let mut mirrors = self.release.package.mirrors.clone();
-        for m in &self.config.download_mirrors {
-            if !mirrors.contains(m) {
-                mirrors.push(m.clone());
-            }
-        }
-
-        let download_and_verify_result: Result<()> = async {
-            if self.config.chunked_download {
-                let chunked_opts = download::ChunkedDownloadOptions {
-                    base: options,
-                    mirrors: &mirrors,
-                    concurrency: self.config.chunked_concurrency,
-                    chunk_size: self.config.chunk_size,
-                };
-                download::download_file_chunked_async(&client, &chunked_opts, &mut callback)
-                    .await?;
-            } else {
-                download::download_file_async(&client, &options, &mut callback).await?;
-            }
-
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let this = self.clone();
-            let target_temp_path = temp_download_path.clone();
-
-            let blocking_handle = tokio::task::spawn_blocking(move || {
-                this.verify_downloaded_payload(&target_temp_path, &mut |event| {
-                    let _ = tx.send(event);
-                })
-            });
-
-            while let Some(event) = rx.recv().await {
-                callback(event);
-            }
-
-            match blocking_handle.await {
-                Ok(res) => res?,
-                Err(join_err) => {
-                    return Err(UpdateError::SelfReplace(format!(
-                        "后台签名校验任务异常中止: {}",
-                        join_err
-                    )));
-                }
-            }
-
-            Ok(())
-        }
-        .await;
+        let download_and_verify_result = self
+            .download_and_verify_async(
+                &client,
+                &options,
+                &mirrors,
+                &temp_download_path,
+                &mut callback,
+            )
+            .await;
 
         if let Err(e) = download_and_verify_result {
             callback(UpdateEvent::Failed {
@@ -330,13 +312,75 @@ impl Update {
             return Err(e);
         }
 
-        Ok(DownloadedUpdate {
-            current_version: self.current_version.clone(),
-            release: self.release.clone(),
-            downloaded_path: temp_download_path,
-            max_rollback_entries: self.config.max_rollback_entries,
-            allow_reboot_deferred_replace: self.config.allow_reboot_deferred_replace,
-        })
+        Ok(self.build_downloaded_update(temp_download_path))
+    }
+
+    /// 异步执行下载（整包或分片），并将阻塞型验签调度至专用线程池
+    ///
+    /// # Errors
+    /// 下载失败、哈希/签名校验不通过或验签任务异常中止时返回对应错误。
+    #[cfg(feature = "async")]
+    async fn download_and_verify_async<F>(
+        &self,
+        client: &reqwest::Client,
+        options: &DownloadOptions<'_>,
+        mirrors: &[String],
+        temp_path: &Path,
+        callback: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(UpdateEvent) + Send,
+    {
+        if self.config.chunked_download {
+            let chunked_opts = download::ChunkedDownloadOptions {
+                base: options.clone(),
+                mirrors,
+                concurrency: self.config.chunked_concurrency,
+                chunk_size: self.config.chunk_size,
+            };
+            download::download_file_chunked_async(client, &chunked_opts, &mut *callback).await?;
+        } else {
+            download::download_file_async(client, options, &mut *callback).await?;
+        }
+
+        self.verify_payload_on_blocking_pool(temp_path, callback)
+            .await
+    }
+
+    /// 将阻塞型哈希与签名校验调度至阻塞线程池，并把事件经通道桥接回异步回调
+    ///
+    /// # Errors
+    /// 校验失败时返回对应错误；验签任务异常中止时返回 [`UpdateError::SelfReplace`]。
+    #[cfg(feature = "async")]
+    async fn verify_payload_on_blocking_pool<F>(
+        &self,
+        temp_path: &Path,
+        callback: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(UpdateEvent) + Send,
+    {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let this = self.clone();
+        let target_temp_path = temp_path.to_path_buf();
+
+        let blocking_handle = tokio::task::spawn_blocking(move || {
+            this.verify_downloaded_payload(&target_temp_path, &mut |event| {
+                let _ = tx.send(event);
+            })
+        });
+
+        while let Some(event) = rx.recv().await {
+            callback(event);
+        }
+
+        match blocking_handle.await {
+            Ok(res) => res,
+            Err(join_err) => Err(UpdateError::SelfReplace(format!(
+                "后台签名校验任务异常中止: {}",
+                join_err
+            ))),
+        }
     }
 
     #[cfg(feature = "async")]

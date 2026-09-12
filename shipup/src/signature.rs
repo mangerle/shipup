@@ -255,6 +255,47 @@ pub fn verify_ed25519_threshold(
     base64_public_keys: &[impl AsRef<str>],
     threshold: usize,
 ) -> Result<()> {
+    let required_threshold =
+        validate_threshold_preconditions(signatures, base64_public_keys, threshold)?;
+
+    let mut verified_keys = HashSet::with_capacity(signatures.len());
+    let mut diagnostics = Vec::with_capacity(signatures.len());
+
+    for (sig_idx, entry) in signatures.iter().enumerate() {
+        try_match_signature_entry(
+            data,
+            entry,
+            sig_idx,
+            base64_public_keys,
+            &mut verified_keys,
+            &mut diagnostics,
+        );
+
+        if verified_keys.len() >= required_threshold {
+            return Ok(());
+        }
+    }
+
+    Err(build_threshold_failure(
+        required_threshold,
+        signatures.len(),
+        base64_public_keys,
+        &verified_keys,
+        &diagnostics,
+    ))
+}
+
+/// 门限验签前置条件校验：公钥/签名非空，且候选签名数量不低于法定门限
+///
+/// # Errors
+/// - 公钥列表为空：[`UpdateError::MissingPublicKey`]；
+/// - 候选签名集合为空：[`UpdateError::MissingSignature`]；
+/// - 候选签名总数小于门限：[`UpdateError::ThresholdNotMet`]。
+fn validate_threshold_preconditions(
+    signatures: &[SignatureEntry],
+    base64_public_keys: &[impl AsRef<str>],
+    threshold: usize,
+) -> Result<usize> {
     if base64_public_keys.is_empty() {
         return Err(UpdateError::MissingPublicKey);
     }
@@ -277,60 +318,66 @@ pub fn verify_ed25519_threshold(
         });
     }
 
-    let mut verified_keys = HashSet::with_capacity(signatures.len());
-    let mut diagnostics = Vec::with_capacity(signatures.len());
+    Ok(required_threshold)
+}
 
-    for (sig_idx, entry) in signatures.iter().enumerate() {
-        let mut matched_for_entry = false;
-
-        for pub_key in base64_public_keys {
-            let pk_str = pub_key.as_ref().trim();
-            if verified_keys.contains(pk_str) {
-                // 该公钥已被其他有效签名使用，禁止重复计票
-                continue;
-            }
-
-            if verify_ed25519(data, &entry.signature, pk_str).is_ok() {
-                verified_keys.insert(pk_str.to_string());
-                diagnostics.push(format!(
-                    "候选签名 #{} 成功通过公钥认证 (当前已累积有效独立签名: {})",
-                    sig_idx + 1,
-                    verified_keys.len()
-                ));
-                matched_for_entry = true;
-                break;
-            }
+/// 尝试用尚未使用过的受信任公钥匹配单条候选签名，命中即计入独立票并短路
+fn try_match_signature_entry(
+    data: &[u8],
+    entry: &SignatureEntry,
+    sig_idx: usize,
+    base64_public_keys: &[impl AsRef<str>],
+    verified_keys: &mut HashSet<String>,
+    diagnostics: &mut Vec<String>,
+) {
+    for pub_key in base64_public_keys {
+        let pk_str = pub_key.as_ref().trim();
+        if verified_keys.contains(pk_str) {
+            // 该公钥已被其他有效签名使用，禁止重复计票
+            continue;
         }
 
-        if !matched_for_entry {
+        if verify_ed25519(data, &entry.signature, pk_str).is_ok() {
+            verified_keys.insert(pk_str.to_string());
             diagnostics.push(format!(
-                "候选签名 #{} 未能匹配任何可用且未使用的受信任公钥",
-                sig_idx + 1
+                "候选签名 #{} 成功通过公钥认证 (当前已累积有效独立签名: {})",
+                sig_idx + 1,
+                verified_keys.len()
             ));
-        }
-
-        if verified_keys.len() >= required_threshold {
-            return Ok(());
+            return;
         }
     }
 
-    if required_threshold == 1 && signatures.len() == 1 {
+    diagnostics.push(format!(
+        "候选签名 #{} 未能匹配任何可用且未使用的受信任公钥",
+        sig_idx + 1
+    ));
+}
+
+/// 构造门限未达标时的最终错误：单签单公钥退化为 InvalidSignature，其余携带完整诊断
+fn build_threshold_failure(
+    required_threshold: usize,
+    total_signatures: usize,
+    base64_public_keys: &[impl AsRef<str>],
+    verified_keys: &HashSet<String>,
+    diagnostics: &[String],
+) -> UpdateError {
+    if required_threshold == 1 && total_signatures == 1 {
         if base64_public_keys.len() == 1 {
-            return Err(UpdateError::InvalidSignature);
-        } else {
-            return Err(UpdateError::MultiKeyVerificationFailed {
-                count: base64_public_keys.len(),
-                details: diagnostics.join("; "),
-            });
+            return UpdateError::InvalidSignature;
         }
+        return UpdateError::MultiKeyVerificationFailed {
+            count: base64_public_keys.len(),
+            details: diagnostics.join("; "),
+        };
     }
 
-    Err(UpdateError::ThresholdNotMet {
+    UpdateError::ThresholdNotMet {
         threshold: required_threshold,
         valid_count: verified_keys.len(),
-        total_signatures: signatures.len(),
+        total_signatures,
         details: diagnostics.join("; "),
-    })
+    }
 }
 
 /// 允许一次性读入内存执行 Ed25519 签名验证的最大文件体积上限（512MB）

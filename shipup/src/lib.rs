@@ -14,6 +14,7 @@
 
 pub mod archive;
 pub(crate) mod builder;
+pub(crate) mod config;
 pub mod download;
 pub mod error;
 pub mod event;
@@ -30,7 +31,8 @@ pub mod template;
 pub(crate) mod updater;
 
 // 常用核心类型直接重导出
-pub use builder::{UpdaterBuilder, UpdaterConfig, VersionComparator};
+pub use builder::UpdaterBuilder;
+pub use config::{UpdaterConfig, VersionComparator};
 pub use download::{
     ChunkedDownloadOptions, DEFAULT_CHUNK_SIZE, DEFAULT_CHUNKED_CONCURRENCY, DownloadOptions,
     FileChunkRange, split_file_into_chunks,

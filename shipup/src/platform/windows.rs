@@ -109,7 +109,8 @@ pub fn replace_current_binary(new_binary_path: &Path) -> Result<()> {
 /// - **实现初衷**：统一抽象 Windows 下主流安装包的静默与被动参数规范。
 ///   MSI 安装包通过 `msiexec.exe /i <path>` 拉起，结合 `/passive`、`/qn` 与 `/norestart`；
 ///   EXE 安装程序（如 NSIS 或 Inno Setup）则注入 `/S` 或 `/passive`。
-/// - **核心优势**：用户自定义参数追加在标准标志之后，兼具标准化与高度灵活性。
+/// - **核心优势**：用户自定义参数追加在标准标志之后，兼具标准化与高度灵活性；
+///   交互模式到标准参数的映射收敛为静态表驱动，新增模式只需改表。
 pub(crate) fn build_windows_installer_args(
     installer_path: &Path,
     options: &InstallerOptions<'_>,
@@ -119,61 +120,62 @@ pub(crate) fn build_windows_installer_args(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    let is_msi = ext == "msi";
+
+    let program = if is_msi {
+        "msiexec".to_string()
+    } else {
+        installer_path.to_string_lossy().to_string()
+    };
 
     let mut args = Vec::with_capacity(options.user_args.len() + 4);
-    let program: String;
-
-    if ext == "msi" {
-        program = "msiexec".to_string();
+    if is_msi {
         args.push("/i".to_string());
         args.push(installer_path.to_string_lossy().to_string());
-
-        match options.install_mode {
-            Some(InstallMode::Passive) => {
-                args.push("/passive".to_string());
-                args.push("/norestart".to_string());
-            }
-            Some(InstallMode::Quiet) => {
-                args.push("/qn".to_string());
-                args.push("/norestart".to_string());
-            }
-            Some(InstallMode::BasicUi) => {
-                args.push("/qb".to_string());
-                args.push("/norestart".to_string());
-            }
-            None => {
-                if options.user_args.is_empty() {
-                    args.push("/passive".to_string());
-                    args.push("/norestart".to_string());
-                }
-            }
-        }
-        // 用户自定义参数追加在标准模式参数之后，避免粗暴全覆盖
-        args.extend(options.user_args.iter().cloned());
-    } else {
-        program = installer_path.to_string_lossy().to_string();
-
-        match options.install_mode {
-            Some(InstallMode::Passive) => {
-                args.push("/passive".to_string());
-            }
-            Some(InstallMode::Quiet) => {
-                args.push("/S".to_string());
-            }
-            Some(InstallMode::BasicUi) => {
-                // 基础 UI 模式不注入静默标志
-            }
-            None => {
-                if options.user_args.is_empty() {
-                    args.push("/S".to_string());
-                }
-            }
-        }
-        // 用户自定义参数追加在标准模式参数之后
-        args.extend(options.user_args.iter().cloned());
     }
 
+    // 表驱动选择标准参数：无显式模式且无自定义参数时按安装器类型施加缺省静默策略
+    let effective_mode = resolve_effective_install_mode(is_msi, options);
+    args.extend(
+        standard_installer_args(is_msi, effective_mode)
+            .iter()
+            .map(|s| (*s).to_string()),
+    );
+    // 用户自定义参数追加在标准模式参数之后，避免粗暴全覆盖
+    args.extend(options.user_args.iter().cloned());
+
     (program, args)
+}
+
+/// 决策生效的交互模式：显式指定优先；未指定且无自定义参数时按类型施加缺省
+fn resolve_effective_install_mode(
+    is_msi: bool,
+    options: &InstallerOptions<'_>,
+) -> Option<InstallMode> {
+    match options.install_mode {
+        Some(mode) => Some(mode),
+        // 无显式模式且用户自带参数时，完全交由用户控制，不注入任何标准静默标志
+        None if !options.user_args.is_empty() => None,
+        // 缺省策略：MSI 走 /passive，EXE 走 /S
+        None => Some(if is_msi {
+            InstallMode::Passive
+        } else {
+            InstallMode::Quiet
+        }),
+    }
+}
+
+/// 表驱动：根据安装器类型与交互模式返回应注入的标准静默参数
+fn standard_installer_args(is_msi: bool, mode: Option<InstallMode>) -> &'static [&'static str] {
+    match (is_msi, mode) {
+        (true, Some(InstallMode::Passive)) => &["/passive", "/norestart"],
+        (true, Some(InstallMode::Quiet)) => &["/qn", "/norestart"],
+        (true, Some(InstallMode::BasicUi)) => &["/qb", "/norestart"],
+        (false, Some(InstallMode::Passive)) => &["/passive"],
+        (false, Some(InstallMode::Quiet)) => &["/S"],
+        // EXE 的 BasicUi 模式不注入静默标志；None 表示完全交由用户参数控制
+        (false, Some(InstallMode::BasicUi)) | (_, None) => &[],
+    }
 }
 
 /// Win32 原生 API 绑定子模块。
@@ -207,23 +209,23 @@ mod ffi {
         /// 成功时返回大于 32 的伪句柄值，失败时返回表示错误类别的较小整数码。
         pub fn ShellExecuteW(
             hwnd: *mut c_void,
-            lpOperation: *const u16,
-            lpFile: *const u16,
-            lpParameters: *const u16,
-            lpDirectory: *const u16,
-            nShowCmd: i32,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
         ) -> *mut c_void;
     }
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        /// 移动或替换文件，可按 `dwFlags` 登记为「重启阶段执行」。
+        /// 移动或替换文件，可按 `dw_flags` 登记为「重启阶段执行」。
         ///
         /// 返回非零表示成功，返回 0 表示失败（错误码通过 `GetLastError` 获取）。
         pub fn MoveFileExW(
-            lpExistingFileName: *const u16,
-            lpNewFileName: *const u16,
-            dwFlags: u32,
+            lp_existing_file_name: *const u16,
+            lp_new_file_name: *const u16,
+            dw_flags: u32,
         ) -> i32;
     }
 }
@@ -606,7 +608,7 @@ mod tests {
 
     #[test]
     fn test_schedule_reboot_replace_and_delete_api() {
-        let temp_dir = std::env::temp_dir();
+        let temp_dir = env::temp_dir();
         let src = temp_dir.join(format!("test_src_{}.exe", std::process::id()));
         let dst = temp_dir.join(format!("test_dst_{}.exe", std::process::id()));
         let _ = fs::write(&src, b"src content");

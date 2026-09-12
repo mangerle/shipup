@@ -21,7 +21,7 @@
 //! `check` / `check_endpoints_racing_blocking` 依赖 `blocking`；
 //! `check_async` / `check_endpoints_racing_async` 依赖 `async`。
 //!
-//! [`crate::Updater`]: super::Updater
+//! [`crate::Updater`]: Updater
 
 #![cfg_attr(not(any(feature = "blocking", feature = "async")), allow(unused))]
 
@@ -36,6 +36,8 @@ use std::sync::Arc;
 #[cfg(feature = "blocking")]
 use std::fs;
 
+#[cfg(any(feature = "blocking", feature = "async"))]
+use crate::updater::http::HttpClientOptions;
 #[cfg(feature = "async")]
 use crate::updater::http::{build_async_http_client, fetch_manifest_async};
 #[cfg(feature = "blocking")]
@@ -43,68 +45,73 @@ use crate::updater::http::{build_blocking_http_client, fetch_manifest_blocking};
 
 impl Updater {
     #[cfg(feature = "blocking")]
-    /// 同步阻塞检查是否有可用更新（支持多端点自动故障转移）
+    /// 尝试经由动态发布源取回清单；成功则评估，失败且无静态端点时回退/上抛。
     ///
-    /// # 设计原理
-    /// - **实现初衷**：在单次调用中按优先级轮询所有端点，单个端点故障自动降级切换至下一个端点。
-    /// - **核心优势**：提升 CDN 与更新源的高可用性，单点宕机不会导致客户端更新中断。
-    ///
-    /// # Errors
-    /// 当所有配置的更新端点均无法连通或解析失败时返回最终错误。
-    pub fn check(&self) -> Result<Option<Update>> {
-        if let Some(ref provider) = self.inner.provider {
-            log::info!("正在通过动态发布源 ReleaseProvider 获取清单...");
-            match provider.fetch_manifest_blocking() {
-                Ok(manifest) => {
-                    log::info!("动态发布源清单获取成功 (版本: {})", manifest.version);
-                    return self.evaluate_manifest_struct(&manifest);
-                }
-                Err(e) => {
-                    log::warn!("通过动态发布源获取清单失败: {}, 尝试降级至静态端点", e);
-                    if self.inner.endpoints.is_empty() {
-                        if let Some(ref fallback) = self.inner.fallback_manifest {
-                            log::warn!(
-                                "动态发布源失败且无备用端点，降级采用内嵌 Fallback Manifest 评估更新"
-                            );
-                            return self.evaluate_manifest_struct(fallback);
-                        }
-                        return Err(e);
-                    }
+    /// 返回 `Some(result)` 表示本阶段已给出最终结论，调用方应直接返回；
+    /// 返回 `None` 表示应继续尝试静态端点列表。
+    fn try_provider_manifest_blocking(&self) -> Option<Result<Option<Update>>> {
+        let provider = self.inner.provider.as_ref()?;
+        log::info!("正在通过动态发布源 ReleaseProvider 获取清单...");
+        match provider.fetch_manifest_blocking() {
+            Ok(manifest) => {
+                log::info!("动态发布源清单获取成功 (版本: {})", manifest.version);
+                Some(self.evaluate_manifest_struct(&manifest))
+            }
+            Err(e) => {
+                log::warn!("通过动态发布源获取清单失败: {}, 尝试降级至静态端点", e);
+                if self.inner.endpoints.is_empty() {
+                    Some(self.fallback_or_err(e))
+                } else {
+                    None
                 }
             }
         }
+    }
 
-        let client = build_blocking_http_client(
-            self.inner.config.timeout,
-            self.inner.config.user_agent.as_deref(),
-            &self.inner.config.headers,
-            self.inner.config.proxy.as_deref(),
-            &self.inner.config.root_certificates_pem,
-        )?;
-
-        let template_ctx = TemplateContext {
-            target: &self.inner.target,
-            current_version: &self.inner.current_version,
-            channel: self.inner.channel.as_deref(),
-        };
-
-        if self.inner.endpoints.len() > 1 && self.inner.config.endpoint_racing {
-            return self.check_endpoints_racing_blocking(&client, &template_ctx);
+    #[cfg(feature = "async")]
+    /// 异步版本的动态发布源探测，语义与 [`Self::try_provider_manifest_blocking`] 对齐。
+    async fn try_provider_manifest_async(&self) -> Option<Result<Option<Update>>> {
+        let provider = self.inner.provider.as_ref()?;
+        log::info!("正在异步通过动态发布源 ReleaseProvider 获取清单...");
+        match provider.fetch_manifest_async().await {
+            Ok(manifest) => {
+                log::info!("异步动态发布源清单获取成功 (版本: {})", manifest.version);
+                Some(self.evaluate_manifest_struct(&manifest))
+            }
+            Err(e) => {
+                log::warn!("异步通过动态发布源获取清单失败: {}, 尝试降级至静态端点", e);
+                if self.inner.endpoints.is_empty() {
+                    Some(self.fallback_or_err(e))
+                } else {
+                    None
+                }
+            }
         }
+    }
 
-        let mut last_error = None;
+    /// 全部端点失败后的收口：优先内嵌 Fallback Manifest，否则原样上抛最终错误
+    fn fallback_or_err(&self, last_error: UpdateError) -> Result<Option<Update>> {
+        if let Some(ref fallback) = self.inner.fallback_manifest {
+            log::warn!("所有配置的更新源端点均无法连通，降级采用内嵌 Fallback Manifest 评估更新");
+            return self.evaluate_manifest_struct(fallback);
+        }
+        Err(last_error)
+    }
+
+    #[cfg(feature = "blocking")]
+    /// 按优先级顺序轮询静态端点，任一成功即返回
+    fn try_endpoints_sequential_blocking(
+        &self,
+        client: &reqwest::blocking::Client,
+        template_ctx: &TemplateContext<'_>,
+    ) -> Result<Option<Update>> {
+        let mut last_error: Option<UpdateError> = None;
+        let total = self.inner.endpoints.len();
         for (idx, raw_endpoint) in self.inner.endpoints.iter().enumerate() {
-            let endpoint = resolve_url_template(raw_endpoint, &template_ctx);
-            log::info!(
-                "发起更新检查端点 [{}/{}]: {}",
-                idx + 1,
-                self.inner.endpoints.len(),
-                endpoint
-            );
+            let endpoint = resolve_url_template(raw_endpoint, template_ctx);
+            log::info!("发起更新检查端点 [{}/{}]: {}", idx + 1, total, endpoint);
 
-            let fetch_result = self.fetch_endpoint_blocking(&client, &endpoint);
-
-            match fetch_result {
+            match self.fetch_endpoint_blocking(client, &endpoint) {
                 Ok(body) => match self.evaluate_manifest(&body) {
                     Ok(res) => return Ok(res),
                     Err(e) => {
@@ -123,81 +130,26 @@ impl Updater {
             }
         }
 
-        if let Some(ref fallback) = self.inner.fallback_manifest {
-            log::warn!("所有配置的更新源端点均无法连通，降级采用内嵌 Fallback Manifest 评估更新");
-            return self.evaluate_manifest_struct(fallback);
-        }
-
-        Err(last_error.unwrap_or_else(|| {
+        let err = last_error.unwrap_or_else(|| {
             UpdateError::Network("所有配置的更新源端点均无法连接访问".to_string())
-        }))
+        });
+        self.fallback_or_err(err)
     }
 
     #[cfg(feature = "async")]
-    /// 异步检查是否有可用更新（支持多端点自动故障转移与 URL 模板渲染）
-    ///
-    /// # 设计原理
-    /// - **实现初衷**：契合 Tokio 异步运行时，无需派生额外线程即可非阻塞拉取远端 Manifest。
-    /// - **核心优势**：遇到单点故障自动异步降级切换，无死锁与跨 await 持锁风险。
-    ///
-    /// # Errors
-    /// 当所有配置的端点均异步失败时返回最终错误。
-    pub async fn check_async(&self) -> Result<Option<Update>> {
-        if let Some(ref provider) = self.inner.provider {
-            log::info!("正在异步通过动态发布源 ReleaseProvider 获取清单...");
-            match provider.fetch_manifest_async().await {
-                Ok(manifest) => {
-                    log::info!("异步动态发布源清单获取成功 (版本: {})", manifest.version);
-                    return self.evaluate_manifest_struct(&manifest);
-                }
-                Err(e) => {
-                    log::warn!("异步通过动态发布源获取清单失败: {}, 尝试降级至静态端点", e);
-                    if self.inner.endpoints.is_empty() {
-                        if let Some(ref fallback) = self.inner.fallback_manifest {
-                            log::warn!(
-                                "动态发布源失败且无备用端点，降级采用内嵌 Fallback Manifest 评估更新"
-                            );
-                            return self.evaluate_manifest_struct(fallback);
-                        }
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
-        let client = build_async_http_client(
-            self.inner.config.timeout,
-            self.inner.config.user_agent.as_deref(),
-            &self.inner.config.headers,
-            self.inner.config.proxy.as_deref(),
-            &self.inner.config.root_certificates_pem,
-        )?;
-
-        let template_ctx = TemplateContext {
-            target: &self.inner.target,
-            current_version: &self.inner.current_version,
-            channel: self.inner.channel.as_deref(),
-        };
-
-        if self.inner.endpoints.len() > 1 && self.inner.config.endpoint_racing {
-            return self
-                .check_endpoints_racing_async(&client, &template_ctx)
-                .await;
-        }
-
-        let mut last_error = None;
+    /// 异步按优先级顺序轮询静态端点，语义与 [`Self::try_endpoints_sequential_blocking`] 对齐
+    async fn try_endpoints_sequential_async(
+        &self,
+        client: &reqwest::Client,
+        template_ctx: &TemplateContext<'_>,
+    ) -> Result<Option<Update>> {
+        let mut last_error: Option<UpdateError> = None;
+        let total = self.inner.endpoints.len();
         for (idx, raw_endpoint) in self.inner.endpoints.iter().enumerate() {
-            let endpoint = resolve_url_template(raw_endpoint, &template_ctx);
-            log::info!(
-                "发起异步更新检查端点 [{}/{}]: {}",
-                idx + 1,
-                self.inner.endpoints.len(),
-                endpoint
-            );
+            let endpoint = resolve_url_template(raw_endpoint, template_ctx);
+            log::info!("发起异步更新检查端点 [{}/{}]: {}", idx + 1, total, endpoint);
 
-            let fetch_result = self.fetch_endpoint_async(&client, &endpoint).await;
-
-            match fetch_result {
+            match self.fetch_endpoint_async(client, &endpoint).await {
                 Ok(body) => match self.evaluate_manifest(&body) {
                     Ok(res) => return Ok(res),
                     Err(e) => {
@@ -216,16 +168,74 @@ impl Updater {
             }
         }
 
-        if let Some(ref fallback) = self.inner.fallback_manifest {
-            log::warn!(
-                "所有配置的更新源端点均无法异步连通，降级采用内嵌 Fallback Manifest 评估更新"
-            );
-            return self.evaluate_manifest_struct(fallback);
+        let err = last_error.unwrap_or_else(|| {
+            UpdateError::Network("所有配置的更新源端点均无法连接访问".to_string())
+        });
+        self.fallback_or_err(err)
+    }
+
+    #[cfg(feature = "blocking")]
+    /// 同步阻塞检查是否有可用更新（支持多端点自动故障转移）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：在单次调用中按优先级轮询所有端点，单个端点故障自动降级切换至下一个端点。
+    /// - **核心优势**：提升 CDN 与更新源的高可用性，单点宕机不会导致客户端更新中断。
+    ///
+    /// # Errors
+    /// 当所有配置的更新端点均无法连通或解析失败时返回最终错误。
+    pub fn check(&self) -> Result<Option<Update>> {
+        if let Some(res) = self.try_provider_manifest_blocking() {
+            return res;
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            UpdateError::Network("所有配置的更新源端点均无法连接访问".to_string())
-        }))
+        let client = build_blocking_http_client(&HttpClientOptions::from_network_config(
+            &self.inner.config,
+        ))?;
+
+        let template_ctx = TemplateContext {
+            target: &self.inner.target,
+            current_version: &self.inner.current_version,
+            channel: self.inner.channel.as_deref(),
+        };
+
+        if self.inner.endpoints.len() > 1 && self.inner.config.endpoint_racing {
+            return self.check_endpoints_racing_blocking(&client, &template_ctx);
+        }
+
+        self.try_endpoints_sequential_blocking(&client, &template_ctx)
+    }
+
+    #[cfg(feature = "async")]
+    /// 异步检查是否有可用更新（支持多端点自动故障转移与 URL 模板渲染）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：契合 Tokio 异步运行时，无需派生额外线程即可非阻塞拉取远端 Manifest。
+    /// - **核心优势**：遇到单点故障自动异步降级切换，无死锁与跨 await 持锁风险。
+    ///
+    /// # Errors
+    /// 当所有配置的端点均异步失败时返回最终错误。
+    pub async fn check_async(&self) -> Result<Option<Update>> {
+        if let Some(res) = self.try_provider_manifest_async().await {
+            return res;
+        }
+
+        let client =
+            build_async_http_client(&HttpClientOptions::from_network_config(&self.inner.config))?;
+
+        let template_ctx = TemplateContext {
+            target: &self.inner.target,
+            current_version: &self.inner.current_version,
+            channel: self.inner.channel.as_deref(),
+        };
+
+        if self.inner.endpoints.len() > 1 && self.inner.config.endpoint_racing {
+            return self
+                .check_endpoints_racing_async(&client, &template_ctx)
+                .await;
+        }
+
+        self.try_endpoints_sequential_async(&client, &template_ctx)
+            .await
     }
 
     #[cfg(feature = "blocking")]
@@ -242,7 +252,6 @@ impl Updater {
         template_ctx: &TemplateContext<'_>,
     ) -> Result<Option<Update>> {
         use std::sync::atomic::AtomicBool;
-        use std::sync::atomic::Ordering as AtomicOrdering;
 
         let endpoints: Vec<String> = self
             .inner
@@ -260,6 +269,32 @@ impl Updater {
 
         let settled = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
+        // spawn 内部持有并克隆 Sender，此处移交所有权后无需再 drop
+        self.spawn_blocking_racers(client, endpoints, &settled, tx);
+
+        match self.collect_blocking_race_results(rx, total, &settled) {
+            Ok(update) => Ok(update),
+            Err(err) => {
+                if let Some(ref fallback) = self.inner.fallback_manifest {
+                    log::warn!("所有竞速端点均请求失败，降级采用内嵌 Fallback Manifest 评估更新");
+                    return self.evaluate_manifest_struct(fallback);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    #[cfg(feature = "blocking")]
+    /// 派生同步竞速工作线程：错峰延迟后发起端点请求，胜出后放弃尚未起步的线程
+    fn spawn_blocking_racers(
+        &self,
+        client: &reqwest::blocking::Client,
+        endpoints: Vec<String>,
+        settled: &Arc<std::sync::atomic::AtomicBool>,
+        tx: std::sync::mpsc::Sender<(String, Result<Option<Update>>)>,
+    ) {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
         for (idx, endpoint) in endpoints.into_iter().enumerate() {
             let stagger = self
                 .inner
@@ -269,26 +304,32 @@ impl Updater {
             let client_cloned = client.clone();
             let tx_cloned = tx.clone();
             let updater = self.clone();
-            let settled_cloned = Arc::clone(&settled);
+            let settled_cloned = Arc::clone(settled);
 
             std::thread::spawn(move || {
                 if !stagger.is_zero() {
                     std::thread::sleep(stagger);
                 }
-
-                // 胜出后尚未真正发起请求的线程直接放弃，杜绝冗余流量
                 if settled_cloned.load(AtomicOrdering::Acquire) {
                     return;
                 }
-
                 let eval_res = updater
                     .fetch_endpoint_blocking(&client_cloned, &endpoint)
                     .and_then(|body| updater.evaluate_manifest(&body));
-
                 let _ = tx_cloned.send((endpoint, eval_res));
             });
         }
-        drop(tx);
+    }
+
+    #[cfg(feature = "blocking")]
+    /// 汇总同步竞速结果；全部端点失败时返回最后一个底层错误
+    fn collect_blocking_race_results(
+        &self,
+        rx: std::sync::mpsc::Receiver<(String, Result<Option<Update>>)>,
+        total: usize,
+        settled: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<Update>> {
+        use std::sync::atomic::Ordering as AtomicOrdering;
 
         let mut last_err = None;
         let mut completed = 0usize;
@@ -296,7 +337,6 @@ impl Updater {
             completed = completed.saturating_add(1);
             match result {
                 Ok(opt_update) => {
-                    // 先置位取消标志，再返回结果，通知其余线程放弃后续请求
                     settled.store(true, AtomicOrdering::Release);
                     log::info!("多更新源端点竞速胜出: {}", endpoint);
                     return Ok(opt_update);
@@ -310,14 +350,7 @@ impl Updater {
                 break;
             }
         }
-
         settled.store(true, AtomicOrdering::Release);
-
-        if let Some(ref fallback) = self.inner.fallback_manifest {
-            log::warn!("所有竞速端点均请求失败，降级采用内嵌 Fallback Manifest 评估更新");
-            return self.evaluate_manifest_struct(fallback);
-        }
-
         Err(last_err.unwrap_or_else(|| {
             UpdateError::Network("所有竞速更新源端点均无法连接访问".to_string())
         }))
@@ -342,15 +375,42 @@ impl Updater {
             .map(|raw| resolve_url_template(raw, template_ctx))
             .collect();
 
+        let total = endpoints.len();
         log::info!(
             "启动异步更新源端点并发竞速 (端点数: {}, 错峰间隔: {}ms)",
-            endpoints.len(),
+            total,
             self.inner.config.stagger_delay.as_millis()
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let mut join_handles = Vec::with_capacity(endpoints.len());
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let join_handles = self.spawn_async_racers(client, endpoints, tx);
 
+        match self.collect_async_race_results(rx, join_handles).await {
+            Ok(race_result) => race_result,
+            Err(last_err) => {
+                let err = last_err.unwrap_or_else(|| {
+                    UpdateError::Network("所有竞速更新源端点均无法连接访问".to_string())
+                });
+                if let Some(ref fallback) = self.inner.fallback_manifest {
+                    log::warn!(
+                        "所有异步竞速端点均请求失败，降级采用内嵌 Fallback Manifest 评估更新"
+                    );
+                    return self.evaluate_manifest_struct(fallback);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    #[cfg(feature = "async")]
+    /// 派生异步竞速任务：错峰延迟后发起端点请求，返回可统一 abort 的句柄列表
+    fn spawn_async_racers(
+        &self,
+        client: &reqwest::Client,
+        endpoints: Vec<String>,
+        tx: tokio::sync::mpsc::Sender<(String, Result<Option<Update>>)>,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut join_handles = Vec::with_capacity(endpoints.len());
         for (idx, endpoint) in endpoints.into_iter().enumerate() {
             let stagger = self
                 .inner
@@ -387,7 +447,16 @@ impl Updater {
             join_handles.push(handle);
         }
         drop(tx);
+        join_handles
+    }
 
+    #[cfg(feature = "async")]
+    /// 汇总异步竞速结果；胜出后 abort 其余任务，全部失败时返回最后一个底层错误
+    async fn collect_async_race_results(
+        &self,
+        mut rx: tokio::sync::mpsc::Receiver<(String, Result<Option<Update>>)>,
+        join_handles: Vec<tokio::task::JoinHandle<()>>,
+    ) -> std::result::Result<Result<Option<Update>>, Option<UpdateError>> {
         let mut last_err = None;
         let mut success_res = None;
 
@@ -408,18 +477,10 @@ impl Updater {
             h.abort();
         }
 
-        if let Some(opt_update) = success_res {
-            return Ok(opt_update);
+        match success_res {
+            Some(update) => Ok(Ok(update)),
+            None => Err(last_err),
         }
-
-        if let Some(ref fallback) = self.inner.fallback_manifest {
-            log::warn!("所有异步竞速端点均请求失败，降级采用内嵌 Fallback Manifest 评估更新");
-            return self.evaluate_manifest_struct(fallback);
-        }
-
-        Err(last_err.unwrap_or_else(|| {
-            UpdateError::Network("所有竞速更新源端点均无法连接访问".to_string())
-        }))
     }
 
     /// 解析并评估 Manifest 文本信息

@@ -4,6 +4,9 @@
 //! 定义 [`NetworkSecurityConfig`]，将网络请求策略（超时、代理、重试、请求头、限速、镜像）
 //! 与密码学安全策略（多公钥、门限签名、强制验签、TLS 协议约束）内聚为一个不可变配置实体。
 //!
+//! 本实体由 [`crate::config::UpdaterConfig`] 在 [`crate::updater::Updater::new`] 阶段拆分派生，
+//! 只承载运行期真正被下载与验签链路消费的安全字段，与业务调度字段（端点、通道、版本基准）分离。
+//!
 //! # 设计原理
 //! - **实现初衷**：`Updater`、`Update`、`DownloadedUpdate` 三层实体都需要读取同一份网络与安全策略，
 //!   若各自持有散装字段会引发配置漂移与多处克隆开销。
@@ -25,27 +28,49 @@ use std::time::Duration;
 /// - **核心优势**：配置通过 `Arc` 跨线程安全共享，不可被外部篡改，杜绝运行时竞争性安全降级。
 /// - **代价与局限**：一旦初始化完成，运行时连接参数即固定不可动态重载。
 pub(crate) struct NetworkSecurityConfig {
+    /// Ed25519 验签公钥列表（Base64 编码，任意一枚通过即视为合法）
     pub public_keys: Vec<String>,
+    /// 单次网络请求超时时长（默认 15 秒）
     pub timeout: Duration,
+    /// 自定义 HTTP User-Agent（若为 None 则使用库内置标识）
     pub user_agent: Option<String>,
+    /// 自定义 HTTP 请求头字典（鉴权凭证在 Debug 输出中自动脱敏）
     pub headers: HashMap<String, String>,
+    /// HTTP / HTTPS / SOCKS 代理服务器地址（若为 None 则直连）
     pub proxy: Option<String>,
+    /// 网络请求失败后的最大重试次数（默认 3 次）
     pub max_retries: u32,
+    /// 重试初始退避延迟（默认 1 秒，后续按指数退避）
     pub retry_delay: Duration,
+    /// 是否放行明文 HTTP 传输（默认 false；开启即放弃 TLS 保护，仅限受控调试）
     pub dangerous_insecure_transport_protocol: bool,
+    /// 是否强制要求更新包携带数字签名（默认 true，关闭将仅依赖哈希完整性）
     pub require_signature: bool,
+    /// 后台下载带宽限速（字节/秒，None 表示不限速）
     pub max_bytes_per_sec: Option<u64>,
+    /// 是否允许 file:// 本地协议端点（默认 false，防止未授权本地文件读取）
     pub allow_file_protocol: bool,
+    /// 是否允许 Windows 重启延迟替换降级路径（MoveFileEx，默认 false）
     pub allow_reboot_deferred_replace: bool,
+    /// 最大保留的历史版本回滚备份数量（默认 3）
     pub max_rollback_entries: usize,
+    /// 自定义受信任根证书 PEM 字节列表（私有 CA 或证书固定场景）
     pub root_certificates_pem: Vec<Vec<u8>>,
+    /// TUF 门限多签最低独立公钥签名法定数量（默认 1）
     pub signature_threshold: usize,
+    /// 是否开启多端点并发竞速探测（Happy Eyeballs，默认 false）
     pub endpoint_racing: bool,
+    /// 并发竞速时各端点错峰启动延迟（默认 250 毫秒）
     pub stagger_delay: Duration,
+    /// 是否开启大文件分片并行下载加速（默认 false）
     pub chunked_download: bool,
+    /// 分片并行下载并发 Worker 数量（默认 4，内部截断于 1..=16）
     pub chunked_concurrency: usize,
+    /// 单个分片切片字节大小（默认 4MB，内部下限 64KB）
     pub chunk_size: usize,
+    /// 备用镜像下载直链列表（用于分片流量分摊与故障转移）
     pub download_mirrors: Vec<String>,
+    /// 是否开启跨进程断点续传（默认 false；开启后使用确定性临时路径）
     pub resumable_download: bool,
 }
 
