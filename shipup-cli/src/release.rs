@@ -1,4 +1,22 @@
-// shipup-cli - 发布相关：密钥生成、单包/批量发布、独立签名与配置脚手架
+//! 发布相关命令模块：密钥生成、单包/批量发布、独立签名与配置脚手架。
+//!
+//! # 模块职责
+//! 实现 `keygen`、`release`、`init`、`sign` 四个子命令，覆盖从首次接入到日常发布的完整链路：
+//! 生成 Ed25519 密钥对、计算包体哈希并写入清单、对既有清单做增量更新、生成发布配置脚手架。
+//!
+//! # 设计原理
+//! - **实现初衷**：发布动作必须是「可重复、可校验、可增量」的：
+//!   同一版本反复发布不应产生内容漂移，多平台发布不应互相覆盖，补发单个平台不应重算全部平台。
+//! - **核心优势**：
+//!   - 批量发布以平台为键合并写入，已存在的其他平台条目原样保留，天然支持「分平台分流水线发布」；
+//!   - 清单读取失败时区分「文件不存在」与「内容损坏」两种情况：
+//!     前者允许初始化新清单，后者必须报错，杜绝静默覆盖既有发布记录；
+//!   - 私钥仅在签署瞬间读取，不写入任何日志或错误上下文。
+//! - **代价与局限**：批量模式按顺序处理配置中的平台条目，超大发布矩阵下耗时线性增长。
+//!
+//! # 安全契约
+//! 私钥文件路径与内容严禁出现在任何日志输出中；
+//! 生成的清单必须经过一次自校验（签名可验证、包体哈希可复算）后才允许落盘覆盖。
 
 use crate::cli::{InitArgs, ReleaseArgs, SignArgs};
 use crate::util::{compute_payload_integrity, current_utc_rfc3339, resolve_expires_at};
@@ -190,12 +208,43 @@ pub(crate) fn handle_release(args: &ReleaseArgs) -> Result<()> {
     Ok(())
 }
 
+/// 批量发布过程中各平台条目共享的上下文（参数对象模式）。
+///
+/// # 设计原理
+/// - **实现初衷**：批量发布需要为每个平台条目重复使用同一批「批次级」参数
+///   （配置目录、清单路径、版本、发布日期与批次配置本身）。
+///   若把这些参数逐个平铺到处理函数上，参数量会迅速突破可读上限，新增字段时也极易漏改某一处。
+/// - **核心优势**：把批次级参数收敛为一个借用视图，单平台处理函数只需接收
+///   「目标清单」「当前条目」与「批次上下文」三项，职责边界一目了然。
+/// - **代价与局限**：新增批次级参数时需同步扩展本结构体与唯一的构造处。
+struct BatchReleaseContext<'a> {
+    /// 批量配置文件所在目录，作为所有相对路径的解析基准
+    config_dir: &'a Path,
+    /// 最终写入的 Manifest 路径
+    manifest_path: &'a Path,
+    /// 本批次统一的目标版本号
+    version: &'a Version,
+    /// 本批次统一的最低支持版本号
+    min_supported_version: Option<&'a Version>,
+    /// 本批次统一的发布日期（RFC 3339）
+    pub_date: &'a str,
+    /// 原始批次配置，用于读取各条目的兜底字段
+    batch: &'a BatchReleaseConfig,
+}
+
 /// 执行基于 TOML 配置文件的跨平台批量发布合并
+///
+/// # 设计原理
+/// - **实现初衷**：多平台发布通常由不同流水线分头执行，需要在同一份清单上增量合并，
+///   同时保证任一平台失败时不产生「部分写入」的半成品清单。
+/// - **核心优势**：批次级参数只解析一次；每个平台的处理被收敛到 [`merge_single_package`]；
+///   所有平台全部成功后才统一落盘，中途失败不会污染既有清单。
+///
+/// # Errors
+/// 配置文件读取或 TOML 解析失败、版本号非法、任一平台包体缺失、哈希计算或元数据读取失败时返回错误。
 pub(crate) fn handle_batch_release(config_path: &Path, default_manifest_path: &Path) -> Result<()> {
-    let toml_content = fs::read_to_string(config_path)
-        .with_context(|| format!("读取批量发布配置文件失败: {}", config_path.display()))?;
-    let batch_config: BatchReleaseConfig = toml::from_str(&toml_content)
-        .with_context(|| format!("解析批量发布配置 TOML 失败: {}", config_path.display()))?;
+    let batch_config = load_batch_release_config(config_path)?;
+    let config_dir = config_path.parent().unwrap_or(Path::new("."));
 
     let version = Version::parse(&batch_config.version).with_context(|| {
         format!(
@@ -203,56 +252,107 @@ pub(crate) fn handle_batch_release(config_path: &Path, default_manifest_path: &P
             batch_config.version
         )
     })?;
-
-    let min_supported_version = match batch_config.min_supported_version {
-        Some(ref v) => {
-            Some(Version::parse(v).with_context(|| format!("解析最低支持版本号 '{}' 失败", v))?)
-        }
-        None => None,
-    };
-
+    let min_supported_version = batch_config
+        .min_supported_version
+        .as_ref()
+        .map(|v| Version::parse(v).with_context(|| format!("解析最低支持版本号 '{}' 失败", v)))
+        .transpose()?;
     let pub_date = batch_config
         .pub_date
         .clone()
         .unwrap_or_else(current_utc_rfc3339);
 
-    let config_dir = config_path.parent().unwrap_or(Path::new("."));
-
-    let manifest_path = batch_config
-        .manifest
-        .as_ref()
-        .map(|p| {
-            if p.is_relative() {
-                config_dir.join(p)
-            } else {
-                p.clone()
-            }
-        })
-        .unwrap_or_else(|| default_manifest_path.to_path_buf());
-
+    let manifest_path =
+        resolve_batch_manifest_path(&batch_config, config_dir, default_manifest_path);
     let resolved_expires_at = resolve_expires_at(
         batch_config.expires_at.as_deref(),
         batch_config.expires_in.as_deref(),
     )?;
 
-    let mut manifest = if manifest_path.exists() {
-        let content = fs::read_to_string(&manifest_path)
-            .with_context(|| format!("读取已有 Manifest 文件失败: {}", manifest_path.display()))?;
-        let mut m = serde_json::from_str::<Manifest>(&content)
-            .with_context(|| format!("反序列化 Manifest JSON 失败: {}", manifest_path.display()))?;
-        if resolved_expires_at.is_some() {
-            m.expires_at = resolved_expires_at;
-        }
-        if batch_config.version_seq.is_some() {
-            m.version_seq = batch_config.version_seq;
-        }
-        m
-    } else {
-        Manifest {
+    let mut manifest = load_or_init_batch_manifest(
+        &manifest_path,
+        &batch_config,
+        &version,
+        min_supported_version.as_ref(),
+        &pub_date,
+        resolved_expires_at,
+    )?;
+
+    let ctx = BatchReleaseContext {
+        config_dir,
+        manifest_path: &manifest_path,
+        version: &version,
+        min_supported_version: min_supported_version.as_ref(),
+        pub_date: &pub_date,
+        batch: &batch_config,
+    };
+
+    let mut success_count = 0usize;
+    for pkg in &batch_config.packages {
+        merge_single_package(&mut manifest, pkg, &ctx)?;
+        success_count = success_count.saturating_add(1);
+        log::info!("  已完成平台 '{}' 的包签名与清单合并", pkg.target);
+    }
+
+    save_manifest_file(&manifest_path, &manifest)?;
+    log::info!(
+        "批量发布成功！已合并 {} 个平台的包元数据并写入 Manifest：{}",
+        success_count,
+        manifest_path.display()
+    );
+    Ok(())
+}
+
+/// 读取并反序列化批量发布 TOML 配置。
+///
+/// # Errors
+/// 文件读取失败或 TOML 语法与字段不匹配时，返回带文件路径上下文的中文错误。
+fn load_batch_release_config(config_path: &Path) -> Result<BatchReleaseConfig> {
+    let toml_content = fs::read_to_string(config_path)
+        .with_context(|| format!("读取批量发布配置文件失败: {}", config_path.display()))?;
+    toml::from_str(&toml_content)
+        .with_context(|| format!("解析批量发布配置 TOML 失败: {}", config_path.display()))
+}
+
+/// 解析批量发布最终写入的 Manifest 路径。
+///
+/// 配置中的相对路径以配置文件所在目录为基准展开；未配置时回退到命令行给定的默认路径。
+fn resolve_batch_manifest_path(
+    batch_config: &BatchReleaseConfig,
+    config_dir: &Path,
+    default_manifest_path: &Path,
+) -> PathBuf {
+    batch_config
+        .manifest
+        .as_ref()
+        .map(|p| resolve_relative_to(config_dir, p))
+        .unwrap_or_else(|| default_manifest_path.to_path_buf())
+}
+
+/// 载入已有 Manifest 并覆盖批次级字段；文件不存在时按批次配置新建一份。
+///
+/// # 设计原理
+/// - **实现初衷**：批量发布需要支持「多次追加不同平台」的增量工作流，
+///   因此必须保留清单中已有的其他平台条目，只更新本批次声明的批次级字段。
+/// - **核心优势**：仅在配置显式提供时才覆盖 `expires_at` 与 `version_seq`，
+///   避免未填写字段被静默清空而削弱清单的防重放能力。
+///
+/// # Errors
+/// 读取或反序列化已有清单失败时，返回带文件路径上下文的中文错误。
+fn load_or_init_batch_manifest(
+    manifest_path: &Path,
+    batch_config: &BatchReleaseConfig,
+    version: &Version,
+    min_supported_version: Option<&Version>,
+    pub_date: &str,
+    resolved_expires_at: Option<String>,
+) -> Result<Manifest> {
+    if !manifest_path.exists() {
+        return Ok(Manifest {
             version: version.clone(),
-            min_supported_version: min_supported_version.clone(),
+            min_supported_version: min_supported_version.cloned(),
             force_update: batch_config.force_update,
-            pub_date: Some(pub_date.clone()),
+            pub_date: Some(pub_date.to_string()),
             notes: batch_config.notes.clone(),
             packages: BTreeMap::new(),
             channels: BTreeMap::new(),
@@ -261,63 +361,74 @@ pub(crate) fn handle_batch_release(config_path: &Path, default_manifest_path: &P
             rollout_percentage: batch_config.rollout_percentage,
             expires_at: resolved_expires_at,
             version_seq: batch_config.version_seq,
-        }
-    };
+        });
+    }
 
-    let mut success_count = 0usize;
+    let content = fs::read_to_string(manifest_path)
+        .with_context(|| format!("读取已有 Manifest 文件失败: {}", manifest_path.display()))?;
+    let mut manifest = serde_json::from_str::<Manifest>(&content)
+        .with_context(|| format!("反序列化 Manifest JSON 失败: {}", manifest_path.display()))?;
 
-    for pkg in &batch_config.packages {
-        let pkg_path = if pkg.package.is_relative() {
-            config_dir.join(&pkg.package)
-        } else {
-            pkg.package.clone()
-        };
+    if resolved_expires_at.is_some() {
+        manifest.expires_at = resolved_expires_at;
+    }
+    if batch_config.version_seq.is_some() {
+        manifest.version_seq = batch_config.version_seq;
+    }
+    Ok(manifest)
+}
 
-        if !pkg_path.exists() {
-            anyhow::bail!(
-                "平台 '{}' 对应的发布包文件不存在: {}",
-                pkg.target,
-                pkg_path.display()
-            );
-        }
+/// 计算单个平台包体的完整信息（哈希、签名、体积、安装模式）并合并进清单。
+///
+/// 若条目自身未指定密钥，则回退使用批次级 `key`；两者均未提供时生成无签名条目。
+///
+/// # Errors
+/// - 包体文件不存在：直接终止批量发布并指明缺失平台；
+/// - 包类型或安装模式字符串非法：返回带可选值提示的中文错误；
+/// - 哈希计算或元数据读取失败：返回带文件路径上下文的中文错误。
+fn merge_single_package(
+    manifest: &mut Manifest,
+    pkg: &BatchPackageConfig,
+    ctx: &BatchReleaseContext<'_>,
+) -> Result<()> {
+    let pkg_path = resolve_relative_to(ctx.config_dir, &pkg.package);
+    if !pkg_path.exists() {
+        anyhow::bail!(
+            "平台 '{}' 对应的发布包文件不存在: {}",
+            pkg.target,
+            pkg_path.display()
+        );
+    }
 
-        let parsed_pkg_type = PackageType::from_str(&pkg.package_type).with_context(|| {
-            format!(
-                "平台 '{}' 的包类型 '{}' 解析失败，可选: binary, archive, installer",
-                pkg.target, pkg.package_type
-            )
-        })?;
+    let parsed_pkg_type = PackageType::from_str(&pkg.package_type).with_context(|| {
+        format!(
+            "平台 '{}' 的包类型 '{}' 解析失败，可选: binary, archive, installer",
+            pkg.target, pkg.package_type
+        )
+    })?;
 
-        let key_path = pkg
-            .key
-            .as_ref()
-            .map(|p| {
-                if p.is_relative() {
-                    config_dir.join(p)
-                } else {
-                    p.clone()
-                }
-            })
-            .or_else(|| {
-                batch_config.key.as_ref().map(|p| {
-                    if p.is_relative() {
-                        config_dir.join(p)
-                    } else {
-                        p.clone()
-                    }
-                })
-            });
+    let key_path = pkg
+        .key
+        .as_ref()
+        .map(|p| resolve_relative_to(ctx.config_dir, p))
+        .or_else(|| {
+            ctx.batch
+                .key
+                .as_ref()
+                .map(|p| resolve_relative_to(ctx.config_dir, p))
+        });
 
-        let (checksum, signature) = compute_payload_integrity(&pkg_path, key_path.as_deref())?;
+    let (checksum, signature) = compute_payload_integrity(&pkg_path, key_path.as_deref())?;
+    let parsed_install_mode = parse_install_mode(pkg.install_mode.as_deref(), Some(&pkg.target))?;
+    let package_size = fs::metadata(&pkg_path)
+        .with_context(|| format!("获取发布包元数据失败: {}", pkg_path.display()))?
+        .len();
 
-        let parsed_install_mode =
-            parse_install_mode(pkg.install_mode.as_deref(), Some(&pkg.target))?;
-
-        let package_size = fs::metadata(&pkg_path)
-            .with_context(|| format!("获取发布包元数据失败: {}", pkg_path.display()))?
-            .len();
-
-        let package_info = PackageInfo {
+    let entry = ManifestReleaseEntry {
+        version: ctx.version.clone(),
+        min_supported_version: ctx.min_supported_version.cloned(),
+        pub_date: ctx.pub_date.to_string(),
+        package_info: PackageInfo {
             url: pkg.url.clone(),
             mirrors: vec![],
             signature,
@@ -331,52 +442,47 @@ pub(crate) fn handle_batch_release(config_path: &Path, default_manifest_path: &P
             wait_for_exit: pkg.wait_for_exit,
             payload_checksums: Default::default(),
             size: Some(package_size),
-        };
+        },
+    };
 
-        let entry = ManifestReleaseEntry {
-            version: version.clone(),
-            min_supported_version: min_supported_version.clone(),
-            pub_date: pub_date.clone(),
-            package_info,
-        };
+    let release_args_for_update = ReleaseArgs {
+        config: None,
+        version: Some(ctx.batch.version.clone()),
+        target: Some(pkg.target.clone()),
+        package: Some(pkg_path),
+        package_type: Some(pkg.package_type.clone()),
+        url: Some(pkg.url.clone()),
+        key: key_path,
+        notes: ctx.batch.notes.clone(),
+        pub_date: Some(ctx.pub_date.to_string()),
+        min_supported_version: ctx.batch.min_supported_version.clone(),
+        force_update: ctx.batch.force_update,
+        install_mode: pkg.install_mode.clone(),
+        install_args: pkg.install_args.clone(),
+        executable_path: pkg.executable_path.clone(),
+        channel: ctx.batch.channel.clone(),
+        require_elevation: pkg.require_elevation,
+        wait_for_exit: pkg.wait_for_exit,
+        rollout_percentage: ctx.batch.rollout_percentage,
+        expires_at: ctx.batch.expires_at.clone(),
+        expires_in: ctx.batch.expires_in.clone(),
+        version_seq: ctx.batch.version_seq,
+        manifest: ctx.manifest_path.to_path_buf(),
+    };
 
-        let release_args_for_update = ReleaseArgs {
-            config: None,
-            version: Some(batch_config.version.clone()),
-            target: Some(pkg.target.clone()),
-            package: Some(pkg_path),
-            package_type: Some(pkg.package_type.clone()),
-            url: Some(pkg.url.clone()),
-            key: key_path,
-            notes: batch_config.notes.clone(),
-            pub_date: Some(pub_date.clone()),
-            min_supported_version: batch_config.min_supported_version.clone(),
-            force_update: batch_config.force_update,
-            install_mode: pkg.install_mode.clone(),
-            install_args: pkg.install_args.clone(),
-            executable_path: pkg.executable_path.clone(),
-            channel: batch_config.channel.clone(),
-            require_elevation: pkg.require_elevation,
-            wait_for_exit: pkg.wait_for_exit,
-            rollout_percentage: batch_config.rollout_percentage,
-            expires_at: batch_config.expires_at.clone(),
-            expires_in: batch_config.expires_in.clone(),
-            version_seq: batch_config.version_seq,
-            manifest: manifest_path.clone(),
-        };
-
-        update_manifest_entries(&mut manifest, &pkg.target, &release_args_for_update, entry);
-        success_count += 1;
-        log::info!("  已完成平台 '{}' 的包签名与清单合并", pkg.target);
-    }
-
-    save_manifest_file(&manifest_path, &manifest)?;
-    log::info!(
-        "批量发布成功！已合并 {} 个平台的包元数据并写入 Manifest：{}",
-        success_count,
-        manifest_path.display()
-    );
+    update_manifest_entries(manifest, &pkg.target, &release_args_for_update, entry);
     Ok(())
+}
+
+/// 以基准目录展开相对路径，绝对路径原样返回。
+///
+/// 批量发布配置中的路径均以配置文件所在目录为基准，避免受到进程当前工作目录影响。
+fn resolve_relative_to(base_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_relative() {
+        base_dir.join(path)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 /// 将包信息合并至指定通道或主通道的 Manifest 数据结构中

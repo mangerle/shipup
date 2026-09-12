@@ -1,3 +1,23 @@
+//! macOS 专属平台适配模块。
+//!
+//! # 模块职责
+//! 实现 macOS 下的应用包（`.app`）定位与整体替换、二进制原地替换、历史备份清理、
+//! Gatekeeper 隔离属性清理，以及外部安装器命令构造与派发。
+//!
+//! # 设计原理
+//! - **实现初衷**：macOS 应用通常以 `.app` 目录包形式分发，
+//!   其「可执行文件」只是包内的一个普通文件；若只替换该文件，签名与资源目录会与新版本不一致。
+//! - **核心优势**：
+//!   - 优先识别并整体替换 `.app` 包目录，保证 `Info.plist`、资源与签名三者始终同源同版本；
+//!   - 替换后主动清除 `com.apple.quarantine` 扩展属性，
+//!     避免用户每次更新后都被 Gatekeeper 拦截并要求手动放行；
+//!   - 通用二进制（Universal Binary）安装器采用直接执行而非 `open` 拉起，便于拿到真实退出码。
+//! - **代价与局限**：整体替换 `.app` 目录要求目标分区具备一份完整的包体积空闲空间，
+//!   且替换期间新进程无法启动。
+//!
+//! # 安全契约
+//! 隔离属性清理仅作用于本次更新写入的产物，不得递归清理用户其他已下载文件。
+
 use crate::error::{Result, UpdateError};
 use crate::platform::InstallerOptions;
 use std::env;
@@ -5,7 +25,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// 临时替换文件后缀
 pub const TEMP_SUFFIX: &str = ".shipup.tmp";
+/// 旧版本备份文件或 App Bundle 后缀（回滚能力依赖该命名约定）
 pub const OLD_BACKUP_SUFFIX: &str = ".shipup.old";
 
 /// 清理以往更新遗留的主程序自身的 .shipup.old 备份 Bundle 或文件

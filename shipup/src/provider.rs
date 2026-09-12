@@ -1,4 +1,22 @@
-// shipup 跨平台自更新系统 - 发布源提供者抽象与 GitHub Releases 适配器
+//! 发布源提供者抽象与 GitHub Releases 适配模块。
+//!
+//! # 模块职责
+//! 定义动态发布源扩展点 [`ReleaseProvider`] 及其配置 [`ProviderClientOptions`]，
+//! 并内置 GitHub Releases 的静态清单直链实现 [`GitHubProvider`]。
+//!
+//! # 设计原理
+//! - **实现初衷**：不同制品平台（GitHub、GitLab、自建制品库）获取清单的方式差异很大，
+//!   若把这些差异硬编码进更新器，将无法支持平台扩展与测试替身。
+//! - **核心优势**：
+//!   - 提供者只负责「产出 Manifest」，清单的时效、签名与版本裁决仍由更新器统一把关，
+//!     因此替换发布源不会削弱任何一层安全防线；
+//!   - GitHub 适配器直接请求 Release 附件中的静态清单，完全绕开 REST API 的匿名限流配额，
+//!     在 CI 高频发布场景下依然稳定。
+//! - **代价与局限**：动态发布源受对应平台的鉴权策略与网络可达性约束；
+//!   GitHub 方案要求发布流水线必须把签名清单作为 Release 附件上传。
+//!
+//! # 特性门控
+//! 网络请求相关的实现依赖 `blocking` 或 `async` 特性；两者均关闭时本模块仅保留 trait 定义。
 
 #[cfg(any(feature = "blocking", feature = "async", test))]
 use crate::error::{Result, UpdateError};

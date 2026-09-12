@@ -1,7 +1,11 @@
-// 离线仓库示例：从本地目录读取 manifest.json 并完成检查更新
-//
-// 准备：在当前目录放置 `offline_repo/manifest.json` 与对应安装包，
-// 然后执行 `cargo run --example offline_repo`。
+//! 离线仓库示例。
+//!
+//! 演示如何从本地目录读取 `manifest.json` 并完成更新检查，
+//! 适用于企业内网、隔离网络与移动介质（U 盘）分发场景。
+//!
+//! # 运行前准备
+//! 在当前目录放置 `offline_repo/manifest.json` 与对应安装包，
+//! 然后执行 `cargo run --example offline_repo`。
 
 use std::path::PathBuf;
 

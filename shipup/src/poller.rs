@@ -1,4 +1,24 @@
-// shipup 跨平台自更新系统 - 后台周期性静默轮询与暂存调度器
+//! 后台周期性静默轮询与暂存调度模块。
+//!
+//! # 模块职责
+//! 提供开箱即用的常驻更新监控：[`AutoPollOptions`] 描述轮询节奏与静默预载策略，
+//! [`AutoPollerHandle`] 提供停止与状态查询句柄，事件经 [`AutoPollEvent`] 回调派发；
+//! 同步与异步宿主分别使用 [`spawn_polling_thread`] 与 [`spawn_polling_task`]。
+//!
+//! # 设计原理
+//! - **实现初衷**：宿主不希望自己维护定时器、并发原语与失败重试，
+//!   但又必须把「检查到新版本」「后台已预载完成」这类结果安全地通知到 UI 线程。
+//! - **核心优势**：
+//!   - 轮询循环采用细粒度睡眠切片，使停止指令能在毫秒级被响应，进程可随宿主优雅退出；
+//!   - 静默预载只在开启对应选项时执行，默认仅探测版本，不会在用户不知情时占用带宽与磁盘；
+//!   - 首次触发时机与轮询周期解耦，既可「启动即检查」也可「延迟首检」以避开启动抖动；
+//!   - 单次轮询失败只记警告不终止循环，避免一次网络抖动导致监控永久失效。
+//! - **代价与局限**：同步实现每实例占用一个原生线程栈；
+//!   异步实现要求调用上下文已处于活跃的 Tokio 运行时中。
+//!
+//! # 生命周期契约
+//! [`AutoPollerHandle`] 被丢弃（Drop）即代表请求停止，调用方无需显式停止；
+//! 但回调闭包不得在内部长时间阻塞，否则会拖慢停止响应。
 
 use crate::error::UpdateError;
 #[cfg(any(feature = "blocking", feature = "async"))]
@@ -134,6 +154,10 @@ pub struct AutoPollerHandle {
 }
 
 impl AutoPollerHandle {
+    /// 创建轮询句柄，同时持有「停止轮询」与「取消进行中下载」两个独立信号位。
+    ///
+    /// 拆分为两个信号位的原因是：停止轮询后已开始的静默预载仍应被允许取消，
+    /// 而单独取消某次下载不应连带终止整个监控循环。
     #[cfg_attr(not(any(feature = "blocking", feature = "async")), allow(dead_code))]
     pub(crate) fn new(stop_flag: Arc<AtomicBool>, download_cancel_flag: Arc<AtomicBool>) -> Self {
         Self {

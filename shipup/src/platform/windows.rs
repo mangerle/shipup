@@ -1,4 +1,23 @@
-// shipup 跨平台自更新系统 - Windows 专属平台适配
+//! Windows 专属平台适配模块。
+//!
+//! # 模块职责
+//! 实现 Windows 下的运行中二进制替换、历史备份清理、安装器命令行构造与派发，
+//! 以及基于 `MoveFileExW` 的「重启后延迟替换/删除」兜底路径。
+//!
+//! # 设计原理
+//! - **实现初衷**：Windows 对正在运行的可执行文件加排他锁，无法像类 Unix 那样直接覆写。
+//! - **核心优势**：
+//!   - 首选策略为「原文件重命名为 `.old` 备份 → 新文件写入原路径」，
+//!     重命名的成功率远高于直接覆盖，且失败时原程序仍然可运行；
+//!   - 重命名仍受阻时（被防病毒或后台服务锁定），可降级向系统注册重启延迟替换任务，
+//!     让更新在下次重启时静默生效，而不是让整条更新流程直接失败；
+//!   - 主程序启动时清理历史 `.old` 残留，形成自净闭环。
+//! - **代价与局限**：延迟替换必须等到下一次操作系统重启才会生效，
+//!   调用方有义务向用户明确提示这一时序差异。
+//!
+//! # 安全契约
+//! 派生外部安装器时，所有用户可控参数都必须经过 [`escape_windows_args`] 转义，
+//! 严防参数注入导致的任意命令执行。
 
 use crate::error::{Result, UpdateError};
 use crate::manifest::InstallMode;
@@ -157,16 +176,35 @@ pub(crate) fn build_windows_installer_args(
     (program, args)
 }
 
+/// Win32 原生 API 绑定子模块。
+///
+/// # 设计原理
+/// - **实现初衷**：本模块只依赖 `libc` 之外的最小外部依赖，因此不引入 `windows` crate，
+///   而是手写所需的两三个 API 声明，避免为少量符号付出整包依赖体积。
+/// - **核心优势**：绑定范围被严格限定在「派生安装器」与「延迟替换」两处用途，
+///   审查面积极小。
+/// - **代价与局限**：函数签名需与 Windows SDK 头文件保持逐字一致，
+///   升级或跨架构时必须人工核对（`extern "system"` 已覆盖 `stdcall` 调用约定差异）。
+///
+/// # 安全契约
+/// 本模块全部函数均为 `unsafe extern`，调用方必须自行保证：
+/// 传入的宽字符串指针以 `\0` 结尾且生命周期覆盖调用期、句柄参数合法。
 #[cfg(windows)]
 mod ffi {
     use std::ffi::c_void;
 
+    /// `ShellExecuteW` 的显示命令：以正常窗口激活目标程序。
     pub const SW_SHOWNORMAL: i32 = 1;
+    /// `MoveFileExW` 标志位：目标已存在时直接覆盖。
     pub const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    /// `MoveFileExW` 标志位：把操作登记到系统重启阶段执行。
     pub const MOVEFILE_DELAY_UNTIL_REBOOT: u32 = 0x0000_0004;
 
     #[link(name = "shell32")]
     unsafe extern "system" {
+        /// 以 Shell 语义启动目标程序（用于派生外部安装器）。
+        ///
+        /// 成功时返回大于 32 的伪句柄值，失败时返回表示错误类别的较小整数码。
         pub fn ShellExecuteW(
             hwnd: *mut c_void,
             lpOperation: *const u16,
@@ -179,6 +217,9 @@ mod ffi {
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        /// 移动或替换文件，可按 `dwFlags` 登记为「重启阶段执行」。
+        ///
+        /// 返回非零表示成功，返回 0 表示失败（错误码通过 `GetLastError` 获取）。
         pub fn MoveFileExW(
             lpExistingFileName: *const u16,
             lpNewFileName: *const u16,

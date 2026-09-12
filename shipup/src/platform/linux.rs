@@ -1,3 +1,24 @@
+//! Linux 专属平台适配模块。
+//!
+//! # 模块职责
+//! 实现 Linux 下的运行中二进制替换、历史备份清理、可执行权限修复、AppImage 形态识别，
+//! 以及外部安装器命令构造与派发。
+//!
+//! # 设计原理
+//! - **实现初衷**：Linux 允许直接覆写正在运行的文件，但会带来两个隐患——
+//!   新文件往往丢失可执行位，且不同发行版的安装器调用约定差异较大。
+//! - **核心优势**：
+//!   - 覆写后强制将权限修正为 `0o755`，避免「更新成功却无法再次启动」的经典故障；
+//!   - 识别 AppImage 运行形态：当宿主以 AppImage 方式启动时，替换目标应指向镜像文件本身，
+//!     而不是挂载点内的临时可执行文件（后者每次启动都会变化）；
+//!   - 采用「先写临时文件再重命名」的顺序，保证任一时刻磁盘上始终存在一个完整的可执行文件。
+//! - **代价与局限**：若宿主启用了进程完整性保护或只读文件系统，原地替换仍会失败，
+//!   此时需要回退到外部安装器形态。
+//!
+//! # 安全契约
+//! 修复权限时必须使用显式的 `0o755` 掩码，禁止直接沿用源文件权限，
+//! 以防解压产物携带异常权限位被原样搬入宿主目录。
+
 use crate::error::{Result, UpdateError};
 use crate::platform::InstallerOptions;
 use std::env;
@@ -6,6 +27,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// 临时替换文件后缀
 pub const TEMP_SUFFIX: &str = ".shipup.tmp";
 /// 旧版本备份文件后缀（与 Windows/macOS 命名保持一致）
 pub const OLD_BACKUP_SUFFIX: &str = ".shipup.old";

@@ -1,7 +1,12 @@
-// 基础同步阻塞模式示例：演示更新器构建、检查更新与两阶段安装的完整骨架
-//
-// 运行前请替换 `PUBLIC_KEY` 与 `MANIFEST_URL` 为真实值；
-// 本地联调可临时开启 `require_signature(false)` 与 `dangerous_insecure_transport_protocol(true)`。
+//! 基础同步阻塞模式示例。
+//!
+//! 演示更新器构建、检查更新与两阶段安装（下载验签 → 物理替换）的完整骨架，
+//! 适合不引入异步运行时的传统桌面与命令行程序参考。
+//!
+//! # 运行前准备
+//! 请替换 `PUBLIC_KEY` 与 `MANIFEST_URL` 为真实值；
+//! 本地联调可临时开启 `require_signature(false)` 与 `dangerous_insecure_transport_protocol(true)`，
+//! 但生产环境严禁保留这两项放宽配置。
 
 use std::time::Duration;
 
