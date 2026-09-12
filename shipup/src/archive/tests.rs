@@ -97,8 +97,9 @@ fn test_extract_tar_xz_and_magic_sniffing() {
     fs::create_dir_all(&temp_dir).unwrap();
 
     // 打包单个可执行文件进 tar
-    let mut tar_builder = tar::Builder::new(Vec::new());
-    let mut header = tar::Header::new_gnu();
+    // 使用 `::tar` 显式指向外部 crate，避免被父模块私有 `mod tar` 遮蔽
+    let mut tar_builder = ::tar::Builder::new(Vec::new());
+    let mut header = ::tar::Header::new_gnu();
     let payload_content = b"hello tar.xz payload binary";
     header.set_path("my_xz_app.exe").unwrap();
     header.set_size(payload_content.len() as u64);
@@ -132,8 +133,9 @@ fn test_extract_tar_zst_and_magic_sniffing() {
     fs::create_dir_all(&temp_dir).unwrap();
 
     // 打包单个可执行文件进 tar
-    let mut tar_builder = tar::Builder::new(Vec::new());
-    let mut header = tar::Header::new_gnu();
+    // 使用 `::tar` 显式指向外部 crate，避免被父模块私有 `mod tar` 遮蔽
+    let mut tar_builder = ::tar::Builder::new(Vec::new());
+    let mut header = ::tar::Header::new_gnu();
     let payload_content = b"hello tar.zst payload binary";
     header.set_path("my_zst_app.exe").unwrap();
     header.set_size(payload_content.len() as u64);
