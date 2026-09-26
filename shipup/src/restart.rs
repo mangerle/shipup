@@ -239,7 +239,9 @@ pub(crate) fn build_delayed_command(
                 }
             }
             let mut c = Command::new("cmd.exe");
-            c.args(["/C", &cmd_line]);
+            // 使用 raw_arg 绕过 Rust 对引号的 \" 转义，防止 cmd.exe 误将 \" 识别为 \\ 文件名
+            c.raw_arg("/C");
+            c.raw_arg(format!("\"{}\"", cmd_line));
             c
         } else {
             let mut c = Command::new(target_exe);
@@ -457,5 +459,17 @@ mod tests {
             let program = cmd.get_program().to_string_lossy();
             assert_eq!(program, "sh");
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_delayed_command_spawn_real() {
+        let opts = RestartOptions::new().startup_delay(Duration::from_millis(500));
+        let dummy_exe = Path::new("cmd.exe");
+        let dummy_args = vec!["/C".to_string(), "exit".to_string(), "0".to_string()];
+        let mut cmd = build_delayed_command(&opts, dummy_exe, &dummy_args);
+        let mut child = cmd.spawn().expect("应该成功派生子进程");
+        let status = child.wait().expect("等待子进程退出");
+        assert!(status.success());
     }
 }
