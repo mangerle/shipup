@@ -9,21 +9,25 @@ English | [简体中文](README_ZH.md) | [Documentation (docs/USAGE.md)](docs/US
 ## Core Features
 
 - **Pure & UI-Agnostic**: Imposes no assumptions on GUI frameworks or async runtimes. Seamlessly integrates with GPUI, Slint, egui, Iced, as well as CLI and backend daemon services.
-- **Multiple Update Strategies**: Supports in-place atomic binary replacement, archive extraction sandbox replacement (.zip / .tar.gz), and external installer takeover for complex installers.
-- **Native Dual Modes**: Built on top of `reqwest`, offering out-of-the-box support for both synchronous blocking (`blocking`) and asynchronous native (`async`) APIs, customizable via Cargo feature flags.
+- **Multiple Update Strategies**: Supports in-place atomic binary replacement, archive extraction sandbox replacement (.zip / .tar.gz / .tar.zst / .tar.xz), and external installer takeover for complex installers.
 - **Decoupled Lifecycle**: Separates download/verification (`download()`) from local disk installation (`install()`), supporting background pre-fetching without interfering with running binaries.
-- **Multi-Endpoint Failover**: Seamlessly handles CDN downtime by cycling through primary and secondary mirror endpoints.
+- **Native Dual Modes**: Built on top of `reqwest`, offering out-of-the-box support for both synchronous blocking (`blocking`) and asynchronous native (`async`) APIs, customizable via Cargo feature flags.
+- **High-Performance Chunked Acceleration**: Supports concurrent multi-threaded chunked downloads via HTTP Range with multi-mirror failover and resumable transfers.
 - **Enterprise-Grade Security Defense**:
   - Layer 1: Streaming SHA-256 integrity verification against corrupt downloads.
-  - Layer 2: High-performance pure-Rust Ed25519 asymmetric cryptographic signature verification with key rotation support.
+  - Layer 2: High-performance pure-Rust Ed25519 asymmetric cryptographic signature verification with key rotation and M-of-N threshold signatures.
   - Layer 3: Enforced TLS certificate transport verification.
   - Layer 4: Zip Slip path traversal mitigation and decompression size limit circuit breaking.
+- **Multi-Endpoint & Multi-Source Support**: Seamlessly handles CDN downtime with endpoint failover, ships with built-in official GitHub Releases provider (`GitHubProvider`), and supports offline/local network repository audits (`file://`).
+- **Background Periodic Poller**: Provides an out-of-the-box periodic auto-updater poller (`AutoPoller`) with graceful lifecycle management.
+- **Dynamic URL Templates & Multi-Channel Routing**: Supports endpoint URL template placeholders (`{{target}}`, `{{current_version}}`, `{{channel}}`), natively accommodating staged rollouts and multi-channel distribution.
+- **User Preference Persistence**: Built-in persistence for user preferences ("skip this version" and "remind me later"), with mandatory update bypass capabilities.
 - **Cross-Platform Robustness**:
   - Same-volume atomic staging strategy preventing cross-filesystem `EXDEV: Cross-device link` errors.
-  - Deep adaptation for Windows executable file locks via atomic rename and self-cleanup helper processes.
+  - Deep adaptation for Windows executable file locks via atomic rename, self-cleanup helper processes, and reboot-deferred replacement.
   - Automatic permission bit fixing (0o755) on Linux and Gatekeeper quarantine attribute removal on macOS.
   - Automatic startup health checks and rollback on consecutive crashes.
-- **Release Ecosystem**: Ships with an out-of-the-box CLI tool `shipup-cli` for cryptographic key generation (`keygen`) and manifest building/signing (`release`).
+- **Release Ecosystem**: Ships with an out-of-the-box CLI tool `shipup-cli` for cryptographic key generation (`keygen`), manifest building/signing (`release`), and offline repository audits (`verify-repo`).
 
 ---
 
@@ -37,7 +41,11 @@ Add `shipup` to your application's `Cargo.toml`:
 
 ```toml
 [dependencies]
-shipup = { version = "0.3.0", features = ["blocking"] }
+# Blocking mode (suitable for Slint, egui, or CLI apps)
+shipup = { version = "0.4.2", features = ["blocking"] }
+
+# Or native async mode (suitable for GPUI, Tokio async runtime)
+# shipup = { version = "0.4.2", features = ["async"] }
 ```
 
 ### 2. Client Update Checking and Installation
