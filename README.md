@@ -42,10 +42,10 @@ Add `shipup` to your application's `Cargo.toml`:
 ```toml
 [dependencies]
 # Blocking mode (suitable for Slint, egui, or CLI apps)
-shipup = { version = "0.5.0", features = ["blocking"] }
+shipup = { version = "0.5.1", features = ["blocking"] }
 
 # Or native async mode (suitable for GPUI, Tokio async runtime)
-# shipup = { version = "0.5.0", features = ["async"] }
+# shipup = { version = "0.5.1", features = ["async"] }
 ```
 
 ### 2. Client Update Checking and Installation

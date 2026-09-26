@@ -42,10 +42,10 @@
 ```toml
 [dependencies]
 # 同步阻塞模式（适用于 Slint、Egui、常规终端 CLI）
-shipup = { version = "0.5.0", features = ["blocking"] }
+shipup = { version = "0.5.1", features = ["blocking"] }
 
 # 或原生异步模式（适用于 GPUI、Tokio 异步运行时）
-# shipup = { version = "0.5.0", features = ["async"] }
+# shipup = { version = "0.5.1", features = ["async"] }
 ```
 
 ### 2. 客户端更新检查、下载与安装
