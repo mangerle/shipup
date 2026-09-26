@@ -37,7 +37,7 @@ pub(crate) fn calculate_backoff(retry_delay: Duration, attempt: u32) -> Duration
 ///   只会毫无意义地放大错误窗口，甚至掩盖真实的安全告警。
 /// - **核心优势**：以「错误是否可能因瞬时状态而自愈」为唯一判据，规则集中且可单元测试：
 ///   - 用户主动取消不可重试（尊重用户意图）；
-///   - `408` / `429` / `5xx` 可重试（服务端瞬时过载或网关抖动）；
+///   - `408` / `416` / `429` / `5xx` 可重试（416 发生时已删除损坏切片，重试将自动发起全新全量下载；其余为服务端瞬时过载或网关抖动）；
 ///   - 连接与读取类 I/O 错误可重试；
 ///   - 磁盘空间不足、权限拒绝等确定性 I/O 错误不可重试。
 /// - **代价与局限**：白名单式判定意味着新增错误变体时默认「不可重试」，
@@ -50,6 +50,7 @@ pub(crate) fn is_retryable_error(err: &UpdateError) -> bool {
         UpdateError::Cancelled => false,
         UpdateError::HttpStatus { status_code, .. } => {
             *status_code == 408
+                || *status_code == 416
                 || *status_code == 429
                 || (*status_code >= 500 && *status_code <= 599)
         }

@@ -82,6 +82,12 @@ fn test_is_retryable_error_rules() {
         message: "Request Timeout".to_string(),
     }));
 
+    // 416 Range Not Satisfiable 可重试（已清除损坏切片，重试将发起全新全量下载）
+    assert!(is_retryable_error(&UpdateError::HttpStatus {
+        status_code: 416,
+        message: "Range Not Satisfiable".to_string(),
+    }));
+
     // 429 Too Many Requests 可重试
     assert!(is_retryable_error(&UpdateError::HttpStatus {
         status_code: 429,
