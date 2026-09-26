@@ -145,12 +145,7 @@ fn execute_rollback(state: &UpdateState, current_exe: &Path, state_file: &Path) 
 /// 当回滚覆盖底层失败时返回 [`crate::error::UpdateError::SelfReplace`]。
 pub fn check_and_recover_current(max_allowed_crashes: u32) -> Result<HealthCheckStatus> {
     let current_exe = env::current_exe()?;
-    let state_dir = crate::preference::resolve_safe_data_dir().unwrap_or_else(|| {
-        current_exe
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf()
-    });
+    let state_dir = super::resolve_effective_state_dir();
     check_and_recover(&state_dir, &current_exe, max_allowed_crashes)
 }
 

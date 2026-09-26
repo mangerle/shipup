@@ -112,31 +112,54 @@ pub fn confirm_update_success_in_dir(state_dir: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// 检查当前运行环境是否存在待确认的更新自愈状态标记
+/// 解析当前有效的更新状态与历史记录目录（支持安全数据目录与程序目录降级 Fallback）
+///
+/// # 设计原理
+/// - **实现初衷**：在便携模式、受限权限容器或沙箱环境中，标准用户数据目录可能不可用或状态被写入在程序同级目录。
+/// - **核心优势**：优先探测含有 `.shipup.state` 文件的活跃目录；若均无状态文件，则按规范顺序回退。
+pub(crate) fn resolve_effective_state_dir() -> PathBuf {
+    if let Some(dir) = crate::preference::resolve_safe_data_dir()
+        && dir.join(super::UPDATE_STATE_FILENAME).exists()
+    {
+        return dir;
+    }
+
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(parent) = current_exe.parent()
+        && parent.join(super::UPDATE_STATE_FILENAME).exists()
+    {
+        return parent.to_path_buf();
+    }
+
+    crate::preference::resolve_safe_data_dir().unwrap_or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."))
+    })
+}
+
+/// 检查当前运行环境是否存在待确认的更新自愈状态标记（支持目录降级 Fallback）
 ///
 /// # 设计原理
 /// - **实现初衷**：在更新器初始化或常规清理流程前进行探针检查，防止误删处于健康观察期的旧版本备份。
-/// - **核心优势**：纯物理路径探测，零解析开销。
+/// - **核心优势**：纯物理路径探测，零解析开销；自动覆盖安全数据目录与当前程序同级目录。
 pub fn has_pending_recovery_state() -> bool {
-    if let Some(dir) = crate::preference::resolve_safe_data_dir() {
-        return dir.join(super::UPDATE_STATE_FILENAME).exists();
-    }
-    false
+    let state_dir = resolve_effective_state_dir();
+    state_dir.join(super::UPDATE_STATE_FILENAME).exists()
 }
 
 /// 检查并确认当前应用升级成功（在应用完成启动并平稳运行后调用）
 ///
 /// # 设计原理
 /// - **实现初衷**：作为宿主程序（如 UI 就绪、主业务线程正常启动后）调用的一站式健康确认接口。
+/// - **核心优势**：自动兼容标准数据目录与程序同级降级目录，消除受限环境下状态无法确认的问题。
 ///
 /// # Errors
-/// 当获取当前运行可执行文件路径失败时返回对应错误。
+/// 当删除旧备份或移除状态标记遇到 IO 故障时返回对应错误。
 pub fn confirm_update_success() -> Result<bool> {
-    if let Some(state_dir) = crate::preference::resolve_safe_data_dir() {
-        confirm_update_success_in_dir(&state_dir)
-    } else {
-        Ok(false)
-    }
+    let state_dir = resolve_effective_state_dir();
+    confirm_update_success_in_dir(&state_dir)
 }
 
 /// 若存在待确认的更新自愈状态标记则静默清除（幂等）

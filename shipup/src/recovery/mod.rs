@@ -55,6 +55,7 @@ pub use history::{
     load_rollback_history, record_rollback_version,
 };
 pub use manual::execute_manual_rollback_to;
+pub(crate) use state::resolve_effective_state_dir;
 pub use state::{
     confirm_update_success, confirm_update_success_in_dir, has_pending_recovery_state,
     record_update_state,

@@ -230,3 +230,26 @@ fn test_confirm_update_keeps_registered_history() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_resolve_effective_state_dir_and_fallback() {
+    let effective = resolve_effective_state_dir();
+    // 无论在何种操作系统与权限环境下，均必须返回非空合法目录路径
+    assert!(!effective.as_os_str().is_empty());
+
+    let temp_dir = env::temp_dir().join(format!("shipup_fallback_test_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let dummy_backup = temp_dir.join("test.shipup.0.9.0.old");
+    fs::write(&dummy_backup, b"old-content").unwrap();
+    record_update_state(&temp_dir, "1.0.0", &dummy_backup).unwrap();
+
+    assert!(temp_dir.join(UPDATE_STATE_FILENAME).exists());
+    // 验证降级目录直接显式确认成功
+    let confirmed = confirm_update_success_in_dir(&temp_dir).unwrap();
+    assert!(confirmed);
+    assert!(!temp_dir.join(UPDATE_STATE_FILENAME).exists());
+    assert!(!dummy_backup.exists());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
