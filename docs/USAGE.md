@@ -92,10 +92,10 @@
 ```toml
 [dependencies]
 # 同步阻塞模式（适用于 Slint、Egui、常规终端 CLI）
-shipup = { version = "0.4.2", features = ["blocking"] }
+shipup = { version = "0.4.3", features = ["blocking"] }
 
 # 或原生异步模式（适用于 GPUI、Tokio 异步运行时）
-# shipup = { version = "0.4.2", features = ["async"] }
+# shipup = { version = "0.4.3", features = ["async"] }
 ```
 
 ### 2. 同步阻塞模式 (Blocking Mode)
@@ -563,7 +563,7 @@ let updater = UpdaterBuilder::new()
 - `shipup` 同步与异步 HTTP 客户端均在传输层硬性约束最低 **TLS 1.2+** 协议版本，杜绝 SSL 3.0、TLS 1.0、TLS 1.1 的中间人降级利用。
 - 若需要完全脱离平台 OpenSSL 动态依赖，可在 `Cargo.toml` 中切换为纯 Rust 静态编译的 `rustls-tls` 特性：
   ```toml
-  shipup = { version = "0.4.2", default-features = false, features = ["blocking", "rustls-tls", "archive"] }
+  shipup = { version = "0.4.3", default-features = false, features = ["blocking", "rustls-tls", "archive"] }
   ```
 
 ---
