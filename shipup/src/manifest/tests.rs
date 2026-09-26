@@ -43,6 +43,35 @@ fn test_normalize_target_libc_and_env_distinction() {
         normalize_target("x86_64-pc-windows-msvc"),
         normalize_target("x86_64-pc-windows-gnu")
     );
+
+    // 验证 32 位 x86 / i686 别名归一化
+    assert_eq!(
+        normalize_target("i686-pc-windows-msvc"),
+        "windows-i686-msvc"
+    );
+    assert_eq!(normalize_target("win-x86-msvc"), "windows-i686-msvc");
+    assert_eq!(normalize_target("i686-unknown-linux-gnu"), "linux-i686-gnu");
+    assert_eq!(normalize_target("linux-x86-musl"), "linux-i686-musl");
+
+    // 验证 armv7 架构别名归一化
+    assert_eq!(
+        normalize_target("armv7-unknown-linux-gnueabihf"),
+        "linux-armv7-gnu"
+    );
+    assert_eq!(normalize_target("linux-armhf-gnu"), "linux-armv7-gnu");
+
+    // 验证 riscv64 与 loongarch64 架构别名归一化
+    assert_eq!(
+        normalize_target("riscv64gc-unknown-linux-gnu"),
+        "linux-riscv64-gnu"
+    );
+    assert_eq!(
+        normalize_target("loongarch64-unknown-linux-musl"),
+        "linux-loongarch64-musl"
+    );
+
+    // 验证当前编译目标 triple 非空且有效
+    assert!(!current_target_triple().is_empty());
 }
 
 #[test]

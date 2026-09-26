@@ -133,6 +133,14 @@ pub(crate) fn normalize_target(target: &str) -> String {
         if lower.contains("aarch64") || lower.contains("arm64") {
             return format!("windows-arm64{}", env_suffix);
         }
+        if lower.contains("i686")
+            || lower.contains("x86")
+            || lower.contains("i386")
+            || lower.contains("ia32")
+            || lower.contains("win32")
+        {
+            return format!("windows-i686{}", env_suffix);
+        }
     } else if lower.contains("darwin") || lower.contains("macos") || lower.contains("apple") {
         if lower.contains("aarch64") || lower.contains("arm64") {
             return "macos-arm64".to_string();
@@ -155,6 +163,18 @@ pub(crate) fn normalize_target(target: &str) -> String {
         if lower.contains("aarch64") || lower.contains("arm64") {
             return format!("linux-arm64{}", libc_suffix);
         }
+        if lower.contains("i686") || lower.contains("i386") || lower.contains("x86") {
+            return format!("linux-i686{}", libc_suffix);
+        }
+        if lower.contains("armv7") || lower.contains("armhf") || lower.contains("armv7l") {
+            return format!("linux-armv7{}", libc_suffix);
+        }
+        if lower.contains("riscv64") {
+            return format!("linux-riscv64{}", libc_suffix);
+        }
+        if lower.contains("loongarch64") {
+            return format!("linux-loongarch64{}", libc_suffix);
+        }
     }
     lower
 }
@@ -164,28 +184,49 @@ pub(crate) fn normalize_target(target: &str) -> String {
 /// # 设计原理
 /// - **实现初衷**：在编译期通过条件编译宏直接映射到 Rust 官方 Target Triple，为客户端提供开箱即用的免配置平台定位。
 /// - **核心优势**：直接返回 `'static str` 静态字符串切片，零运行期堆分配与字符串拼接开销。
-/// - **代价与局限**：覆盖了主流 Windows、macOS 与 Linux 架构；对于稀有交叉编译目标会返回 `"unknown-target"`，需要调用端通过 Builder 手动指定。
+/// - **代价与局限**：覆盖了主流 Windows、macOS 与 Linux 架构（涵盖 x86_64, aarch64, i686, armv7, riscv64, loongarch64）；对于稀有交叉编译目标会返回 `"unknown-target"`，需要调用端通过 Builder 手动指定。
 pub fn current_target_triple() -> &'static str {
+    // 1. Windows 平台
     #[cfg(all(target_arch = "x86_64", target_os = "windows", target_env = "msvc"))]
     return "x86_64-pc-windows-msvc";
 
     #[cfg(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"))]
     return "x86_64-pc-windows-gnu";
 
+    #[cfg(all(target_arch = "x86", target_os = "windows", target_env = "msvc"))]
+    return "i686-pc-windows-msvc";
+
+    #[cfg(all(target_arch = "x86", target_os = "windows", target_env = "gnu"))]
+    return "i686-pc-windows-gnu";
+
+    #[cfg(all(target_arch = "x86", target_os = "windows"))]
+    return "i686-pc-windows-msvc";
+
+    #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "gnu"))]
+    return "aarch64-pc-windows-gnu";
+
     #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
     return "aarch64-pc-windows-msvc";
 
+    // 2. macOS 平台
     #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
     return "x86_64-apple-darwin";
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     return "aarch64-apple-darwin";
 
+    // 3. Linux 平台
     #[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))]
     return "x86_64-unknown-linux-gnu";
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "musl"))]
     return "x86_64-unknown-linux-musl";
+
+    #[cfg(all(target_arch = "x86", target_os = "linux", target_env = "musl"))]
+    return "i686-unknown-linux-musl";
+
+    #[cfg(all(target_arch = "x86", target_os = "linux"))]
+    return "i686-unknown-linux-gnu";
 
     #[cfg(all(target_arch = "aarch64", target_os = "linux", target_env = "gnu"))]
     return "aarch64-unknown-linux-gnu";
@@ -193,13 +234,36 @@ pub fn current_target_triple() -> &'static str {
     #[cfg(all(target_arch = "aarch64", target_os = "linux", target_env = "musl"))]
     return "aarch64-unknown-linux-musl";
 
+    #[cfg(all(target_arch = "arm", target_os = "linux", target_env = "musl"))]
+    return "armv7-unknown-linux-musleabihf";
+
+    #[cfg(all(target_arch = "arm", target_os = "linux"))]
+    return "armv7-unknown-linux-gnueabihf";
+
+    #[cfg(all(target_arch = "riscv64", target_os = "linux", target_env = "musl"))]
+    return "riscv64gc-unknown-linux-musl";
+
+    #[cfg(all(target_arch = "riscv64", target_os = "linux"))]
+    return "riscv64gc-unknown-linux-gnu";
+
+    #[cfg(all(target_arch = "loongarch64", target_os = "linux", target_env = "musl"))]
+    return "loongarch64-unknown-linux-musl";
+
+    #[cfg(all(target_arch = "loongarch64", target_os = "linux"))]
+    return "loongarch64-unknown-linux-gnu";
+
     #[cfg(not(any(
         all(target_arch = "x86_64", target_os = "windows"),
+        all(target_arch = "x86", target_os = "windows"),
         all(target_arch = "aarch64", target_os = "windows"),
         all(target_arch = "x86_64", target_os = "macos"),
         all(target_arch = "aarch64", target_os = "macos"),
         all(target_arch = "x86_64", target_os = "linux"),
-        all(target_arch = "aarch64", target_os = "linux")
+        all(target_arch = "x86", target_os = "linux"),
+        all(target_arch = "aarch64", target_os = "linux"),
+        all(target_arch = "arm", target_os = "linux"),
+        all(target_arch = "riscv64", target_os = "linux"),
+        all(target_arch = "loongarch64", target_os = "linux")
     )))]
     return "unknown-target";
 }
