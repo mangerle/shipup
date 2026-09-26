@@ -64,6 +64,9 @@ pub use recovery::{
     confirm_update_success_in_dir, execute_manual_rollback_to, list_available_rollback_versions,
     load_rollback_history, record_rollback_version,
 };
-pub use restart::{RestartContext, SHIPUP_RESTARTED_ARG, is_restarted_by_shipup, restart_with};
+pub use restart::{
+    RestartContext, RestartOptions, SHIPUP_RESTARTED_ARG, is_restarted_by_shipup, restart_with,
+    restart_with_options, schedule_restart, schedule_restart_with,
+};
 pub use template::{TemplateContext, resolve_url_template};
 pub use updater::{DownloadedUpdate, Update, Updater};

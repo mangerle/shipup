@@ -26,7 +26,10 @@ use crate::error::{Result, UpdateError};
 use crate::event::UpdateEvent;
 use crate::manifest::{PackageType, ResolvedRelease};
 use crate::platform::{get_resumable_download_path, get_temp_download_path};
-use crate::restart::{RestartContext, restart_with};
+use crate::restart::{
+    RestartContext, RestartOptions, restart_with, restart_with_options, schedule_restart,
+    schedule_restart_with,
+};
 use crate::signature::{verify_ed25519_file_threshold, verify_sha256_file};
 use crate::updater::config::NetworkSecurityConfig;
 use crate::updater::install::PayloadApplyContext;
@@ -527,6 +530,40 @@ impl Update {
     pub fn restart(&self) -> Result<Infallible> {
         restart_with(|_| {})
     }
+
+    /// 使用指定的重启选项优雅重启宿主程序
+    ///
+    /// # Errors
+    /// 当拉起新进程失败时返回 [`UpdateError::SelfReplace`]。若新进程拉起成功，正常情况下不会返回。
+    pub fn restart_with_options<F>(
+        &self,
+        options: &RestartOptions,
+        cleanup: F,
+    ) -> Result<Infallible>
+    where
+        F: FnOnce(&mut RestartContext),
+    {
+        restart_with_options(options, cleanup)
+    }
+
+    /// 非阻塞调度优雅自重启（专为 Axum / Actix 等 Web / 异步宿主设计）
+    ///
+    /// # Errors
+    /// 当拉起新进程失败时返回 [`UpdateError::SelfReplace`]。
+    pub fn schedule_restart(&self, options: &RestartOptions) -> Result<()> {
+        schedule_restart(options)
+    }
+
+    /// 非阻塞调度优雅自重启并附加退出前清理回调
+    ///
+    /// # Errors
+    /// 当拉起新进程失败时返回 [`UpdateError::SelfReplace`]。
+    pub fn schedule_restart_with<F>(&self, options: &RestartOptions, cleanup: F) -> Result<()>
+    where
+        F: FnOnce(&mut RestartContext) + Send + 'static,
+    {
+        schedule_restart_with(options, cleanup)
+    }
 }
 /// 已下载并完成哈希与数字签名验证的待安装更新实体
 ///
@@ -628,5 +665,58 @@ impl DownloadedUpdate {
                 Err(e)
             }
         }
+    }
+
+    /// 执行直接自重启
+    ///
+    /// # Errors
+    /// 当拉起新进程失败时返回 [`UpdateError::SelfReplace`]。
+    pub fn restart(&self) -> Result<Infallible> {
+        restart_with(|_| {})
+    }
+
+    /// 执行带退出前清理闭包的优雅自重启
+    ///
+    /// # Errors
+    /// 当拉起新进程失败时返回 [`UpdateError::SelfReplace`]。
+    pub fn restart_with<F>(&self, cleanup: F) -> Result<Infallible>
+    where
+        F: FnOnce(&mut RestartContext),
+    {
+        restart_with(cleanup)
+    }
+
+    /// 使用指定的重启选项优雅重启宿主程序
+    ///
+    /// # Errors
+    /// 当拉起新进程失败时返回 [`UpdateError::SelfReplace`]。
+    pub fn restart_with_options<F>(
+        &self,
+        options: &RestartOptions,
+        cleanup: F,
+    ) -> Result<Infallible>
+    where
+        F: FnOnce(&mut RestartContext),
+    {
+        restart_with_options(options, cleanup)
+    }
+
+    /// 非阻塞调度优雅自重启（专为 Axum / Actix 等 Web / 异步宿主设计）
+    ///
+    /// # Errors
+    /// 当拉起新进程失败时返回 [`UpdateError::SelfReplace`]。
+    pub fn schedule_restart(&self, options: &RestartOptions) -> Result<()> {
+        schedule_restart(options)
+    }
+
+    /// 非阻塞调度优雅自重启并附加退出前清理回调
+    ///
+    /// # Errors
+    /// 当拉起新进程失败时返回 [`UpdateError::SelfReplace`]。
+    pub fn schedule_restart_with<F>(&self, options: &RestartOptions, cleanup: F) -> Result<()>
+    where
+        F: FnOnce(&mut RestartContext) + Send + 'static,
+    {
+        schedule_restart_with(options, cleanup)
     }
 }
