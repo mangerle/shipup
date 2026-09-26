@@ -117,13 +117,13 @@ pub fn verify_ed25519(data: &[u8], base64_signature: &str, base64_public_key: &s
 ///
 /// # 设计原理
 /// - **实现初衷**：为任意体积文件的数字签名校验提供标准化输入，彻底消除大包全量读入内存的开销。
-/// - **核心优势**：固定 64KB 缓冲区循环迭代，内存占用恒定且无论文件多大都不会触发 OOM。
+/// - **核心优势**：堆分配固定 64KB 缓冲区循环迭代，不占用栈空间，内存占用恒定且无论文件多大都不会触发 OOM 或爆栈。
 ///
 /// # Errors
 /// 当底层文件打开或读取失败时返回 [`UpdateError::Io`]。
 pub fn compute_file_sha256_digest(file_path: &Path) -> Result<[u8; 32]> {
     let mut file = File::open(file_path)?;
-    let mut buffer = [0u8; HASH_BUFFER_SIZE];
+    let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
     let mut hasher = Sha256::new();
 
     loop {

@@ -1190,4 +1190,36 @@ mod tests {
         let res = build_blocking_http_client(&options);
         assert!(res.is_ok());
     }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn test_download_async_future_size_guarantee() {
+        let manifest_json = r#"{
+            "version": "1.0.1",
+            "packages": {
+                "x86_64-pc-windows-msvc": {
+                    "url": "https://example.com/app-1.0.1.zip",
+                    "package_type": "archive",
+                    "checksum": "sha256:abc"
+                }
+            }
+        }"#;
+        let updater = UpdaterBuilder::new()
+            .current_version("1.0.0")
+            .unwrap()
+            .target("x86_64-pc-windows-msvc")
+            .manifest_url("https://example.com/manifest.json")
+            .require_signature(false)
+            .build()
+            .unwrap();
+        let release = updater.evaluate_manifest(manifest_json).unwrap().unwrap();
+        let fut = release.download_async(|_| {});
+        let fut_size = std::mem::size_of_val(&fut);
+        // 验证通过 Box::pin 堆化后，Future 在栈上的投影极小（远低于曾经的 64KB+ 巨物）
+        assert!(
+            fut_size < 2048,
+            "download_async 生成的 Future 栈占用过大: {} 字节 (必须 < 2048 字节)",
+            fut_size
+        );
+    }
 }

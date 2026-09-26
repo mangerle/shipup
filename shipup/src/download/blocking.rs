@@ -358,7 +358,7 @@ fn fetch_chunk_stream_blocking(
         });
     }
 
-    let mut buffer = [0u8; BUFFER_SIZE];
+    let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut written_for_chunk = 0u64;
     let expected_len = chunk.len();
 
@@ -641,7 +641,7 @@ where
 {
     let mut downloaded_bytes: u64 = ctx.initial_downloaded;
     let mut tracker = DownloadProgressTracker::new(ctx.total_bytes);
-    let mut buffer = [0u8; BUFFER_SIZE];
+    let mut buffer = vec![0u8; BUFFER_SIZE];
 
     loop {
         if let Some(flag) = ctx.cancel_flag

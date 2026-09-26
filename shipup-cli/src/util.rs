@@ -158,7 +158,7 @@ pub(crate) fn compute_payload_integrity(
         .with_context(|| format!("打开发布包文件失败: {}", package_path.display()))?;
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
 
     loop {
         let bytes_read = reader

@@ -214,7 +214,7 @@ fn unpack_single_tar_entry<R: Read>(
     }
 
     let mut out_file = File::create(dest_path)?;
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
 
     loop {
         let n = entry.read(&mut buffer)?;

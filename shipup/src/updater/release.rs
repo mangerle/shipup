@@ -265,17 +265,25 @@ impl Update {
     #[cfg(feature = "async")]
     /// 异步执行更新包下载与完整性验签，暂存至临时目录并返回待安装实体（不修改任何本地文件）
     ///
+    /// # 设计原理
+    /// - **实现初衷**：通过 `Box::pin` 将庞大的下载与验签调用链迁移至堆内存执行，降低对调用方线程栈的占用。
+    /// - **核心优势**：栈上仅保留指针大小（16 字节），彻底消除 Windows 平台默认线程栈或深层调用栈下的栈溢出（0xc00000fd）隐患。
+    ///
     /// # Errors
     /// 当异步下载失败、校验错误时返回对应错误。
     pub async fn download_async<F>(&self, callback: F) -> Result<DownloadedUpdate>
     where
         F: FnMut(UpdateEvent) + Send,
     {
-        self.download_with_cancellation_async(None, callback).await
+        Box::pin(async move { self.download_with_cancellation_async(None, callback).await }).await
     }
 
     #[cfg(feature = "async")]
     /// 支持主动取消标记的异步下载与验签（不修改任何本地运行文件）
+    ///
+    /// # 设计原理
+    /// - **实现初衷**：支持随时传入取消标记中止网络传输；通过 `Box::pin` 将整个流程堆化防爆栈。
+    /// - **核心优势**：消除深层异步调用的栈空间压力，保证在任意宿主环境中安全执行。
     ///
     /// # Errors
     /// 当异步流程被取消或签名校验失败时返回对应错误。
@@ -287,32 +295,35 @@ impl Update {
     where
         F: FnMut(UpdateEvent) + Send,
     {
-        self.validate_package_transport()?;
+        Box::pin(async move {
+            self.validate_package_transport()?;
 
-        let client =
-            build_async_http_client(&HttpClientOptions::from_network_config(&self.config))?;
-        let temp_download_path = self.resolve_download_path()?;
-        let options = self.build_download_options(&temp_download_path, cancel_flag);
-        let mirrors = self.merge_download_mirrors();
+            let client =
+                build_async_http_client(&HttpClientOptions::from_network_config(&self.config))?;
+            let temp_download_path = self.resolve_download_path()?;
+            let options = self.build_download_options(&temp_download_path, cancel_flag);
+            let mirrors = self.merge_download_mirrors();
 
-        let download_and_verify_result = self
-            .download_and_verify_async(
-                &client,
-                &options,
-                &mirrors,
-                &temp_download_path,
-                &mut callback,
-            )
-            .await;
+            let download_and_verify_result = self
+                .download_and_verify_async(
+                    &client,
+                    &options,
+                    &mirrors,
+                    &temp_download_path,
+                    &mut callback,
+                )
+                .await;
 
-        if let Err(e) = download_and_verify_result {
-            callback(UpdateEvent::Failed {
-                reason: e.to_string(),
-            });
-            return Err(e);
-        }
+            if let Err(e) = download_and_verify_result {
+                callback(UpdateEvent::Failed {
+                    reason: e.to_string(),
+                });
+                return Err(e);
+            }
 
-        Ok(self.build_downloaded_update(temp_download_path))
+            Ok(self.build_downloaded_update(temp_download_path))
+        })
+        .await
     }
 
     /// 异步执行下载（整包或分片），并将阻塞型验签调度至专用线程池
@@ -331,20 +342,24 @@ impl Update {
     where
         F: FnMut(UpdateEvent) + Send,
     {
-        if self.config.chunked_download {
-            let chunked_opts = download::ChunkedDownloadOptions {
-                base: options.clone(),
-                mirrors,
-                concurrency: self.config.chunked_concurrency,
-                chunk_size: self.config.chunk_size,
-            };
-            download::download_file_chunked_async(client, &chunked_opts, &mut *callback).await?;
-        } else {
-            download::download_file_async(client, options, &mut *callback).await?;
-        }
+        Box::pin(async move {
+            if self.config.chunked_download {
+                let chunked_opts = download::ChunkedDownloadOptions {
+                    base: options.clone(),
+                    mirrors,
+                    concurrency: self.config.chunked_concurrency,
+                    chunk_size: self.config.chunk_size,
+                };
+                download::download_file_chunked_async(client, &chunked_opts, &mut *callback)
+                    .await?;
+            } else {
+                download::download_file_async(client, options, &mut *callback).await?;
+            }
 
-        self.verify_payload_on_blocking_pool(temp_path, callback)
-            .await
+            self.verify_payload_on_blocking_pool(temp_path, callback)
+                .await
+        })
+        .await
     }
 
     /// 将阻塞型哈希与签名校验调度至阻塞线程池，并把事件经通道桥接回异步回调
@@ -360,13 +375,13 @@ impl Update {
     where
         F: FnMut(UpdateEvent) + Send,
     {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let this = self.clone();
         let target_temp_path = temp_path.to_path_buf();
 
         let blocking_handle = tokio::task::spawn_blocking(move || {
             this.verify_downloaded_payload(&target_temp_path, &mut |event| {
-                let _ = tx.send(event);
+                let _ = tx.blocking_send(event);
             })
         });
 
@@ -392,10 +407,13 @@ impl Update {
     where
         F: FnMut(UpdateEvent) + Send,
     {
-        let downloaded = self
-            .download_with_cancellation_async(None, &mut callback)
-            .await?;
-        downloaded.install(callback)
+        Box::pin(async move {
+            let downloaded = self
+                .download_with_cancellation_async(None, &mut callback)
+                .await?;
+            downloaded.install(callback)
+        })
+        .await
     }
 
     #[cfg(feature = "async")]
@@ -411,10 +429,13 @@ impl Update {
     where
         F: FnMut(UpdateEvent) + Send,
     {
-        let downloaded = self
-            .download_with_cancellation_async(cancel_flag, &mut callback)
-            .await?;
-        downloaded.install(callback)
+        Box::pin(async move {
+            let downloaded = self
+                .download_with_cancellation_async(cancel_flag, &mut callback)
+                .await?;
+            downloaded.install(callback)
+        })
+        .await
     }
 
     /// 根据配置解析下载落盘路径

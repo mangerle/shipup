@@ -52,8 +52,9 @@ use super::{
 /// 异步流式下载更新包（支持 HTTP Range 断点续传与指数退避网络重试）
 ///
 /// # 设计原理
-/// - **实现初衷**：利用异步事件驱动模型实现弱网退避重试与 Range 断点续传，不阻塞 OS 线程。
-/// - **核心优势**：在单线程或多任务并发上下文中资源开销小，主动取消保留断点切片以供续传。
+/// - **实现初衷**：利用异步事件驱动模型实现弱网退避重试与 Range 断点续传，不阻塞 OS 线程；
+///   通过 `Box::pin` 将庞大的异步重试状态机迁移至堆内存执行，降低对调用线程栈空间的占用。
+/// - **核心优势**：在单线程或多任务并发上下文中资源开销小，主动取消保留断点切片以供续传；栈上仅占指针大小，彻底防范栈溢出。
 /// - **代价与局限**：回调函数需满足 `Send` 约束。
 ///
 /// # Errors
@@ -67,45 +68,48 @@ pub async fn download_file_async<F>(
 where
     F: FnMut(UpdateEvent) + Send,
 {
-    if try_hit_local_cache(
-        options.target_path,
-        options.expected_checksum,
-        &mut event_callback,
-    ) {
-        return Ok(());
-    }
+    Box::pin(async move {
+        if try_hit_local_cache(
+            options.target_path,
+            options.expected_checksum,
+            &mut event_callback,
+        ) {
+            return Ok(());
+        }
 
-    if let Some(exp_size) = options.expected_size {
-        check_disk_space_available(options.target_path, exp_size.saturating_mul(2))?;
-    }
+        if let Some(exp_size) = options.expected_size {
+            check_disk_space_available(options.target_path, exp_size.saturating_mul(2))?;
+        }
 
-    let mut attempts = 0;
-    loop {
-        attempts += 1;
-        match download_file_async_attempt(client, options, &mut event_callback).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                if !is_retryable_error(&e) || attempts > options.max_retries {
-                    return Err(e);
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match download_file_async_attempt(client, options, &mut event_callback).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if !is_retryable_error(&e) || attempts > options.max_retries {
+                        return Err(e);
+                    }
+                    let backoff = calculate_backoff(options.retry_delay, attempts);
+                    log::warn!(
+                        "异步下载遇到暂时性故障: {}，正在等待 {:?} 进行第 {}/{} 次重试",
+                        e,
+                        backoff,
+                        attempts,
+                        options.max_retries
+                    );
+                    event_callback(UpdateEvent::Retrying {
+                        attempt: attempts,
+                        max_retries: options.max_retries,
+                        delay: backoff,
+                        error: e.to_string(),
+                    });
+                    tokio::time::sleep(backoff).await;
                 }
-                let backoff = calculate_backoff(options.retry_delay, attempts);
-                log::warn!(
-                    "异步下载遇到暂时性故障: {}，正在等待 {:?} 进行第 {}/{} 次重试",
-                    e,
-                    backoff,
-                    attempts,
-                    options.max_retries
-                );
-                event_callback(UpdateEvent::Retrying {
-                    attempt: attempts,
-                    max_retries: options.max_retries,
-                    delay: backoff,
-                    error: e.to_string(),
-                });
-                tokio::time::sleep(backoff).await;
             }
         }
-    }
+    })
+    .await
 }
 
 #[cfg(feature = "async")]
@@ -123,8 +127,9 @@ async fn probe_range_support_async(client: &reqwest::Client, url: &str) -> bool 
 /// 异步分片并行下载大文件更新包（支持多镜像流量分发、原地预分配与自动降级）
 ///
 /// # 设计原理
-/// - **实现初衷**：在异步事件驱动模型中实现大文件多镜像源并发分流与拼装，不阻塞工作线程。
-/// - **核心优势**：自动探测服务端 Range 兼容性；原地预分配文件；基于信号量限流的高并发原地写入。
+/// - **实现初衷**：在异步事件驱动模型中实现大文件多镜像源并发分流与拼装，不阻塞工作线程；
+///   通过 `Box::pin` 将包含多分支降级、信号量并发与后台校验的庞大状态机迁移至堆内存，消除栈深度膨胀。
+/// - **核心优势**：自动探测服务端 Range 兼容性；原地预分配文件；基于信号量限流的高并发原地写入；栈上零负担，彻底杜绝爆栈。
 /// - **代价与局限**：回调函数需满足 `Send` 约束。
 ///
 /// # Errors
@@ -137,40 +142,43 @@ pub async fn download_file_chunked_async<F>(
 where
     F: FnMut(UpdateEvent) + Send,
 {
-    if try_hit_local_cache(
-        options.base.target_path,
-        options.base.expected_checksum,
-        &mut event_callback,
-    ) {
-        return Ok(());
-    }
+    Box::pin(async move {
+        if try_hit_local_cache(
+            options.base.target_path,
+            options.base.expected_checksum,
+            &mut event_callback,
+        ) {
+            return Ok(());
+        }
 
-    if is_file_url(options.base.url) {
-        return copy_local_file_async(&options.base, &mut event_callback).await;
-    }
+        if is_file_url(options.base.url) {
+            return copy_local_file_async(&options.base, &mut event_callback).await;
+        }
 
-    let Some(total_size) = options.base.expected_size else {
-        log::info!("未提供文件总预期大小，自动降级为常规异步流式下载");
-        return download_file_async(client, &options.base, event_callback).await;
-    };
+        let Some(total_size) = options.base.expected_size else {
+            log::info!("未提供文件总预期大小，自动降级为常规异步流式下载");
+            return download_file_async(client, &options.base, event_callback).await;
+        };
 
-    let min_chunked_threshold = (options.chunk_size as u64).saturating_mul(2);
-    if total_size < min_chunked_threshold {
-        log::info!(
-            "文件体积 ({} 字节) 小于分片加速阈值，直接使用常规单流异步下载",
-            total_size
-        );
-        return download_file_async(client, &options.base, event_callback).await;
-    }
+        let min_chunked_threshold = (options.chunk_size as u64).saturating_mul(2);
+        if total_size < min_chunked_threshold {
+            log::info!(
+                "文件体积 ({} 字节) 小于分片加速阈值，直接使用常规单流异步下载",
+                total_size
+            );
+            return download_file_async(client, &options.base, event_callback).await;
+        }
 
-    check_disk_space_available(options.base.target_path, total_size.saturating_mul(2))?;
+        check_disk_space_available(options.base.target_path, total_size.saturating_mul(2))?;
 
-    if !probe_range_support_async(client, options.base.url).await {
-        log::warn!("远端服务器不支持 HTTP Range 协议，平滑降级为常规单流异步下载");
-        return download_file_async(client, &options.base, event_callback).await;
-    }
+        if !probe_range_support_async(client, options.base.url).await {
+            log::warn!("远端服务器不支持 HTTP Range 协议，平滑降级为常规单流异步下载");
+            return download_file_async(client, &options.base, event_callback).await;
+        }
 
-    execute_chunked_download_async(client, options, total_size, event_callback).await
+        execute_chunked_download_async(client, options, total_size, event_callback).await
+    })
+    .await
 }
 
 #[cfg(feature = "async")]
@@ -183,61 +191,64 @@ async fn execute_chunked_download_async<F>(
 where
     F: FnMut(UpdateEvent) + Send,
 {
-    if let Some(parent) = options.base.target_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let prealloc_file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(options.base.target_path)
-        .await?;
-    prealloc_file.set_len(total_size).await?;
-    drop(prealloc_file);
+    Box::pin(async move {
+        if let Some(parent) = options.base.target_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let prealloc_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(options.base.target_path)
+            .await?;
+        prealloc_file.set_len(total_size).await?;
+        drop(prealloc_file);
 
-    event_callback(UpdateEvent::DownloadStarted {
-        total_bytes: Some(total_size),
-    });
+        event_callback(UpdateEvent::DownloadStarted {
+            total_bytes: Some(total_size),
+        });
 
-    let chunks = split_file_into_chunks(total_size, options.chunk_size);
-    let total_chunks = chunks.len();
-    let candidate_urls: Vec<String> = collect_candidate_urls(options.base.url, options.mirrors)
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect();
-    let concurrency = options.concurrency.clamp(1, 16);
-    let (tx, rx) = tokio::sync::mpsc::channel(concurrency * 4);
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let chunks = split_file_into_chunks(total_size, options.chunk_size);
+        let total_chunks = chunks.len();
+        let candidate_urls: Vec<String> = collect_candidate_urls(options.base.url, options.mirrors)
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        let concurrency = options.concurrency.clamp(1, 16);
+        let (tx, rx) = tokio::sync::mpsc::channel(concurrency * 4);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
-    let mut handles = Vec::with_capacity(total_chunks);
-    let target_path_buf = options.base.target_path.to_path_buf();
-    let cancel_flag = options.base.cancel_flag.clone();
+        let mut handles = Vec::with_capacity(total_chunks);
+        let target_path_buf = options.base.target_path.to_path_buf();
+        let cancel_flag = options.base.cancel_flag.clone();
 
-    spawn_async_chunk_tasks(
-        client,
-        chunks,
-        &semaphore,
-        &target_path_buf,
-        &candidate_urls,
-        &cancel_flag,
-        tx.clone(),
-        &mut handles,
-    );
-    drop(tx);
+        spawn_async_chunk_tasks(
+            client,
+            chunks,
+            &semaphore,
+            &target_path_buf,
+            &candidate_urls,
+            &cancel_flag,
+            tx.clone(),
+            &mut handles,
+        );
+        drop(tx);
 
-    monitor_chunked_progress_async(rx, total_chunks, total_size, &mut event_callback).await?;
+        monitor_chunked_progress_async(rx, total_chunks, total_size, &mut event_callback).await?;
 
-    for handle in handles {
-        let _ = handle.await;
-    }
+        for handle in handles {
+            let _ = handle.await;
+        }
 
-    verify_chunked_payload_async(options, total_size).await?;
+        verify_chunked_payload_async(options, total_size).await?;
 
-    log::info!(
-        "异步分片并行下载与拼装完成，临时文件: {}",
-        options.base.target_path.display()
-    );
-    Ok(())
+        log::info!(
+            "异步分片并行下载与拼装完成，临时文件: {}",
+            options.base.target_path.display()
+        );
+        Ok(())
+    })
+    .await
 }
 
 #[cfg(feature = "async")]
@@ -507,7 +518,7 @@ where
     let mut downloaded_bytes: u64 = 0;
     let mut tracker = DownloadProgressTracker::new(Some(total_bytes));
     let mut rate_limiter = options.max_bytes_per_sec.map(RateLimiter::new);
-    let mut buffer = [0u8; BUFFER_SIZE];
+    let mut buffer = vec![0u8; BUFFER_SIZE];
 
     loop {
         if let Some(flag) = options.cancel_flag.as_ref()
