@@ -40,49 +40,84 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 /// 孤儿临时下载切片的最长保留过期时长（24 小时）
 const ORPHAN_TEMP_EXPIRATION_SECS: u64 = 24 * 3600;
 
-/// 清理当前主程序自身遗留的历史 *.shipup.old 备份文件与过期孤儿临时切片
+/// 判断指定文件名是否属于当前主程序自身的历史备份（支持通配扫描）
+///
+/// 匹配规则：
+/// 1. 以 `{exe_name}.shipup.` 开头且以 `.old` 结尾（如 `app.exe.shipup.0.8.1.old`）；
+/// 2. 或精确等于 `{exe_name}.shipup.old`。
+pub(crate) fn is_matching_old_backup(file_name: &str, exe_name: &str) -> bool {
+    let prefix = format!("{}.shipup.", exe_name);
+    (file_name.starts_with(&prefix) && file_name.ends_with(".old"))
+        || file_name == format!("{}{}", exe_name, OLD_BACKUP_SUFFIX)
+}
+
+/// 清理当前主程序自身遗留的历史 *.shipup.*.old 备份文件与过期孤儿临时切片
 ///
 /// # 设计原理
-/// - **实现初衷**：替换完成且新版本稳定后，定向销毁自身旧二进制；对历史残留临时切片引入 24 小时修改时间保护。
-/// - **核心优势**：定向清理自身备份，绝不误删同目录其他进程正在下载中的临时文件或并发实例。
+/// - **实现初衷**：替换完成且新版本稳定后，通配销毁自身旧二进制备份（含带版本号与无版本号格式）；对历史残留临时切片引入 24 小时修改时间保护。
+/// - **核心优势**：通配清理自身所有历史版本备份，绝不误删同目录其他进程文件或由版本历史管理器保留的回滚归档。
 /// - **代价与局限**：24 小时内的未完成下载切片将被保留供断点续传，直到超时后自动回收。
 pub fn cleanup_old_backup_files() {
-    if let Ok(current_exe) = env::current_exe()
-        && let Some(parent) = current_exe.parent()
-    {
-        let exe_name = current_exe
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("app");
+    let Ok(current_exe) = env::current_exe() else {
+        return;
+    };
+    let Some(parent) = current_exe.parent() else {
+        return;
+    };
+    let exe_name = current_exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("app");
 
-        // 1. 定向清理主程序自身对应的历史备份文件
-        let my_backup = parent.join(format!("{}{}", exe_name, OLD_BACKUP_SUFFIX));
-        if my_backup.exists() {
-            if let Err(e) = fs::remove_file(&my_backup) {
-                log::debug!("清理当前程序历史备份失败 ({}): {}", my_backup.display(), e);
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+
+        // 1. 通配清理主程序自身对应的历史备份（排除已被版本历史管理器接管的条目）
+        if is_matching_old_backup(file_name, exe_name) {
+            let is_protected = crate::preference::resolve_safe_data_dir()
+                .map(|dir| crate::recovery::is_in_rollback_history(&dir, &path))
+                .unwrap_or(false)
+                || crate::recovery::is_in_rollback_history(parent, &path);
+
+            if is_protected {
+                log::debug!(
+                    "当前历史备份由版本历史管理器保留，跳过清理: {}",
+                    path.display()
+                );
             } else {
-                log::debug!("成功清理当前程序历史备份: {}", my_backup.display());
+                let remove_res = if path.is_dir() {
+                    fs::remove_dir_all(&path)
+                } else {
+                    fs::remove_file(&path)
+                };
+                if let Err(e) = remove_res {
+                    log::debug!("清理当前程序历史备份失败 ({}): {}", path.display(), e);
+                } else {
+                    log::debug!("成功清理当前程序历史备份: {}", path.display());
+                }
             }
+            continue;
         }
 
         // 2. 仅清理修改时间超过 24 小时的孤儿临时切片，避免误删正在下载的文件
-        if let Ok(entries) = fs::read_dir(parent) {
-            let now = std::time::SystemTime::now();
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
-                    && file_name.ends_with(TEMP_SUFFIX)
-                    && let Ok(metadata) = entry.metadata()
-                    && let Ok(modified) = metadata.modified()
-                    && let Ok(age) = now.duration_since(modified)
-                    && age.as_secs() > ORPHAN_TEMP_EXPIRATION_SECS
-                {
-                    if let Err(e) = fs::remove_file(&path) {
-                        log::debug!("清理过期孤儿临时切片失败 ({}): {}", path.display(), e);
-                    } else {
-                        log::debug!("成功清理过期孤儿临时切片: {}", path.display());
-                    }
-                }
+        if file_name.ends_with(TEMP_SUFFIX)
+            && let Ok(metadata) = entry.metadata()
+            && let Ok(modified) = metadata.modified()
+            && let Ok(age) = now.duration_since(modified)
+            && age.as_secs() > ORPHAN_TEMP_EXPIRATION_SECS
+        {
+            if let Err(e) = fs::remove_file(&path) {
+                log::debug!("清理过期孤儿临时切片失败 ({}): {}", path.display(), e);
+            } else {
+                log::debug!("成功清理过期孤儿临时切片: {}", path.display());
             }
         }
     }
@@ -628,5 +663,24 @@ mod tests {
 
         let _ = fs::remove_file(&src);
         let _ = fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn test_is_matching_old_backup_matching_rules() {
+        let exe = "rddns.exe";
+        // 匹配带具体版本号的备份
+        assert!(is_matching_old_backup("rddns.exe.shipup.0.8.1.old", exe));
+        assert!(is_matching_old_backup(
+            "rddns.exe.shipup.1.0.0-rc.1.old",
+            exe
+        ));
+        // 匹配旧版无版本号的备份
+        assert!(is_matching_old_backup("rddns.exe.shipup.old", exe));
+        // 不匹配其他程序的备份
+        assert!(!is_matching_old_backup("other.exe.shipup.0.8.1.old", exe));
+        // 不匹配非 .old 后缀的文件
+        assert!(!is_matching_old_backup("rddns.exe.shipup.0.8.1.tmp", exe));
+        // 不匹配主程序自身
+        assert!(!is_matching_old_backup("rddns.exe", exe));
     }
 }

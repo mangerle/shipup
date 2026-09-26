@@ -30,29 +30,74 @@ pub const TEMP_SUFFIX: &str = ".shipup.tmp";
 /// 旧版本备份文件或 App Bundle 后缀（回滚能力依赖该命名约定）
 pub const OLD_BACKUP_SUFFIX: &str = ".shipup.old";
 
-/// 清理以往更新遗留的主程序自身的 .shipup.old 备份 Bundle 或文件
+/// 判断指定文件名是否属于当前主程序自身的历史备份（支持通配扫描）
+///
+/// 匹配规则：
+/// 1. 以 `{target_name}.shipup.` 开头且以 `.old` 结尾（如 `app.shipup.0.8.1.old`）；
+/// 2. 或精确等于 `{target_name}.shipup.old`。
+pub(crate) fn is_matching_old_backup(file_name: &str, target_name: &str) -> bool {
+    let prefix = format!("{}.shipup.", target_name);
+    (file_name.starts_with(&prefix) && file_name.ends_with(".old"))
+        || file_name == format!("{}{}", target_name, OLD_BACKUP_SUFFIX)
+}
+
+/// 清理以往更新遗留的主程序自身的 *.shipup.*.old 备份 Bundle 或文件
 pub fn cleanup_old_backup_bundles() {
-    if let Some(current_bundle) = find_current_app_bundle()
+    let (target_name, parent) = if let Some(current_bundle) = find_current_app_bundle()
         && let Some(parent) = current_bundle.parent()
     {
         let bundle_name = current_bundle
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("app.app");
-        let my_backup = parent.join(format!("{}{}", bundle_name, OLD_BACKUP_SUFFIX));
-        if my_backup.exists() {
-            let _ = fs::remove_dir_all(&my_backup).or_else(|_| fs::remove_file(&my_backup));
-        }
+            .unwrap_or("app.app")
+            .to_string();
+        (bundle_name, parent.to_path_buf())
     } else if let Ok(current_exe) = env::current_exe()
         && let Some(parent) = current_exe.parent()
     {
         let exe_name = current_exe
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("app");
-        let my_backup = parent.join(format!("{}{}", exe_name, OLD_BACKUP_SUFFIX));
-        if my_backup.exists() {
-            let _ = fs::remove_file(&my_backup);
+            .unwrap_or("app")
+            .to_string();
+        (exe_name, parent.to_path_buf())
+    } else {
+        return;
+    };
+
+    let Ok(entries) = fs::read_dir(&parent) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+
+        if is_matching_old_backup(file_name, &target_name) {
+            let is_protected = crate::preference::resolve_safe_data_dir()
+                .map(|dir| crate::recovery::is_in_rollback_history(&dir, &path))
+                .unwrap_or(false)
+                || crate::recovery::is_in_rollback_history(&parent, &path);
+
+            if is_protected {
+                log::debug!(
+                    "当前历史备份由版本历史管理器保留，跳过清理: {}",
+                    path.display()
+                );
+            } else {
+                let remove_res = if path.is_dir() {
+                    fs::remove_dir_all(&path)
+                } else {
+                    fs::remove_file(&path)
+                };
+                if let Err(e) = remove_res {
+                    log::debug!("清理当前程序历史备份失败 ({}): {}", path.display(), e);
+                } else {
+                    log::debug!("成功清理当前程序历史备份: {}", path.display());
+                }
+            }
         }
     }
 }
@@ -304,5 +349,18 @@ mod tests {
             file_name.ends_with(TEMP_SUFFIX),
             "macOS 同卷临时文件必须以 TEMP_SUFFIX 结尾"
         );
+    }
+
+    #[test]
+    fn test_is_matching_old_backup_matching_rules() {
+        let app = "MyApp.app";
+        assert!(is_matching_old_backup("MyApp.app.shipup.0.8.1.old", app));
+        assert!(is_matching_old_backup("MyApp.app.shipup.old", app));
+        assert!(!is_matching_old_backup(
+            "OtherApp.app.shipup.0.8.1.old",
+            app
+        ));
+        assert!(!is_matching_old_backup("MyApp.app.shipup.0.8.1.tmp", app));
+        assert!(!is_matching_old_backup("MyApp.app", app));
     }
 }

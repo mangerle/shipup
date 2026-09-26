@@ -51,8 +51,8 @@ pub const CRASH_WINDOW_THRESHOLD_SECS: u64 = 30;
 
 pub use health::{HealthCheckStatus, check_and_recover_current, check_and_recover_once};
 pub use history::{
-    RollbackEntry, RollbackHistory, list_available_rollback_versions, load_rollback_history,
-    record_rollback_version,
+    RollbackEntry, RollbackHistory, is_in_rollback_history, list_available_rollback_versions,
+    load_rollback_history, record_rollback_version,
 };
 pub use manual::execute_manual_rollback_to;
 pub use state::{
