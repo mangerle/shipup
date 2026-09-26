@@ -202,6 +202,18 @@ pub fn replace_current_bundle(new_bundle_path: &Path) -> Result<()> {
 /// # Errors
 /// 当底层重命名失败或隔离属性清理出错时返回 [`UpdateError::SelfReplace`]。
 pub fn replace_current_binary(new_binary_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = new_binary_path.metadata() {
+            let mut perms = metadata.permissions();
+            if perms.mode() & 0o111 == 0 {
+                perms.set_mode(0o755);
+                let _ = fs::set_permissions(new_binary_path, perms);
+            }
+        }
+    }
+
     self_replace::self_replace(new_binary_path)
         .map_err(|e| UpdateError::SelfReplace(format!("macOS 原地替换可执行程序失败: {}", e)))?;
 

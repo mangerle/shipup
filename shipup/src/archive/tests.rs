@@ -216,3 +216,23 @@ fn test_verify_extracted_payload_checksums_success_and_failure() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+#[cfg(unix)]
+#[test]
+fn test_ensure_executable_unix_sets_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp_file = std::env::temp_dir().join(format!("test_exec_perm_{}.bin", std::process::id()));
+    fs::write(&temp_file, b"test-payload").unwrap();
+
+    // 预设为无执行权限 0o644
+    let mut perms = fs::metadata(&temp_file).unwrap().permissions();
+    perms.set_mode(0o644);
+    fs::set_permissions(&temp_file, perms).unwrap();
+
+    assert!(ensure_executable_unix(&temp_file).is_ok());
+
+    let mode = fs::metadata(&temp_file).unwrap().permissions().mode();
+    assert_eq!(mode & 0o755, 0o755);
+
+    let _ = fs::remove_file(&temp_file);
+}

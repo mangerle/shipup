@@ -95,18 +95,58 @@ pub fn extract_archive(
         }
     }
 
-    if let Some(rel) = executable_rel_path {
+    let target = if let Some(rel) = executable_rel_path {
         let target = canonical_sandbox.join(rel);
         if target.exists() {
-            return Ok(target);
+            target
+        } else {
+            return Err(UpdateError::ArchiveExtract(format!(
+                "归档包内未找到指定的执行文件: {}",
+                rel
+            )));
         }
-        return Err(UpdateError::ArchiveExtract(format!(
-            "归档包内未找到指定的执行文件: {}",
-            rel
-        )));
+    } else {
+        find_single_executable(&canonical_sandbox)?
+    };
+
+    #[cfg(unix)]
+    {
+        if target.is_file() {
+            if let Err(e) = ensure_executable_unix(&target) {
+                log::warn!(
+                    "赋予解压后主程序可执行权限失败 ({}): {}",
+                    target.display(),
+                    e
+                );
+            } else {
+                log::debug!(
+                    "已确保解压后主程序具备 0o755 执行权限: {}",
+                    target.display()
+                );
+            }
+        }
     }
 
-    find_single_executable(&canonical_sandbox)
+    Ok(target)
+}
+
+/// 在 Unix 环境下确保目标文件具备标准可执行权限（0o755）
+///
+/// # 设计原理
+/// - **实现初衷**：在 Windows 环境打包的 Zip 归档或未规范保存权限位的 Tar 包，
+///   在 Unix 系统解压后默认仅具备只读/读写权限（0o644），导致替换并启动时报
+///   `Permission denied (os error 13)` 权限不足错误。
+/// - **核心优势**：在解压落地阶段自动判定并赋予标准 `0o755` 权限，消除跨平台打包差异。
+#[cfg(unix)]
+pub fn ensure_executable_unix(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path)?.permissions();
+    let current_mode = perms.mode();
+    if current_mode & 0o111 == 0 {
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)?;
+    }
+    Ok(())
 }
 
 /// 在沙箱目录中扫描查找唯一的执行程序
